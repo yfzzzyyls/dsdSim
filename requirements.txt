@@ -1,0 +1,6 @@
+transformers>=4.33.0
+optimum-neuron>=0.1.0
+grpcio>=1.50.0
+grpcio-tools==1.33.2
+protobuf>=3.20.3,<4
+sentencepiece>=0.1.99

@@ -1,0 +1,44 @@
+syntax = "proto3";
+
+package specdecode;
+
+// The speculative decoding gRPC service definition.
+service SpeculativeService {
+  // Initialize a generation session with the prompt.
+  rpc StartGeneration(StartRequest) returns (StartResponse);
+  // Verify a batch of draft tokens against the target model.
+  rpc VerifyDraftTokens(VerifyRequest) returns (VerifyResponse);
+  // Generate a full completion using only the target model (for verification/perf).
+  rpc GenerateFull(GenerateRequest) returns (GenerateResponse);
+}
+
+// Message definitions
+message StartRequest {
+  string prompt = 1;           // The prompt text to start generation
+  int32 max_new_tokens = 2;    // Maximum number of tokens to generate (optional)
+}
+
+message StartResponse {
+  // Simple acknowledgment, can include a session ID for future use if needed.
+  bool acknowledged = 1;
+}
+
+message VerifyRequest {
+  repeated int32 draft_tokens = 1;  // Batch of speculative tokens from draft model
+}
+
+message VerifyResponse {
+  bool all_matched = 1;        // True if all draft_tokens matched the target's output
+  int32 match_count = 2;       // Number of tokens that matched before a mismatch (equals len(draft_tokens) if all_matched)
+  int32 correct_token = 3;     // The target model's token at first mismatch (undefined if all_matched=true)
+  bool finished = 4;           // True if generation is finished (target produced EOS or reached max length)
+}
+
+message GenerateRequest {
+  string prompt = 1;
+  int32 max_new_tokens = 2;
+}
+
+message GenerateResponse {
+  string output_text = 1;
+}
