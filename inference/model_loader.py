@@ -10,7 +10,7 @@ def load_model(model_id):
     print(f"[ModelLoader] Loading HF model: {model_id}")
     # First load the model & tokenizer in regular CPU memory
     # (We generally do not do .to('cuda') or anything, because we are going to compile for Neuron.)
-    model = AutoModelForCausalLM.from_pretrained(model_id)
+    model = AutoModelForCausalLM.from_pretrained(model_id, torch_dtype=torch.bfloat16)
     tokenizer = AutoTokenizer.from_pretrained(model_id)
     # Some LLM tokenizers do not have a pad token
     if tokenizer.pad_token_id is None and tokenizer.eos_token_id is not None:
@@ -19,7 +19,7 @@ def load_model(model_id):
     # Prepare a dummy input for tracing (sequence length = 128 is arbitrary; adapt as needed)
     # The shape you choose here must be representative of your typical input sizes
     # for correct compilation.
-    example_sequence_len = 128
+    example_sequence_len = 32
     dummy_input_ids = torch.randint(
         low=0, 
         high=len(tokenizer), 
