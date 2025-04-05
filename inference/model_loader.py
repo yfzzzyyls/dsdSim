@@ -1,44 +1,64 @@
 import torch
-import torch_neuronx  # The low-level Neuron tracing API
-from transformers import AutoModelForCausalLM, AutoTokenizer
+import torch_neuronx
+from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
-def load_model(model_id):
+class LlamaDecoderWrapper(torch.nn.Module):
+    """Wrapper to adjust LLaMA model's head_dim and key/value heads for AWS Trainium (Neuron) compilation."""
+    def __init__(self, model, head_dim, num_key_value_heads):
+        super().__init__()
+        # Patch model configuration for head_dim and grouped key/value heads (GQA)
+        model.config.head_dim = head_dim
+        model.config.num_key_value_heads = num_key_value_heads
+        # Update derived attributes in attention layers (num_key_value_groups) to avoid mismatch
+        if hasattr(model, "model") and hasattr(model.model, "layers"):
+            for layer in model.model.layers:
+                if hasattr(layer, "self_attn"):
+                    layer.self_attn.num_key_value_groups = model.config.num_attention_heads // num_key_value_heads
+        self.model = model
+
+    def forward(self, *args, **kwargs):
+        return self.model(*args, **kwargs)
+
+
+def load_model(model_name_or_path, compile_to_neuron: bool = True):
     """
-    Load and compile a HF Transformers model on AWS Trainium using torch-neuronx (no optimum-neuron).
+    Load a HuggingFace model and tokenizer. If on AWS Trainium (torch-neuronx available),
+    compile the model for Neuron. Applies LlamaDecoderWrapper for LLaMA models to fix
+    head_dim mismatch issues (using grouped query attention) without modifying Transformers.
     """
+    # 1) Load model configuration with torch_dtype = bfloat16
+    config = AutoConfig.from_pretrained(model_name_or_path)
+    config.torch_dtype = torch.bfloat16
 
-    print(f"[ModelLoader] Loading HF model: {model_id}")
-    # First load the model & tokenizer in regular CPU memory
-    # (We generally do not do .to('cuda') or anything, because we are going to compile for Neuron.)
-    model = AutoModelForCausalLM.from_pretrained(model_id, torch_dtype=torch.bfloat16)
-    tokenizer = AutoTokenizer.from_pretrained(model_id)
-    # Some LLM tokenizers do not have a pad token
-    if tokenizer.pad_token_id is None and tokenizer.eos_token_id is not None:
-        tokenizer.pad_token_id = tokenizer.eos_token_id
-
-    # Prepare a dummy input for tracing (sequence length = 128 is arbitrary; adapt as needed)
-    # The shape you choose here must be representative of your typical input sizes
-    # for correct compilation.
-    example_sequence_len = 32
-    dummy_input_ids = torch.randint(
-        low=0, 
-        high=len(tokenizer), 
-        size=(1, example_sequence_len),
-        dtype=torch.long
+    # 2) Load model with the updated config
+    model = AutoModelForCausalLM.from_pretrained(
+        model_name_or_path,
+        config=config,
+        ignore_mismatched_sizes=True
     )
+    tokenizer = AutoTokenizer.from_pretrained(model_name_or_path)
 
-    print("[ModelLoader] Compiling model with torch_neuronx.trace...")
-    # Put model in eval mode
-    model.eval()
-    # Perform the compile step
-    # The model must be invoked at least once on a Neuron device to create a compiled graph.
-    compiled_model = torch_neuronx.trace(
-        model,
-        dummy_input_ids,
-        compiler_workdir=None,  # or specify a path if you want to inspect artifacts
-        # compiler_args={},      # You can pass additional Neuron compiler args if needed
-    )
-    print("[ModelLoader] Compilation complete. Model is now on Neuron device.")
+    # 3) If the model is a LLaMA variant, apply wrapper for specific sizes
+    if model.config.model_type == "llama":
+        # Example case: LLaMA 1B (hidden_size=1024)
+        if model.config.hidden_size == 1024:
+            model = LlamaDecoderWrapper(model, head_dim=64, num_key_value_heads=8)
+        # Example case: LLaMA 3B (hidden_size=2048)
+        elif model.config.hidden_size == 2048:
+            model = LlamaDecoderWrapper(model, head_dim=128, num_key_value_heads=8)
 
-    # Return the compiled model plus the tokenizer
-    return compiled_model, tokenizer
+    # 4) Optionally compile the model to TorchScript on Neuron
+    if compile_to_neuron and torch_neuronx is not None:
+        model.eval()  # set to inference mode
+
+        # Create dummy inputs in bfloat16; seq length = 32
+        dummy_input_ids = torch.ones((1, 32), dtype=torch.bfloat16)
+        dummy_attn_mask = torch.ones_like(dummy_input_ids)  # also bfloat16
+
+        # Compile (trace) the model for Neuron
+        model = torch_neuronx.trace(
+            model,
+            example_inputs=(dummy_input_ids, dummy_attn_mask)
+        )
+
+    return model, tokenizer
