@@ -2,7 +2,7 @@ import grpc
 from concurrent import futures
 
 # Import the generated classes from the compiled proto module
-from grpc_comm.proto import inference_pb2, inference_pb2_grpc
+import inference_pb2, inference_pb2_grpc
 
 class SpeculativeServicer(inference_pb2_grpc.SpeculativeServiceServicer):
     def __init__(self, target_worker):

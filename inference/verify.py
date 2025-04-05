@@ -1,5 +1,5 @@
 import time
-from grpc_comm.proto import inference_pb2
+import inference_pb2
 
 def check_and_compare(stub, tokenizer, prompt, spec_output_tokens, max_tokens, measure_perf=False):
     """

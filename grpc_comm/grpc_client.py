@@ -1,5 +1,5 @@
 import grpc
-from grpc_comm.proto import inference_pb2_grpc
+import inference_pb2_grpc
 
 def create_stub(target_address):
     """

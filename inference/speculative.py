@@ -1,4 +1,4 @@
-from grpc_comm.proto import inference_pb2
+import inference_pb2
 
 def run_speculative_decoding(draft_model, tokenizer, stub, prompt, max_tokens, num_speculative):
     """
