@@ -18,7 +18,8 @@ def load_model(model_name: str, sequence_length: int = DEFAULT_SEQUENCE_LENGTH,
     Load a LLaMA model on AWS Trainium using transformers-neuronx.
     If a compiled model exists, load it; otherwise, compile and save it.
     """
-    compiled_dir = f"{os.path.basename(model_name)}-neuron-compiled-{sequence_length}"
+    base_name = os.path.basename(os.path.normpath(model_name))
+    compiled_dir = f"{base_name}-neuron-compiled-{sequence_length}"
     # Determine if we have compiled artifacts already
     if os.path.isdir(compiled_dir):
         logger.info(f"Loading compiled model from {compiled_dir}")

@@ -38,7 +38,7 @@ def main():
             logger.error("Please specify --model (target model) for target role")
             return
         # Run target server
-        import target_worker
+        from inference import target_worker
         target_worker.run_server(model_name, port=args.port)
     elif args.role == "draft":
         # For draft, need both draft and target model names if provided separately
@@ -49,7 +49,7 @@ def main():
             return
         prompt = args.prompt or ""
         # Run draft client
-        import draft_worker
+        from inference import draft_worker
         draft_worker.run_client(draft_model, target_host=args.target_host, port=args.port, prompt=prompt, target_model_name=target_model)
     else:
         logger.error("Unknown role. Use --role target|draft|compile.")
