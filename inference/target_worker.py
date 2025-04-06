@@ -1,4 +1,4 @@
-import model_loader
+from . import model_loader
 import torch
 
 class TargetWorker:

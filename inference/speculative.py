@@ -1,6 +1,6 @@
-import model_loader
-import target_worker
-import draft_worker
+from . import model_loader
+from . import target_worker
+from . import draft_worker
 import torch
 
 def speculative_decode(prompt, target_worker, draft_worker, max_steps=100, k=4):
