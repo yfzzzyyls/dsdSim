@@ -59,10 +59,11 @@ export NEURON_CC_FLAGS="--model-type transformer"
 export NEURON_RT_NUM_CORES=2
 ```
 
-### **Compile the Target Model Server**
+### **Compile the Target and Draft Model Server**
 
 ```
 python main.py --role compile --model /home/ubuntu/models/llama-3.2-3b/ --sequence_length 128
+python main.py --role compile --model /home/ubuntu/models/llama-3.2-1b/ --sequence_length 128
 ```
 
 ### **Start the Draft Client**
