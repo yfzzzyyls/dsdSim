@@ -1,60 +1,127 @@
-# Choral-Spec
+# Distributed Inference with Speculative Decoding on AWS Trainium
 
-Choral Spec is a project aims to optimize the performance of distributed inference for speculative decoding on AWS Trainium
+This repository has been adapted for **single-device** AWS Trainium usage with **speculative decoding** by default, using **Meta LLaMA 3.2** (1B draft + 3B target) in **bfloat16**. We assume you have an **AWS DLAMI** with Neuron SDK installed.
 
-# Speculative LLM Decoding on AWS Trainium (LLaMA3.2 Example)
+## Dpendencies
 
-This repository implements a **scalable, distributed speculative decoding system** for large language model (LLM) inference using two AWS Trainium instances (e.g., `trn1.2xlarge`). It uses a small **draft model** to generate tokens speculatively and a large **target model** to validate those tokens. The system is built with Hugging Face Transformers and Optimum Neuron for model compilation, and uses gRPC for communication between the draft and target nodes.
+install dependencies
 
-This repository implements a **scalable, distributed speculative decoding system** for large language model (LLM) inference on **AWS Trainium** (e.g., **trn1.2xlarge**) **without** using **optimum-neuron**. Instead, we directly use **Hugging Face Transformers** plus **torch-neuronx.trace** to compile models for Trainium. The system involves:
-
-* A **draft model** (smaller, faster) generating tokens speculatively.
-* A **target model** (larger, more accurate) validating those tokens.
-* **gRPC** for communication between the draft and target nodes.
-
-## Project Structure
-
-```text
-spec-decoding-llama3/
-├── README.md
-├── requirements.txt
-├── run_node.py                  # Main entry point for either draft or target role
-├── grpc_comm/
-│   ├── proto/
-│   │   ├── inference.proto      # gRPC service definitions
-│   │   └── (generated code)     # Inference gRPC stub/server code (after protoc)
-│   ├── grpc_server.py           # gRPC server implementation (target node)
-│   └── grpc_client.py           # gRPC client helper (draft node)
-├── inference/
-│   ├── model_loader.py          # Neuron model compilation & loading utilities
-│   ├── draft_worker.py          # Draft node logic (speculative token generation)
-│   ├── target_worker.py         # Target node logic (token verification & generation)
-│   ├── speculative.py           # Speculative decoding pipeline coordination
-│   └── verify.py                # Functional and performance verification routines
-└── scripts/
-    ├── compile_model.py         # Helper to compile a model with Optimum Neuron
-    └── launch_example.sh        # Example commands to launch draft/target nodes
+```
+pip install grpcio==1.71.0 grpcio-tools==1.66.2
+pip install gevent
 ```
 
+## Setup
 
-## **2. Setup and Installation**
+1. **Clone Repo & Install**:
 
-Below are the **step-by-step** instructions to get this running on **AWS Trainium** (**trn1** instance). We assume you have an **Ubuntu 22.04** AMI (or the official AWS Deep Learning AMI for Trainium). Adjust accordingly for other OS versions.
-
-1. **Provision your trn1 instances** (at least two if you want to split draft & target, or you can run both roles on the same instance in separate terminals).
-2. **Clone or copy** this repository onto **each** Trainium node. For instance:
-
-   ```
-   git clone https://github.com/yfzzzyyls/Choral-Spec.git
+   ```bash
+   git clone https://github.com/yfzzzyyls/Choral-Spec
    cd Choral-Spec
+   # Ensure torch-neuronx, transformers[neuron], grpcio, etc. are installed
+   ```
+2. **Download Models** (1B draft, 3B target) from Hugging Face. For example:
+
+   ```
+   cd ~
+   mkdir models
+   huggingface-cli download --token YOURTOKEN meta-llama/Llama-3.2-1B --local-dir /home/ubuntu/models/llama-3.2-1b
+   ```
+3. **Generate new grpc files**
+
+   ```
+   python -m grpc_tools.protoc -I . --python_out=. --grpc_python_out=. model_service.proto
+   python -m grpc_tools.protoc -I . --python_out=. --grpc_python_out=. service.proto
+   python -m grpc_tools.protoc -I . --python_out=. --grpc_python_out=. batch.proto
    ```
 
+   Notice: if you encounter import failure issue:
 
-3. **Install Python dependencies**
-   Make sure your **pip** uses the Neuron repository (if needed) and then install:
+   replace:
+
    ```
-   python -m pip install --upgrade \
-       "grpcio>=1.50.0" \
-       "grpcio-tools>=1.50.0" \
-       "sentencepiece>=0.1.99"
+   import model_service_pb2 as model__service__pb2
    ```
+
+   to:
+
+   ```
+   from . import model_service_pb2 as model__service__pb2
+   ```
+
+## **Usage: Single-Device Trainium**
+
+### **Start the Target Model Server**
+
+```
+python model_service.py --model-path /home/ubuntu/models/llama-3.2-3b --compiled-model-path /home/ubuntu/models/llama1b_neuron.pt --compile --max-context 1024
+```
+
+* This loads or compiles the 3B model for the Trainium device.
+* The server listens on port 50051 for gRPC calls.
+* Adjust **--max-context** if you want a different maximum context length for KV cache.
+
+### **Start the Draft Client**
+
+In another terminal on the same instance:
+
+```
+python draft_client.py --host localhost --port 50051 --model /home/ubuntu/models/llama-3.2-1b/ --compiled_model_path /home/ubuntu/models/llama1b_neuron_draft.pt --max_length 32 --gamma 4 --prompt "Once upon a time,"
+```
+
+* The client loads or compiles the 1B draft model.
+* **--gamma 4** means we generate 4 tokens at a time speculatively.
+* By default, we do incremental decoding with KV cache. The client sends tokens to the server for verification.
+* The final output text is printed with timing/throughput info.
+
+### **Example Output**
+
+```
+[Draft] Final output: Once upon a time, ...
+[Draft] Time: 2.35 s, tokens: 20, speed: 8.51 tokens/s
+```
+
+## **Performance Testing**
+
+Run the **evaluate_test.py** script to compare speculative decoding vs. target-only:
+
+1. **Ensure server is running** with the 3B model.
+2. Launch:
+
+```
+python evaluate_test.py
+  --host localhost --port 50051
+  --draft_model models/llama-3.2-1b
+  --compiled_draft_model models/llama1b_neuron.pt
+  --compile
+  --max_tokens 128 --gamma 4
+  --prompt "Once upon a time,"
+  --target_model_service
+```
+
+You’ll see something like:
+
+```
+Speculative decoding result:
+Once upon a time, ...
+Spec time: 2.12s, tokens=40, throughput=18.87 t/sBaseline target-only result:
+Once upon a time, ...
+Baseline time: 3.95s, tokens=40, throughput=10.12 t/s
+```
+
+This shows ~1.8x speedup from speculative decoding.
+
+## **Advanced Tips**
+
+* **NEURON_RT_VISIBLE_CORES**: If your instance has multiple NeuronCores, you can dedicate certain cores to the draft or server processes:
+
+```
+#In terminal 1 (server):export NEURON_RT_VISIBLE_CORES=4-15
+python model_service.py ...#In terminal 2 (draft):export NEURON_RT_VISIBLE_CORES=0-3
+python draft_client.py ...
+```
+
+This can allow parallel execution, improving throughput.
+
+* **Larger Models**: If using LLaMA 7B or bigger, you might need to distribute the model across multiple Neuron cores. That requires advanced compilation with **neuronx-distributed** or optimum-neuron. The approach is similar; just ensure the code references the sharded model.
+* **Modifying the Speculative Mechanism**: The draft code uses a simple loop with **use_cache=True**. If you want to do partial or multi-token steps differently, you can adapt the logic in **draft_client.py**

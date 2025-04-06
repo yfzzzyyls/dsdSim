@@ -1,64 +1,57 @@
+import os
 import torch
 import torch_neuronx
-from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM
 
-class LlamaDecoderWrapper(torch.nn.Module):
-    """Wrapper to adjust LLaMA model's head_dim and key/value heads for AWS Trainium (Neuron) compilation."""
-    def __init__(self, model, head_dim, num_key_value_heads):
-        super().__init__()
-        # Patch model configuration for head_dim and grouped key/value heads (GQA)
-        model.config.head_dim = head_dim
-        model.config.num_key_value_heads = num_key_value_heads
-        # Update derived attributes in attention layers (num_key_value_groups) to avoid mismatch
-        if hasattr(model, "model") and hasattr(model.model, "layers"):
-            for layer in model.model.layers:
-                if hasattr(layer, "self_attn"):
-                    layer.self_attn.num_key_value_groups = model.config.num_attention_heads // num_key_value_heads
-        self.model = model
+# Default maximum sequence length the compiled model supports (should match what was used in compilation)
+DEFAULT_MAX_SEQ_LEN = 1024
 
-    def forward(self, *args, **kwargs):
-        return self.model(*args, **kwargs)
+def _get_compiled_model_path(model_name_or_path: str, max_seq_length: int = DEFAULT_MAX_SEQ_LEN):
+    """Generate the expected compiled model file path for a given model name and sequence length."""
+    base_name = os.path.basename(os.path.normpath(model_name_or_path))
+    return f"{base_name}_neuron_bf16_{max_seq_length}.pt"
 
-
-def load_model(model_name_or_path, compile_to_neuron: bool = True):
+def load_model(model_name_or_path: str, use_compiled: bool = True, compile_if_missing: bool = False):
     """
-    Load a HuggingFace model and tokenizer. If on AWS Trainium (torch-neuronx available),
-    compile the model for Neuron. Applies LlamaDecoderWrapper for LLaMA models to fix
-    head_dim mismatch issues (using grouped query attention) without modifying Transformers.
+    Load a causal LM model. If use_compiled is True, will load a precompiled Neuron model (TorchScript .pt).
+    If the compiled model file is missing and compile_if_missing is True, will compile the model on the fly.
+    Otherwise, falls back to loading the model normally (on CPU/GPU).
     """
-    # 1) Load model configuration with torch_dtype = bfloat16
-    config = AutoConfig.from_pretrained(model_name_or_path)
-    config.torch_dtype = torch.bfloat16
-
-    # 2) Load model with the updated config
-    model = AutoModelForCausalLM.from_pretrained(
-        model_name_or_path,
-        config=config,
-        ignore_mismatched_sizes=True
-    )
-    tokenizer = AutoTokenizer.from_pretrained(model_name_or_path)
-
-    # 3) If the model is a LLaMA variant, apply wrapper for specific sizes
-    if model.config.model_type == "llama":
-        # Example case: LLaMA 1B (hidden_size=1024)
-        if model.config.hidden_size == 1024:
-            model = LlamaDecoderWrapper(model, head_dim=64, num_key_value_heads=8)
-        # Example case: LLaMA 3B (hidden_size=2048)
-        elif model.config.hidden_size == 2048:
-            model = LlamaDecoderWrapper(model, head_dim=128, num_key_value_heads=8)
-
-    # 4) Optionally compile the model to TorchScript on Neuron
-    if compile_to_neuron and torch_neuronx is not None:
-        model.eval()  # set to inference mode
-
-        # Create dummy inputs in bfloat16; seq length = 32
-        dummy_input_ids = torch.ones((1, 32), dtype=torch.bfloat16)
-        dummy_attn_mask = torch.ones_like(dummy_input_ids)  # also bfloat16
-
-        # Compile (trace) the model for Neuron
-        model = torch_neuronx.trace(
-            model,
-            example_inputs=(dummy_input_ids, dummy_attn_mask)
-        )
-
-    return model, tokenizer
+    if use_compiled:
+        # Determine expected compiled model file path
+        compiled_path = _get_compiled_model_path(model_name_or_path, max_seq_length=DEFAULT_MAX_SEQ_LEN)
+        if os.path.isfile(compiled_path):
+            # Load the precompiled model from disk
+            print(f"Loading precompiled model from {compiled_path} ...")
+            model = torch.jit.load(compiled_path)
+            # By default, the Neuron runtime assigns cores in a round-robin manner per process.
+            # If multiple models are loaded in one process, they will occupy different NeuronCores automatically.
+            # If running in separate processes (e.g., target and draft on different instances), each will use core0 by default.
+            # If needed, the model can be moved to a specific NeuronCore with torch_neuronx.move_trace_to_device.
+            # Attach metadata for downstream use
+            model.max_length = DEFAULT_MAX_SEQ_LEN
+            model.is_compiled = True
+            return model
+        else:
+            if compile_if_missing:
+                # Compile on the fly using compile_model module
+                print(f"Compiled model not found for {model_name_or_path}. Compiling now...")
+                from compile_model import compile_model as compile_fn
+                output_path = compile_fn(model_name_or_path, compiled_path, DEFAULT_MAX_SEQ_LEN)
+                print("Loading newly compiled model...")
+                model = torch.jit.load(output_path)
+                model.max_length = DEFAULT_MAX_SEQ_LEN
+                model.is_compiled = True
+                return model
+            else:
+                raise FileNotFoundError(f"Compiled model not found at {compiled_path}. Please run in compile mode first.")
+    # If not using compiled model, load normally (runs on CPU or GPU)
+    print(f"Loading model {model_name_or_path} without Neuron compilation (CPU/GPU mode)...")
+    model = AutoModelForCausalLM.from_pretrained(model_name_or_path)
+    model.eval()
+    # Attempt to use BF16 on CPU/GPU if supported (for memory savings)
+    try:
+        model.to(torch.bfloat16)
+    except Exception:
+        pass
+    return model

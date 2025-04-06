@@ -1,72 +1,68 @@
-import inference_pb2
+import model_loader
+import target_worker
+import draft_worker
+import torch
 
-def run_speculative_decoding(draft_model, tokenizer, stub, prompt, max_tokens, num_speculative):
+def speculative_decode(prompt, target_worker, draft_worker, max_steps=100, k=4):
     """
-    Coordinates speculative decoding between the draft model and the target via gRPC.
-    Returns the final output token list (including prompt and generated continuation).
+    Perform speculative decoding given a prompt, a target model worker, and a draft model worker.
+    - prompt: list of input token IDs (already tokenized input sequence)
+    - target_worker: an instance or interface to the target model (must support generate_token and verify_sequence)
+    - draft_worker: an instance or interface to the draft model (must support generate_token)
+    - max_steps: maximum number of decoding steps to generate
+    - k: speculative decoding window (target provides 1 token, draft speculates the next k-1 tokens)
+    Returns the full generated token sequence (including the prompt tokens and newly generated tokens).
     """
-    # Tokenize prompt for the draft model
-    prompt_enc = tokenizer(prompt, return_tensors="pt")
-    prompt_ids = prompt_enc["input_ids"][0].tolist()
-    # Start the session on target
-    start_req = inference_pb2.StartRequest(prompt=prompt, max_new_tokens=max_tokens)
-    stub.StartGeneration(start_req)
-    output_tokens = prompt_ids[:]  # initialize output with prompt tokens
-    generated_count = 0  # number of new tokens generated so far
+    # Ensure prompt is a list of token IDs (integers)
+    if isinstance(prompt, str):
+        raise ValueError("Prompt must be tokenized into token IDs before decoding.")
+    output_tokens = list(prompt)
+    end_of_text_token = None  # Define this based on the tokenizer (e.g., tokenizer.eos_token_id)
 
-    eos_token_id = tokenizer.eos_token_id
-    finished = False
+    for step in range(max_steps):
+        # Step 1: Target model generates one guaranteed token
+        input_ids = torch.tensor([output_tokens], dtype=torch.long)
+        target_logits = target_worker.generate_token(input_ids)
+        # Determine target_token (for simplicity, take argmax; could sample according to distribution if needed)
+        target_token = int(torch.argmax(target_logits, dim=-1)[0])
+        output_tokens.append(target_token)
+        if end_of_text_token is not None and target_token == end_of_text_token:
+            break  # Stop if end-of-sequence token generated
 
-    # Generation loop
-    while not finished and generated_count < max_tokens:
-        # Draft model generates up to `num_speculative` new tokens greedily (or until EOS if it comes sooner).
-        draft_context = tokenizer.decode(output_tokens, skip_special_tokens=False)
-        # We will generate one token at a time in a loop to have control, or use model.generate for speed.
+        # Step 2: Draft model speculates the next k-1 tokens
         draft_tokens = []
-        for _ in range(num_speculative):
-            # Stop if we reached max_tokens
-            if generated_count >= max_tokens:
+        for i in range(k - 1):
+            input_ids = torch.tensor([output_tokens], dtype=torch.long)
+            draft_logits = draft_worker.generate_token(input_ids)
+            # Sample a token from draft model's distribution (using argmax here for simplicity)
+            draft_token = int(torch.argmax(draft_logits, dim=-1)[0])
+            draft_tokens.append(draft_token)
+            output_tokens.append(draft_token)
+            if end_of_text_token is not None and draft_token == end_of_text_token:
                 break
-            input_ids = tokenizer(output_tokens, return_tensors="pt").input_ids
-            outputs = draft_model(input_ids)
-            logits = outputs.logits[0, -1, :]
-            next_id = int(logits.argmax())
-            # Append draft predicted token
-            draft_tokens.append(next_id)
-            # Append to output_tokens as provisional (they'll be removed if mismatch later)
-            output_tokens.append(next_id)
-            generated_count += 1
-            # Break if draft predicts EOS
-            if eos_token_id is not None and next_id == eos_token_id:
+        # If no speculative tokens (e.g., if draft immediately predicted EOS), continue to next loop iteration
+        if not draft_tokens:
+            continue
+
+        # Step 3: Verify the draft tokens with the target model in one pass
+        input_ids = torch.tensor([output_tokens], dtype=torch.long)
+        target_logits_seq = target_worker.verify_sequence(input_ids)
+        # Check each draft token against target's output distribution at that position
+        accept_all = True
+        for j, draft_token in enumerate(draft_tokens, start=1):
+            # Compare target model's predicted token at the position of this draft token
+            # (Using argmax for target's prediction; in practice, acceptance criteria could be probabilistic)
+            target_index = - (len(draft_tokens) - j + 1)  # index from the end for the j-th draft token
+            target_pred_id = int(torch.argmax(target_logits_seq[0, target_index, :]))
+            if target_pred_id != draft_token:
+                # Mismatch: target would have chosen a different token at this position
+                # Roll back the sequence to the point of divergence
+                output_tokens = output_tokens[: -(len(draft_tokens) - j + 1)]
+                output_tokens.append(target_pred_id)
+                accept_all = False
                 break
-
-        if len(draft_tokens) == 0:
-            # No tokens generated (max_tokens might have been reached)
-            break
-
-        # Send draft tokens to target for verification
-        verify_req = inference_pb2.VerifyRequest(draft_tokens=draft_tokens)
-        response = stub.VerifyDraftTokens(verify_req)
-        # Process response
-        if response.all_matched:
-            # All speculative tokens were correct
-            # They are already appended in output_tokens, and target model has accepted them.
-            finished = bool(response.finished)
-            # If finished is True, it means target encountered EOS (matching draft) or length limit
-        else:
-            # There was a mismatch at response.match_count (number of tokens matched)
-            # Truncate any extra draft tokens beyond the match
-            match_count = response.match_count
-            # The output_tokens list currently includes all draft_tokens; keep only those that matched
-            output_tokens = output_tokens[:len(output_tokens) - (len(draft_tokens) - match_count)]
-            # Append the correct token from target
-            correct_id = int(response.correct_token)
-            output_tokens.append(correct_id)
-            generated_count = len(output_tokens) - len(prompt_ids)  # recompute new tokens count
-            # If the correct token was EOS or target finished, mark finished
-            finished = bool(response.finished or (eos_token_id is not None and correct_id == eos_token_id))
-        # If we've generated max_tokens new tokens, end as well
-        if generated_count >= max_tokens:
-            finished = True
-
+        if not accept_all:
+            # If a mismatch occurred, we accepted target's token at the divergence and discard remaining draft tokens
+            continue
+        # If all draft tokens are accepted, they remain in output_tokens and we continue generating further tokens.
     return output_tokens
