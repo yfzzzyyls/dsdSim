@@ -28,7 +28,7 @@ def main():
             logger.error("Please specify --model for compile role")
             return
         # Import model_loader and compile the model
-        import model_loader
+        from inference import model_loader
         logger.info(f"Compiling model '{model_name}' with sequence length {seq_length}...")
         model_loader.compile_model(model_name, seq_length)
         logger.info("Model compilation completed.")

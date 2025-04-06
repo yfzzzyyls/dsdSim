@@ -50,17 +50,20 @@ pip install --upgrade transformers-neuronx
    from . import model_service_pb2 as model__service__pb2
    ```
 
-## **Usage: Single-Device Trainium**
+## **Usage:**
 
-### **Start the Target Model Server**
+export correct compiler flag
 
 ```
-python model_service.py --model-path /home/ubuntu/models/llama-3.2-3b --compiled-model-path /home/ubuntu/models/llama1b_neuron.pt --compile --max-context 1024
+export NEURON_CC_FLAGS="--model-type transformer"
+export NEURON_RT_NUM_CORES=2
 ```
 
-* This loads or compiles the 3B model for the Trainium device.
-* The server listens on port 50051 for gRPC calls.
-* Adjust **--max-context** if you want a different maximum context length for KV cache.
+### **Compile the Target Model Server**
+
+```
+python main.py --role compile --model /home/ubuntu/models/llama-3.2-3b/ --sequence_length 128
+```
 
 ### **Start the Draft Client**
 
