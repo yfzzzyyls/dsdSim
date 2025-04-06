@@ -63,21 +63,21 @@ export NEURON_RT_NUM_CORES=2
 
 ```
 python main.py --role compile --model /home/ubuntu/models/llama-3.2-3b/ --sequence_length 128
-python main.py --role compile --model /home/ubuntu/models/llama-3.2-1b/ --sequence_length 128
+python main.py --role compile --model /home/ubuntu/models/llama-3.2-3b/ --sequence_length 128
 ```
 
-### **Start the Draft Client**
-
-In another terminal on the same instance:
+### **Run the target server on target instance**
 
 ```
-python draft_client.py --host localhost --port 50051 --model /home/ubuntu/models/llama-3.2-1b/ --compiled_model_path /home/ubuntu/models/llama1b_neuron_draft.pt --max_length 32 --gamma 4 --prompt "Once upon a time,"
+python main.py --role target --model /home/ubuntu/models/llama-3.2-3b/ --port 50051 --sequence_length 128
 ```
 
-* The client loads or compiles the 1B draft model.
-* **--gamma 4** means we generate 4 tokens at a time speculatively.
-* By default, we do incremental decoding with KV cache. The client sends tokens to the server for verification.
-* The final output text is printed with timing/throughput info.
+### Run the draft server on draft instance
+
+```
+# Replace <TARGET_IP> with your target machine’s IP address.
+python main.py --role draft --model /home/ubuntu/models/llama-3.2-1b/ --target_host <TARGET_IP> --port 50051 --prompt "Once upon a time," --target_model /home/ubuntu/models/llama-3.2-3b/ --sequence_length 128 --max_new_tokens 50
+```
 
 ### **Example Output**
 
