@@ -1,68 +1,61 @@
-from . import model_loader
-from . import target_worker
-from . import draft_worker
-import torch
+import logging
+logger = logging.getLogger(__name__)
 
-def speculative_decode(prompt, target_worker, draft_worker, max_steps=100, k=4):
+def speculative_decode(draft_model, tokenizer, target_stub, prompt_text: str, max_new_tokens: int = 50, window_size: int = 4):
     """
-    Perform speculative decoding given a prompt, a target model worker, and a draft model worker.
-    - prompt: list of input token IDs (already tokenized input sequence)
-    - target_worker: an instance or interface to the target model (must support generate_token and verify_sequence)
-    - draft_worker: an instance or interface to the draft model (must support generate_token)
-    - max_steps: maximum number of decoding steps to generate
-    - k: speculative decoding window (target provides 1 token, draft speculates the next k-1 tokens)
-    Returns the full generated token sequence (including the prompt tokens and newly generated tokens).
+    Perform distributed speculative decoding: uses a draft model locally and a target model via gRPC.
+    Returns the generated text (excluding the prompt).
     """
-    # Ensure prompt is a list of token IDs (integers)
-    if isinstance(prompt, str):
-        raise ValueError("Prompt must be tokenized into token IDs before decoding.")
-    output_tokens = list(prompt)
-    end_of_text_token = None  # Define this based on the tokenizer (e.g., tokenizer.eos_token_id)
-
-    for step in range(max_steps):
-        # Step 1: Target model generates one guaranteed token
-        input_ids = torch.tensor([output_tokens], dtype=torch.long)
-        target_logits = target_worker.generate_token(input_ids)
-        # Determine target_token (for simplicity, take argmax; could sample according to distribution if needed)
-        target_token = int(torch.argmax(target_logits, dim=-1)[0])
-        output_tokens.append(target_token)
-        if end_of_text_token is not None and target_token == end_of_text_token:
-            break  # Stop if end-of-sequence token generated
-
-        # Step 2: Draft model speculates the next k-1 tokens
-        draft_tokens = []
-        for i in range(k - 1):
-            input_ids = torch.tensor([output_tokens], dtype=torch.long)
-            draft_logits = draft_worker.generate_token(input_ids)
-            # Sample a token from draft model's distribution (using argmax here for simplicity)
-            draft_token = int(torch.argmax(draft_logits, dim=-1)[0])
-            draft_tokens.append(draft_token)
-            output_tokens.append(draft_token)
-            if end_of_text_token is not None and draft_token == end_of_text_token:
-                break
-        # If no speculative tokens (e.g., if draft immediately predicted EOS), continue to next loop iteration
-        if not draft_tokens:
-            continue
-
-        # Step 3: Verify the draft tokens with the target model in one pass
-        input_ids = torch.tensor([output_tokens], dtype=torch.long)
-        target_logits_seq = target_worker.verify_sequence(input_ids)
-        # Check each draft token against target's output distribution at that position
-        accept_all = True
-        for j, draft_token in enumerate(draft_tokens, start=1):
-            # Compare target model's predicted token at the position of this draft token
-            # (Using argmax for target's prediction; in practice, acceptance criteria could be probabilistic)
-            target_index = - (len(draft_tokens) - j + 1)  # index from the end for the j-th draft token
-            target_pred_id = int(torch.argmax(target_logits_seq[0, target_index, :]))
-            if target_pred_id != draft_token:
-                # Mismatch: target would have chosen a different token at this position
-                # Roll back the sequence to the point of divergence
-                output_tokens = output_tokens[: -(len(draft_tokens) - j + 1)]
-                output_tokens.append(target_pred_id)
-                accept_all = False
-                break
-        if not accept_all:
-            # If a mismatch occurred, we accepted target's token at the divergence and discard remaining draft tokens
-            continue
-        # If all draft tokens are accepted, they remain in output_tokens and we continue generating further tokens.
-    return output_tokens
+    # Encode the prompt text to input IDs
+    input_ids = tokenizer(prompt_text, return_tensors='pt').input_ids
+    output_text = ""
+    # Initialize conversation with target: send prompt to target and get first token
+    logger.info("Sending initial prompt to target for first token...")
+    from speculative_pb2 import NextTokenRequest  # import here to avoid dependency issues
+    request = NextTokenRequest(prompt=prompt_text)
+    response = target_stub.NextToken(request)
+    target_token_id = response.token_id
+    target_token_text = response.token_text
+    # Append to output
+    output_text += target_token_text
+    # Extend the input_ids with the new token for both draft and tracking target context
+    import torch
+    new_token_tensor = torch.tensor([[target_token_id]], dtype=input_ids.dtype)
+    input_ids = torch.cat([input_ids, new_token_tensor], dim=1)
+    logger.info(f"Received first token from target: {repr(target_token_text)} (id {target_token_id})")
+    # Generate remaining tokens
+    tokens_generated = 1
+    while tokens_generated < max_new_tokens:
+        # Use draft model to predict the next token
+        # (We generate one token at a time for simplicity; window_size could be used for future optimization)
+        draft_seq = draft_model.sample(input_ids, sequence_length=input_ids.shape[1] + 1)
+        # draft_seq may be a PyTorch tensor or list; handle accordingly
+        if isinstance(draft_seq, (list, tuple)):
+            draft_token_id = int(draft_seq[0][-1]) if isinstance(draft_seq[0], (list, tuple)) else int(draft_seq[0])
+        else:
+            # Assume it's a tensor
+            draft_token_id = int(draft_seq[0, -1])
+        draft_token_text = tokenizer.decode([draft_token_id])
+        # Ask target for the next token (without sending prompt again)
+        request = NextTokenRequest(prompt="")  # empty prompt indicates continuation
+        response = target_stub.NextToken(request)
+        target_token_id = response.token_id
+        target_token_text = response.token_text
+        # Compare draft's prediction with target's actual token
+        if target_token_id == draft_token_id:
+            # Speculative token accepted
+            logger.info(f"Draft predicted token correctly: {repr(draft_token_text)}")
+            output_text += target_token_text
+        else:
+            # Draft was wrong, use target's token
+            logger.info(f"Draft prediction {repr(draft_token_text)} diverged, accepting target token {repr(target_token_text)} instead")
+            output_text += target_token_text
+            # Discard the draft token (if wrong, we reset the draft's assumed context to match target)
+            draft_token_id = target_token_id
+            draft_token_text = target_token_text
+        # Append the accepted token (target_token_id) to input_ids for draft model context
+        new_token_tensor = torch.tensor([[target_token_id]], dtype=input_ids.dtype)
+        input_ids = torch.cat([input_ids, new_token_tensor], dim=1)
+        tokens_generated += 1
+        # (Optional: break if EOS token is generated)
+    return output_text

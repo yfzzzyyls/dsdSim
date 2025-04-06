@@ -9,6 +9,7 @@ install dependencies
 ```
 pip install grpcio==1.71.0 grpcio-tools==1.66.2
 pip install gevent
+pip install --upgrade transformers-neuronx
 ```
 
 ## Setup
@@ -27,7 +28,7 @@ pip install gevent
    mkdir models
    huggingface-cli download --token YOURTOKEN meta-llama/Llama-3.2-1B --local-dir /home/ubuntu/models/llama-3.2-1b
    ```
-3. **Generate new grpc files**
+3. **Optinal: Generate new grpc files**
 
    ```
    python -m grpc_tools.protoc -I . --python_out=. --grpc_python_out=. model_service.proto
