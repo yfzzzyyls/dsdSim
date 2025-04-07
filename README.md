@@ -1,6 +1,6 @@
-# Distributed Inference with Speculative Decoding on AWS Trainium
+# Distributed Speculative Decoding on AWS Trainium
 
-This repository has been adapted for **single-device** AWS Trainium usage with **speculative decoding** by default, using **Meta LLaMA 3.2** (1B draft + 3B target) in **bfloat16**. We assume you have an **AWS DLAMI** with Neuron SDK installed.
+This repository has been adapted for **multi-device** AWS Trainium usage with **speculative decoding**, using **Meta LLaMA 3.2** (1B draft + 3B target) in **bfloat16**.
 
 ## Dpendencies
 
@@ -18,8 +18,6 @@ pip install --upgrade transformers-neuronx
 
    ```bash
    git clone https://github.com/yfzzzyyls/Choral-Spec
-   cd Choral-Spec
-   # Ensure torch-neuronx, transformers[neuron], grpcio, etc. are installed
    ```
 2. **Download Models** (1B draft, 3B target) from Hugging Face. For example:
 
@@ -52,33 +50,23 @@ pip install --upgrade transformers-neuronx
 
 ## **Usage:**
 
-export correct compiler flag
+export compiler flag
 
 ```
 export NEURON_CC_FLAGS="--model-type transformer"
 export NEURON_RT_NUM_CORES=2
 ```
 
-### **Compile the Target and Draft Model Server**
+### **Compile & Run the Target Model Server**
 
 ```
-# target model
-python main.py --role compile --model /home/ubuntu/models/llama-3.2-3b/ --sequence_length 128
-# draft model
-python main.py --role compile --model /home/ubuntu/models/llama-3.2-1b/ --sequence_length 128
+python main.py --role target --model /home/ubuntu/models/llama-3.2-3b --port 50051 --sequence_length 128
 ```
 
-### **Run the target server on target instance**
+### **Compile & Run the Draft Model server**
 
 ```
-python main.py --role target --model /home/ubuntu/models/llama-3.2-3b/ --port 50051 --sequence_length 128
-```
-
-### Run the draft server on draft instance
-
-```
-# IMPORTANT: compile the same target model locally on draft server before running this command
-python main.py --role draft --model /home/ubuntu/models/llama-3.2-1b/ --target_host 3.22.171.151 --port 50051 --prompt "Once upon a time," --target_model /home/ubuntu/Choral-Spec/llama-3.2-3b-neuron-compiled-128/ --sequence_length 128
+python main.py --role draft --model /home/ubuntu/models/llama-3.2-1b --target_host 3.16.109.246 --port 50051 --prompt "Once upon a time," --target_model /home/ubuntu/models/llama-3.2-3b
 ```
 
 ### **Example Output**
@@ -91,22 +79,6 @@ python main.py --role draft --model /home/ubuntu/models/llama-3.2-1b/ --target_h
 ## **Performance Testing**
 
 Run the **evaluate_test.py** script to compare speculative decoding vs. target-only:
-
-1. **Ensure server is running** with the 3B model.
-2. Launch:
-
-```
-python evaluate_test.py
-  --host localhost --port 50051
-  --draft_model models/llama-3.2-1b
-  --compiled_draft_model models/llama1b_neuron.pt
-  --compile
-  --max_tokens 128 --gamma 4
-  --prompt "Once upon a time,"
-  --target_model_service
-```
-
-You’ll see something like:
 
 ```
 Speculative decoding result:
