@@ -6,24 +6,6 @@ This repository has been adapted for **multi-device** AWS Trainium usage with **
 
 Below is an overview of the repository structure and how the modules relate to each other:
 
-```
-Choral-Spec/
-├── main.py                  # CLI entry point; parses args and launches roles (draft, target, compile, verify)
-├── inference/               # Package for model loading, speculative decoding, and verification logic
-│   ├── model_loader.py      # Utilities to load or compile LLaMA models on AWS Neuron, provides `load_model` and `compile_model`
-│   ├── draft_worker.py      # Draft client process: performs speculative decoding, communicates with target server via gRPC
-│   ├── target_worker.py     # Target server process: serves the target model over gRPC (one token at a time)
-│   ├── speculative.py       # Implements the speculative decoding algorithm (combines draft model predictions with target verification)
-│   └── verify.py            # Verification utilities: can run a model standalone for debugging, and compare draft vs target outputs
-├── grpc_comm/               # gRPC definitions and generated code for inter-process communication
-│   ├── inference.proto          # Definition of SpeculativeService (gRPC service for generation and verification)
-│   ├── inference_pb2.py         # Generated Python classes from the proto definitions
-│   └── inference_pb2_grpc.py    # Generated gRPC client/server code based on the proto
-├── evaluate_test.py         # Script to evaluate performance of speculative decoding vs. baseline
-├── requirements.txt         # Python dependencies for the project
-└── README.md                # Documentation and usage instructions
-
-```
 
 ## Dpendencies
 
