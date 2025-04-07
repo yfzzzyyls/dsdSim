@@ -4,7 +4,7 @@ from transformers import AutoTokenizer
 import inference_pb2
 import inference_pb2_grpc
 from . import model_loader
-from . import speculative
+from .speculative import speculative_decode  # Import the function, not the module
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -17,17 +17,22 @@ def run_client(draft_model_name: str, target_host: str = "localhost", port: int 
     # Use the target model name for tokenizer if provided (to ensure same vocabulary)
     tokenizer_name = target_model_name or draft_model_name
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_name, use_fast=False)
+    
     # Connect to target server via gRPC
     address = f"{target_host}:{port}"
     logger.info(f"Connecting to target at {address}...")
     channel = grpc.insecure_channel(address)
     stub = inference_pb2_grpc.SpeculativeServiceStub(channel)
+    
     if not prompt:
         logger.error("No prompt provided for draft client.")
         return
+    
     logger.info(f"Starting speculative decoding for prompt: {repr(prompt)}")
-    generated_text = speculative(draft_model, tokenizer, stub, prompt, max_new_tokens=max_new_tokens)
+    # Call the imported function instead of the module
+    generated_text = speculative_decode(draft_model, tokenizer, stub, prompt, max_new_tokens=max_new_tokens)
     logger.info("Speculative decoding completed.")
+    
     full_output = prompt + generated_text
     print("\n=== Final Output ===\n" + full_output)
 
