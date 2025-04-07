@@ -77,7 +77,8 @@ python main.py --role target --model /home/ubuntu/models/llama-3.2-3b/ --port 50
 ### Run the draft server on draft instance
 
 ```
-python main.py --role draft --model /home/ubuntu/models/llama-3.2-1b/ --target_host <TARGET_IP> --port 50051 --prompt "Once upon a time," --target_model /home/ubuntu/models/llama-3.2-3b/ --sequence_length 128 --max_new_tokens 50
+# IMPORTANT: compile the same target model locally on draft server before running this command
+python main.py --role draft --model /home/ubuntu/models/llama-3.2-1b/ --target_host 3.22.171.151 --port 50051 --prompt "Once upon a time," --target_model /home/ubuntu/Choral-Spec/llama-3.2-3b-neuron-compiled-128/ --sequence_length 128
 ```
 
 ### **Example Output**
