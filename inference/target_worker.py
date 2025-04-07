@@ -1,32 +1,32 @@
 import logging
-from concurrent import futures
-
+import os
 import grpc
-
-import inference_pb2, inference_pb2_grpc  # gRPC generated classes
-from inference import model_loader
+from concurrent import futures
 from transformers import AutoTokenizer
+from inference import model_loader
+import inference_pb2
+import inference_pb2_grpc
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
     def __init__(self, model_path, sequence_length=128):
-        # Load the target model (compile if necessary). model_path can be a base model path or a compiled model directory.
+        # Load the pre-compiled (or compile on the fly) target model
+        # model_path should be the path to the model or compiled model directory.
+        logger.info(f"Loading target model from '{model_path}' (sequence_length={sequence_length})...")
         self.model = model_loader.load_model(model_path, sequence_length=sequence_length)
-        # Load tokenizer from the same path (compiled dir contains tokenizer files if model was compiled)
         self.tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=False)
         logger.info("Target model and tokenizer loaded.")
 
     def StartGeneration(self, request, context):
         logger.info("StartGeneration called with prompt: %s", request.prompt)
-        # (Optional) Initialize generation state if needed
+        # (Optionally initialize a generation session here - not used in this implementation)
         return inference_pb2.StartResponse(acknowledged=True)
 
     def VerifyDraftTokens(self, request, context):
         logger.info("VerifyDraftTokens called with draft_tokens: %s", request.draft_tokens)
-        # **Note**: This is a placeholder. In a full implementation, the target model 
-        # would verify which of the draft tokens are correct. Here we assume all match.
+        # Placeholder implementation: always acknowledge all tokens as matched
         return inference_pb2.VerifyResponse(
             all_matched=True,
             match_count=len(request.draft_tokens),
@@ -36,9 +36,8 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
 
     def GenerateFull(self, request, context):
         logger.info("GenerateFull called with prompt: %s", request.prompt)
-        # Generate one token from the target model given the prompt
+        # Use the target model to generate one token continuation for the given prompt
         input_ids = self.tokenizer(request.prompt, return_tensors="pt").input_ids
-        # Use the model's sampling method to get the next token (sequence_length = current length + 1)
         output = self.model.sample(input_ids, sequence_length=input_ids.shape[1] + 1)
         # Extract the generated token ID
         if isinstance(output, (list, tuple)):
@@ -50,23 +49,20 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
         return inference_pb2.GenerateResponse(output_text=token_text)
 
 def run_server(model_path, port=50051, sequence_length=128):
-    # Create a gRPC server
+    # Start a gRPC server for the target model
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=10))
-    # Instantiate the service servicer, which will load/compile the model
     servicer = SpeculativeServiceServicer(model_path, sequence_length=sequence_length)
     inference_pb2_grpc.add_SpeculativeServiceServicer_to_server(servicer, server)
     server.add_insecure_port(f"[::]:{port}")
-    logger.info("Target server starting on port %d", port)
+    logger.info("Target server starting on port %d (sequence_length=%d)", port, sequence_length)
     server.start()
     server.wait_for_termination()
 
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser(description="Target worker for speculative decoding")
-    parser.add_argument("--model", type=str, required=True, 
-                        help="Path to the target model (base model path or compiled model directory)")
-    parser.add_argument("--port", type=int, default=50051, help="Port for the target gRPC server")
-    parser.add_argument("--sequence_length", type=int, default=128, 
-                        help="Sequence length for model compilation (if the model is not yet compiled)")
+    parser.add_argument("--model", type=str, required=True, help="Path to the target model (original or compiled directory)")
+    parser.add_argument("--port", type=int, default=50051, help="Port for the gRPC server")
+    parser.add_argument("--sequence_length", type=int, default=128, help="Sequence length for model inference")
     args = parser.parse_args()
     run_server(args.model, port=args.port, sequence_length=args.sequence_length)
