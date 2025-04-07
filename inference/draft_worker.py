@@ -1,8 +1,8 @@
 import grpc
 import logging
 from transformers import AutoTokenizer
-import speculative_pb2
-import speculative_pb2_grpc
+import inference_pb2
+import inference_pb2_grpc
 import model_loader
 from speculative import speculative_decode
 
@@ -21,7 +21,7 @@ def run_client(draft_model_name: str, target_host: str = "localhost", port: int 
     address = f"{target_host}:{port}"
     logger.info(f"Connecting to target at {address}...")
     channel = grpc.insecure_channel(address)
-    stub = speculative_pb2_grpc.SpeculativeServiceStub(channel)
+    stub = inference_pb2_grpc.SpeculativeServiceStub(channel)
     if not prompt:
         logger.error("No prompt provided for draft client.")
         return
