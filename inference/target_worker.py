@@ -1,67 +1,70 @@
 import grpc
 from concurrent import futures
 import logging
-import torch
-from transformers import AutoTokenizer
+from transformers_neuronx import LlamaForSampling
+from transformers import AutoTokenizer, LlamaConfig
 import inference_pb2
 import inference_pb2_grpc
-from . import model_loader
+import os
+from inference import model_loader  # Ensure this loads your precompiled model
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-class SpeculativeService(inference_pb2_grpc.SpeculativeServiceServicer):
-    def __init__(self, model_name: str, sequence_length: int = 128):
-        # Load the target model (compiling if necessary)
-        logger.info(f"Loading target model '{model_name}'...")
-        self.model = model_loader.load_model(model_name, sequence_length=sequence_length)
-        # Initialize tokenizer for the model
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=False)
-        # Track the current context tokens for generation
-        self.input_ids = None
+class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
+    def __init__(self, model_path, sequence_length=128):
+        # Load the pre-compiled target model (compiled folder)
+        # model_path should be the path to the pre-compiled target model folder,
+        # for example: '/home/ubuntu/Choral-Spec/llama-3.2-3b-neuron-compiled-128'
+        self.model = model_loader.load_model(model_path, sequence_length=sequence_length)
+        self.tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=False)
+        logger.info("Target model and tokenizer loaded.")
 
-    def NextToken(self, request, context):
-        # If a prompt is provided in the request, treat this as a new generation or reset
-        prompt = request.prompt
-        if prompt:
-            # Encode prompt and set as current context
-            enc = self.tokenizer(prompt, return_tensors='pt')
-            self.input_ids = enc.input_ids
-            # First call: generate one token after the prompt
-            seq = self.model.sample(self.input_ids, sequence_length=self.input_ids.shape[1] + 1)
-        else:
-            # Continue from existing context (generate next token)
-            if self.input_ids is None:
-                context.set_code(grpc.StatusCode.INVALID_ARGUMENT)
-                context.set_details("No prompt provided and no existing context.")
-                return inference_pb2.NextTokenResponse()
-            seq = self.model.sample(self.input_ids, sequence_length=self.input_ids.shape[1] + 1)
-        # Extract the newly generated token
-        if isinstance(seq, (list, tuple)):
-            token_id = int(seq[0][-1]) if isinstance(seq[0], (list, tuple)) else int(seq[0])
-        else:
-            token_id = int(seq[0, -1])
-        token_text = self.tokenizer.decode([token_id])
-        # Append the new token to context for future generation
-        new_token_tensor = torch.tensor([[token_id]])
-        self.input_ids = torch.cat([self.input_ids, new_token_tensor], dim=1)
-        logger.info(f"Target model generated token: {repr(token_text)} (id {token_id})")
-        return inference_pb2.NextTokenResponse(token_id=token_id, token_text=token_text)
+    def StartGeneration(self, request, context):
+        logger.info("StartGeneration called with prompt: %s", request.prompt)
+        # (Optionally, you might initialize a generation session here)
+        return inference_pb2.StartResponse(acknowledged=True)
 
-def run_server(model_name: str, port: int = 50051):
-    server = grpc.server(futures.ThreadPoolExecutor(max_workers=1))
-    speculative_service = SpeculativeService(model_name)
-    inference_pb2_grpc.add_SpeculativeServiceServicer_to_server(speculative_service, server)
-    server_address = f'[::]:{port}'
-    server.add_insecure_port(server_address)
+    def VerifyDraftTokens(self, request, context):
+        logger.info("VerifyDraftTokens called with draft_tokens: %s", request.draft_tokens)
+        # Placeholder: for now, assume all tokens match.
+        return inference_pb2.VerifyResponse(
+            all_matched=True,
+            match_count=len(request.draft_tokens),
+            correct_token=0,
+            finished=False
+        )
+
+    def GenerateFull(self, request, context):
+        logger.info("GenerateFull called with prompt: %s", request.prompt)
+        # Use the target model to generate one token.
+        input_ids = self.tokenizer(request.prompt, return_tensors="pt").input_ids
+        # Generate one additional token.
+        output = self.model.sample(input_ids, sequence_length=input_ids.shape[1] + 1)
+        # Handle both tensor and list outputs.
+        if isinstance(output, (list, tuple)):
+            token_id = int(output[0][-1])
+        else:
+            token_id = int(output[0, -1])
+        token_text = self.tokenizer.decode([token_id]).strip()
+        logger.info("GenerateFull returning token: %s", token_text)
+        return inference_pb2.GenerateResponse(output_text=token_text)
+
+def run_server(model_path, port=50051):
+    server = grpc.server(futures.ThreadPoolExecutor(max_workers=10))
+    servicer = SpeculativeServiceServicer(model_path)
+    inference_pb2_grpc.add_SpeculativeServiceServicer_to_server(servicer, server)
+    server.add_insecure_port(f"[::]:{port}")
+    logger.info("Target server starting on port %d", port)
     server.start()
-    logger.info(f"Target server is running on port {port}")
     server.wait_for_termination()
 
 if __name__ == "__main__":
     import argparse
-    parser = argparse.ArgumentParser(description="Target worker (server) for speculative decoding")
-    parser.add_argument("--model", type=str, required=True, help="Target model name or path")
-    parser.add_argument("--port", type=int, default=50051, help="Port to run the gRPC server on")
+    parser = argparse.ArgumentParser(description="Target worker for speculative decoding")
+    parser.add_argument("--model", type=str, required=True, 
+                        help="Path to the pre-compiled target model (e.g., /home/ubuntu/Choral-Spec/llama-3.2-3b-neuron-compiled-128)")
+    parser.add_argument("--port", type=int, default=50051, help="Port for gRPC server")
+    parser.add_argument("--sequence_length", type=int, default=128, help="Sequence length for model inference")
     args = parser.parse_args()
     run_server(args.model, port=args.port)
