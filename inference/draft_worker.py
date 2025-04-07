@@ -1,7 +1,7 @@
 import logging
 import grpc
 
-import inference_pb2_grpc
+from grpc_comm import inference_pb2_grpc
 from inference.model_loader import load_model
 from inference.speculative import speculative_decode
 from transformers import AutoTokenizer

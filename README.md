@@ -29,23 +29,20 @@ pip install --upgrade transformers-neuronx
 3. **Optinal: Generate new grpc files**
 
    ```
-   python -m grpc_tools.protoc -I . --python_out=. --grpc_python_out=. model_service.proto
-   python -m grpc_tools.protoc -I . --python_out=. --grpc_python_out=. service.proto
-   python -m grpc_tools.protoc -I . --python_out=. --grpc_python_out=. batch.proto
+   cd Choral-Spec/grpc_comm
+   python -m grpc_tools.protoc -I. --python_out=. --grpc_python_out=. inference.proto
    ```
 
-   Notice: if you encounter import failure issue:
-
-   replace:
+   Notice: in inference_pb2_grpc.py, if you have the following code:
 
    ```
-   import model_service_pb2 as model__service__pb2
+   import inference_pb2 as inference__pb2
    ```
 
-   to:
+   replace it with:
 
    ```
-   from . import model_service_pb2 as model__service__pb2
+   from . import inference_pb2 as inference__pb2
    ```
 
 ## **Usage:**

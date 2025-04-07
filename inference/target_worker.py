@@ -4,8 +4,8 @@ import grpc
 from concurrent import futures
 from transformers import AutoTokenizer
 from inference import model_loader
-import inference_pb2
-import inference_pb2_grpc
+from grpc_comm import inference_pb2
+from grpc_comm import inference_pb2_grpc
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)

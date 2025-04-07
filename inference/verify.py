@@ -3,7 +3,7 @@ import logging
 import torch
 from transformers import AutoTokenizer
 from inference.model_loader import load_model
-import inference_pb2
+from grpc_comm import inference_pb2
 
 logger = logging.getLogger(__name__)
 

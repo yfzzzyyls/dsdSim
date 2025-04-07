@@ -14,7 +14,7 @@ def speculative_decode(draft_model, tokenizer, target_stub, prompt_text: str, ma
     
     # Get the first token from the target model via GenerateFull RPC
     logger.info("Sending initial prompt to target for first token...")
-    from inference_pb2 import GenerateRequest
+    from grpc_comm.inference_pb2 import GenerateRequest
     request = GenerateRequest(prompt=prompt_text, max_new_tokens=1)
     response = target_stub.GenerateFull(request)
     target_token_text = response.output_text.strip()
