@@ -2,6 +2,29 @@
 
 This repository has been adapted for **multi-device** AWS Trainium usage with **speculative decoding**, using **Meta LLaMA 3.2** (1B draft + 3B target) in **bfloat16**.
 
+## Project Structure
+
+Below is an overview of the repository structure and how the modules relate to each other:
+
+```
+Choral-Spec/
+├── main.py                  # CLI entry point; parses args and launches roles (draft, target, compile, verify)
+├── inference/               # Package for model loading, speculative decoding, and verification logic
+│   ├── model_loader.py      # Utilities to load or compile LLaMA models on AWS Neuron, provides `load_model` and `compile_model`
+│   ├── draft_worker.py      # Draft client process: performs speculative decoding, communicates with target server via gRPC
+│   ├── target_worker.py     # Target server process: serves the target model over gRPC (one token at a time)
+│   ├── speculative.py       # Implements the speculative decoding algorithm (combines draft model predictions with target verification)
+│   └── verify.py            # Verification utilities: can run a model standalone for debugging, and compare draft vs target outputs
+├── grpc_comm/               # gRPC definitions and generated code for inter-process communication
+│   ├── inference.proto          # Definition of SpeculativeService (gRPC service for generation and verification)
+│   ├── inference_pb2.py         # Generated Python classes from the proto definitions
+│   └── inference_pb2_grpc.py    # Generated gRPC client/server code based on the proto
+├── evaluate_test.py         # Script to evaluate performance of speculative decoding vs. baseline
+├── requirements.txt         # Python dependencies for the project
+└── README.md                # Documentation and usage instructions
+
+```
+
 ## Dpendencies
 
 install dependencies
@@ -33,7 +56,7 @@ pip install --upgrade transformers-neuronx
    python -m grpc_tools.protoc -I. --python_out=. --grpc_python_out=. inference.proto
    ```
 
-   Notice: in inference_pb2_grpc.py, if you have the following code:
+   Notice: in the newly generated inference_pb2_grpc.py, if you have the following code:
 
    ```
    import inference_pb2 as inference__pb2
@@ -72,6 +95,28 @@ python main.py --role draft --model /home/ubuntu/models/llama-3.2-1b --target_ho
 [Draft] Final output: Once upon a time, ...
 [Draft] Time: 2.35 s, tokens: 20, speed: 8.51 tokens/s
 ```
+
+## **Run a Single Model for Verification**
+
+You can also run either the draft or target model **standalone** (without speculative decoding) to verify its generation output token-by-token. This is useful for debugging and sanity checks to ensure each model behaves as expected given a prompt.
+
+For example, to run the **target model** by itself on a prompt:
+
+```
+python main.py --role verify_target --model /home/ubuntu/models/llama-3.2-3b --prompt "Once upon a time," --max_tokens 20
+```
+
+This will load the 3B target model and generate 20 tokens continuing the prompt, printing each generated token as it arrives, followed by the full output text.
+
+Similarly, to run the **draft model** by itself:
+
+```
+python main.py --role verify_draft --model /home/ubuntu/models/llama-3.2-1b --prompt "Once upon a time," --max_tokens 20
+```
+
+This will use the 1B draft model to generate text token-by-token for the given prompt.
+
+*Note:* In verification modes, the model will be compiled on the fly if a compiled Neuron model is not found. By default,** **`--sequence_length 128` is used; ensure you use the same sequence length that the model was compiled with (or specify** **`--sequence_length` accordingly) to avoid recompilation. The** **`--max_tokens` option controls how many new tokens to generate for the prompt.
 
 ## **Performance Testing**
 
