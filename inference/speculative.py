@@ -11,7 +11,7 @@ def speculative_decode(draft_model, tokenizer, target_stub, prompt_text: str, ma
     output_text = ""
     # Initialize conversation with target: send prompt to target and get first token
     logger.info("Sending initial prompt to target for first token...")
-    from speculative_pb2 import NextTokenRequest  # import here to avoid dependency issues
+    from inference_pb2 import NextTokenRequest  # import here to avoid dependency issues
     request = NextTokenRequest(prompt=prompt_text)
     response = target_stub.NextToken(request)
     target_token_id = response.token_id

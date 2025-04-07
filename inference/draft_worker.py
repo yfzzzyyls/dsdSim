@@ -3,8 +3,8 @@ import logging
 from transformers import AutoTokenizer
 import inference_pb2
 import inference_pb2_grpc
-import model_loader
-from speculative import speculative_decode
+from . import model_loader
+from . import speculative
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -26,7 +26,7 @@ def run_client(draft_model_name: str, target_host: str = "localhost", port: int 
         logger.error("No prompt provided for draft client.")
         return
     logger.info(f"Starting speculative decoding for prompt: {repr(prompt)}")
-    generated_text = speculative_decode(draft_model, tokenizer, stub, prompt, max_new_tokens=max_new_tokens)
+    generated_text = speculative(draft_model, tokenizer, stub, prompt, max_new_tokens=max_new_tokens)
     logger.info("Speculative decoding completed.")
     full_output = prompt + generated_text
     print("\n=== Final Output ===\n" + full_output)
