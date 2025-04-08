@@ -1,44 +1,43 @@
 syntax = "proto3";
-
 package specdecode;
 
-// The speculative decoding gRPC service definition.
 service SpeculativeService {
-  // Initialize a generation session with the prompt.
-  rpc StartGeneration(StartRequest) returns (StartResponse);
-  // Verify a batch of draft tokens against the target model.
-  rpc VerifyDraftTokens(VerifyRequest) returns (VerifyResponse);
-  // Generate a full completion using only the target model (for verification/perf).
-  rpc GenerateFull(GenerateRequest) returns (GenerateResponse);
+  // Existing single-token generation, if used
+  rpc Generate(GenerateRequest) returns (GenerateResponse);
+
+  // Possibly existing single-token verification, if you keep it
+  rpc VerifyDraftToken(VerifyRequest) returns (VerifyResponse);
+
+  // NEW: single-shot chunk verification
+  rpc VerifyDraftChunk(VerifyChunkRequest) returns (VerifyChunkResponse);
 }
 
-// Message definitions
-message StartRequest {
-  string prompt = 1;           // The prompt text to start generation
-  int32 max_new_tokens = 2;    // Maximum number of tokens to generate (optional)
-}
-
-message StartResponse {
-  // Simple acknowledgment, can include a session ID for future use if needed.
-  bool acknowledged = 1;
-}
-
-message VerifyRequest {
-  repeated int32 draft_tokens = 1;  // Batch of speculative tokens from draft model
-}
-
-message VerifyResponse {
-  bool all_matched = 1;        // True if all draft_tokens matched the target's output
-  int32 match_count = 2;       // Number of tokens that matched before a mismatch (equals len(draft_tokens) if all_matched)
-  int32 correct_token = 3;     // The target model's token at first mismatch (undefined if all_matched=true)
-  bool finished = 4;           // True if generation is finished (target produced EOS or reached max length)
-}
-
+// For single-token generation
 message GenerateRequest {
-  string prompt = 1;
-  int32 max_new_tokens = 2;
+  // (You can define fields like 'input_ids' or 'past_key_values' if needed.
+  // This demo just uses a placeholder.)
+}
+message GenerateResponse {
+  int32 token_id = 1;  // The single token the target model outputs
 }
 
-message GenerateResponse {
-  string output_text = 1;
+// For single-token verification (if you keep it)
+message VerifyRequest {
+  int32 draft_token_id = 1;
+}
+message VerifyResponse {
+  bool match = 1;
+  int32 correct_token_id = 2; // only if match=false
+}
+
+// NEW: chunk-based verification request
+message VerifyChunkRequest {
+  repeated int32 draft_tokens = 1;  // The entire chunk from draft
+}
+
+// NEW: chunk-based verification response
+message VerifyChunkResponse {
+  bool all_match = 1;               // True if entire chunk matched
+  uint32 match_prefix_length = 2;   // # of tokens (from the start) that matched
+  int32 correct_token_id = 3;       // The target’s correct token at first mismatch (if all_match=false)
 }

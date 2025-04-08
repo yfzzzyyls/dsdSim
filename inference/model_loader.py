@@ -2,129 +2,49 @@ import os
 import json
 import logging
 import torch
-from transformers_neuronx import LlamaForSampling
-from transformers import AutoTokenizer, LlamaConfig
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Default compilation settings
 DEFAULT_SEQUENCE_LENGTH = 128
-DEFAULT_TP_DEGREE = 2
-DEFAULT_DTYPE = 'bf16'
 
-def load_model(model_name: str,
-               sequence_length: int = DEFAULT_SEQUENCE_LENGTH,
-               tp_degree: int = DEFAULT_TP_DEGREE,
-               dtype: str = DEFAULT_DTYPE):
+def load_model(model_path: str, sequence_length: int = DEFAULT_SEQUENCE_LENGTH):
     """
-    Load a LLaMA model for AWS Neuron.
-    If model_name is a pre-compiled folder (contains config.json and a dummy checkpoint),
-    load the model using from_pretrained(). Otherwise, compile the model.
+    Load a LLaMA (or other) model for huggingface + Trainium usage in normal HF format.
+    If the model_path is already “compiled” (i.e., contains a local directory with
+    a ‘pytorch_model.bin’ and possibly a 'config.json'), we load from that folder.
+    Otherwise, we do a minimal “compile” (in this example, that just downloads & saves).
     """
-    base_name = os.path.basename(os.path.normpath(model_name))
-    compiled_dir = f"{base_name}-neuron-compiled-{sequence_length}"
-    # If model_name is a directory containing compiled artifacts, use it.
-    if os.path.isdir(model_name) and os.path.isfile(os.path.join(model_name, "config.json")) \
-       and os.path.isfile(os.path.join(model_name, "pytorch_model.bin")):
-        logger.info(f"Detected pre-compiled model folder at '{model_name}'. Loading using from_pretrained().")
-        return LlamaForSampling.from_pretrained(
-            model_name,
-            batch_size=1,
-            tp_degree=tp_degree,
-            n_positions=sequence_length,
-            amp=dtype
-        )
 
-    # Otherwise, check if a compiled folder exists using our naming convention.
-    if os.path.isdir(compiled_dir) and os.path.isfile(os.path.join(compiled_dir, "config.json")) \
-       and os.path.isfile(os.path.join(compiled_dir, "pytorch_model.bin")):
-        logger.info(f"Found existing compiled model folder at '{compiled_dir}'. Loading compiled model.")
-        return LlamaForSampling.from_pretrained(
-            compiled_dir,
-            batch_size=1,
-            tp_degree=tp_degree,
-            n_positions=sequence_length,
-            amp=dtype
-        )
+    # Check if it’s a local directory with a config & pytorch_model.bin
+    config_file = os.path.join(model_path, "config.json")
+    weight_file = os.path.join(model_path, "pytorch_model.bin")
+    if os.path.isdir(model_path) and os.path.isfile(config_file) and os.path.isfile(weight_file):
+        # We consider this a “locally available compiled/cached” folder
+        logger.info(f"Found existing local model folder at: {model_path}. Loading with AutoModelForCausalLM...")
+        model = AutoModelForCausalLM.from_pretrained(model_path)
+        return model
+    else:
+        # Perform a minimal “compile” step: load from HF or local, then save
+        logger.info(f"No local compiled model found at {model_path}. Attempting to download or load from HF, then save.")
+        return compile_model(model_path, sequence_length=sequence_length)
 
-    # If not found, compile the model.
-    logger.info(f"Compiled model not found for '{model_name}'. Compiling now (seq_len={sequence_length})...")
-    return compile_model(model_name, sequence_length=sequence_length, tp_degree=tp_degree, dtype=dtype)
-
-def compile_model(model_name: str,
-                  sequence_length: int = DEFAULT_SEQUENCE_LENGTH,
-                  tp_degree: int = DEFAULT_TP_DEGREE,
-                  dtype: str = DEFAULT_DTYPE):
+def compile_model(model_path: str, sequence_length: int = DEFAULT_SEQUENCE_LENGTH):
     """
-    Compile the given LLaMA model (assumed to be a Hugging Face checkpoint) using transformers-neuronx.
-    Save the compiled artifacts (compiled model, tokenizer, config, and a dummy checkpoint) into
-    a folder named "<base_name>-neuron-compiled-<sequence_length>".
+    Minimal “compile” flow: load from Hugging Face or local checkpoint, then save to
+    a directory for subsequent runs. This is not a real ‘neuron compile’, but it prevents indefinite waits.
     """
-    logger.info(f"Compiling model '{model_name}' with sequence_length={sequence_length}, tp_degree={tp_degree}, dtype={dtype}")
-    os.environ["NEURON_CC_FLAGS"] = "--model-type transformer --verbose=1"
-    logger.info(f"NEURON_CC_FLAGS set to: {os.environ['NEURON_CC_FLAGS']}")
-    tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=False)
-    model = LlamaForSampling.from_pretrained(
-        model_name,
-        batch_size=1,
-        tp_degree=tp_degree,
-        n_positions=sequence_length,
-        amp=dtype
-    )
-    model.eval()
-    logger.info("Running Neuron compilation (model.to_neuron())...")
-    model.to_neuron()
-
-    # Minimal forward pass to initialize any uninitialized parameters.
-    try:
-        import torch
-        dummy_input_ids = torch.randint(0, 5, (1, 4), dtype=torch.long)
-        model.sample(dummy_input_ids, sequence_length=4)
-        logger.info("Dummy forward pass succeeded, parameters should be initialized.")
-    except Exception as e:
-        logger.warning(f"Dummy forward pass failed (some params may remain uninitialized): {e}")
-
-    base_name = os.path.basename(os.path.normpath(model_name))
-    compiled_dir = f"{base_name}-neuron-compiled-{sequence_length}"
+    base_name = os.path.basename(os.path.normpath(model_path))
+    compiled_dir = f"{base_name}-compiled-{sequence_length}"
     os.makedirs(compiled_dir, exist_ok=True)
-    logger.info(f"Saving compiled artifacts into '{compiled_dir}'...")
-
-    # Save tokenizer
+    logger.info(f"Loading model {model_path} via AutoModelForCausalLM...")
+    # The actual HF model load
+    model = AutoModelForCausalLM.from_pretrained(model_path)
+    model.save_pretrained(compiled_dir)
+    # Save the tokenizer too
+    tokenizer = AutoTokenizer.from_pretrained(model_path)
     tokenizer.save_pretrained(compiled_dir)
-    # Save config
-    config_dict = {k: v for k, v in vars(model.config).items() if not k.startswith("_")}
-    config_path = os.path.join(compiled_dir, "config.json")
-    with open(config_path, "w") as f:
-        json.dump(config_dict, f, indent=2)
-    logger.info(f"Model config saved to '{config_path}'")
-    
-    # Attempt to save a dummy checkpoint
-    checkpoint_path = os.path.join(compiled_dir, "pytorch_model.bin")
-    try:
-        torch.save(model.state_dict(), checkpoint_path)
-        logger.info(f"Saved dummy checkpoint to '{checkpoint_path}'")
-    except Exception as e:
-        logger.error(f"Error saving dummy checkpoint: {e}")
-
-    # Save compiled artifacts using either save_pretrained_split or fallback
-    try:
-        model.save_pretrained_split(compiled_dir)
-        logger.info("Saved compiled model using save_pretrained_split().")
-    except AttributeError:
-        compiled_module = getattr(model, "model", None) or getattr(model, "_neuron_module", None)
-        if compiled_module is None:
-            compiled_module = model
-        if isinstance(compiled_module, list):
-            logger.info(f"Detected tp_degree={tp_degree}, saving {len(compiled_module)} compiled shards...")
-            for i, shard in enumerate(compiled_module):
-                shard_path = os.path.join(compiled_dir, f"model_neuron_tp_{i}.pt")
-                shard.save(shard_path)
-                logger.info(f"Saved shard {i} to '{shard_path}'")
-        else:
-            shard_path = os.path.join(compiled_dir, "model_neuron.ts")
-            compiled_module.save(shard_path)
-            logger.info(f"Saved compiled module to '{shard_path}'")
-
-    logger.info("Model compilation complete.")
+    logger.info(f"Model + tokenizer saved locally to {compiled_dir}. Next time we’ll load from it.")
     return model

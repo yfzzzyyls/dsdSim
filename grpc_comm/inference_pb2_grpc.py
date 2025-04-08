@@ -3,9 +3,7 @@
 import grpc
 import warnings
 
-# import inference_pb2 as inference__pb2
 from . import inference_pb2 as inference__pb2
-
 
 GRPC_GENERATED_VERSION = '1.66.2'
 GRPC_VERSION = grpc.__version__
@@ -28,8 +26,7 @@ if _version_not_supported:
 
 
 class SpeculativeServiceStub(object):
-    """The speculative decoding gRPC service definition.
-    """
+    """Missing associated documentation comment in .proto file."""
 
     def __init__(self, channel):
         """Constructor.
@@ -37,43 +34,42 @@ class SpeculativeServiceStub(object):
         Args:
             channel: A grpc.Channel.
         """
-        self.StartGeneration = channel.unary_unary(
-                '/specdecode.SpeculativeService/StartGeneration',
-                request_serializer=inference__pb2.StartRequest.SerializeToString,
-                response_deserializer=inference__pb2.StartResponse.FromString,
+        self.Generate = channel.unary_unary(
+                '/specdecode.SpeculativeService/Generate',
+                request_serializer=inference__pb2.GenerateRequest.SerializeToString,
+                response_deserializer=inference__pb2.GenerateResponse.FromString,
                 _registered_method=True)
-        self.VerifyDraftTokens = channel.unary_unary(
-                '/specdecode.SpeculativeService/VerifyDraftTokens',
+        self.VerifyDraftToken = channel.unary_unary(
+                '/specdecode.SpeculativeService/VerifyDraftToken',
                 request_serializer=inference__pb2.VerifyRequest.SerializeToString,
                 response_deserializer=inference__pb2.VerifyResponse.FromString,
                 _registered_method=True)
-        self.GenerateFull = channel.unary_unary(
-                '/specdecode.SpeculativeService/GenerateFull',
-                request_serializer=inference__pb2.GenerateRequest.SerializeToString,
-                response_deserializer=inference__pb2.GenerateResponse.FromString,
+        self.VerifyDraftChunk = channel.unary_unary(
+                '/specdecode.SpeculativeService/VerifyDraftChunk',
+                request_serializer=inference__pb2.VerifyChunkRequest.SerializeToString,
+                response_deserializer=inference__pb2.VerifyChunkResponse.FromString,
                 _registered_method=True)
 
 
 class SpeculativeServiceServicer(object):
-    """The speculative decoding gRPC service definition.
-    """
+    """Missing associated documentation comment in .proto file."""
 
-    def StartGeneration(self, request, context):
-        """Initialize a generation session with the prompt.
+    def Generate(self, request, context):
+        """Existing single-token generation, if used
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
-    def VerifyDraftTokens(self, request, context):
-        """Verify a batch of draft tokens against the target model.
+    def VerifyDraftToken(self, request, context):
+        """Possibly existing single-token verification, if you keep it
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
-    def GenerateFull(self, request, context):
-        """Generate a full completion using only the target model (for verification/perf).
+    def VerifyDraftChunk(self, request, context):
+        """NEW: single-shot chunk verification
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -82,20 +78,20 @@ class SpeculativeServiceServicer(object):
 
 def add_SpeculativeServiceServicer_to_server(servicer, server):
     rpc_method_handlers = {
-            'StartGeneration': grpc.unary_unary_rpc_method_handler(
-                    servicer.StartGeneration,
-                    request_deserializer=inference__pb2.StartRequest.FromString,
-                    response_serializer=inference__pb2.StartResponse.SerializeToString,
+            'Generate': grpc.unary_unary_rpc_method_handler(
+                    servicer.Generate,
+                    request_deserializer=inference__pb2.GenerateRequest.FromString,
+                    response_serializer=inference__pb2.GenerateResponse.SerializeToString,
             ),
-            'VerifyDraftTokens': grpc.unary_unary_rpc_method_handler(
-                    servicer.VerifyDraftTokens,
+            'VerifyDraftToken': grpc.unary_unary_rpc_method_handler(
+                    servicer.VerifyDraftToken,
                     request_deserializer=inference__pb2.VerifyRequest.FromString,
                     response_serializer=inference__pb2.VerifyResponse.SerializeToString,
             ),
-            'GenerateFull': grpc.unary_unary_rpc_method_handler(
-                    servicer.GenerateFull,
-                    request_deserializer=inference__pb2.GenerateRequest.FromString,
-                    response_serializer=inference__pb2.GenerateResponse.SerializeToString,
+            'VerifyDraftChunk': grpc.unary_unary_rpc_method_handler(
+                    servicer.VerifyDraftChunk,
+                    request_deserializer=inference__pb2.VerifyChunkRequest.FromString,
+                    response_serializer=inference__pb2.VerifyChunkResponse.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
@@ -106,11 +102,10 @@ def add_SpeculativeServiceServicer_to_server(servicer, server):
 
  # This class is part of an EXPERIMENTAL API.
 class SpeculativeService(object):
-    """The speculative decoding gRPC service definition.
-    """
+    """Missing associated documentation comment in .proto file."""
 
     @staticmethod
-    def StartGeneration(request,
+    def Generate(request,
             target,
             options=(),
             channel_credentials=None,
@@ -123,9 +118,9 @@ class SpeculativeService(object):
         return grpc.experimental.unary_unary(
             request,
             target,
-            '/specdecode.SpeculativeService/StartGeneration',
-            inference__pb2.StartRequest.SerializeToString,
-            inference__pb2.StartResponse.FromString,
+            '/specdecode.SpeculativeService/Generate',
+            inference__pb2.GenerateRequest.SerializeToString,
+            inference__pb2.GenerateResponse.FromString,
             options,
             channel_credentials,
             insecure,
@@ -137,7 +132,7 @@ class SpeculativeService(object):
             _registered_method=True)
 
     @staticmethod
-    def VerifyDraftTokens(request,
+    def VerifyDraftToken(request,
             target,
             options=(),
             channel_credentials=None,
@@ -150,7 +145,7 @@ class SpeculativeService(object):
         return grpc.experimental.unary_unary(
             request,
             target,
-            '/specdecode.SpeculativeService/VerifyDraftTokens',
+            '/specdecode.SpeculativeService/VerifyDraftToken',
             inference__pb2.VerifyRequest.SerializeToString,
             inference__pb2.VerifyResponse.FromString,
             options,
@@ -164,7 +159,7 @@ class SpeculativeService(object):
             _registered_method=True)
 
     @staticmethod
-    def GenerateFull(request,
+    def VerifyDraftChunk(request,
             target,
             options=(),
             channel_credentials=None,
@@ -177,9 +172,9 @@ class SpeculativeService(object):
         return grpc.experimental.unary_unary(
             request,
             target,
-            '/specdecode.SpeculativeService/GenerateFull',
-            inference__pb2.GenerateRequest.SerializeToString,
-            inference__pb2.GenerateResponse.FromString,
+            '/specdecode.SpeculativeService/VerifyDraftChunk',
+            inference__pb2.VerifyChunkRequest.SerializeToString,
+            inference__pb2.VerifyChunkResponse.FromString,
             options,
             channel_credentials,
             insecure,
