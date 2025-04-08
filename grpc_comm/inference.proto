@@ -1,35 +1,26 @@
 syntax = "proto3";
+option py_generic_services = false;
 package specdecode;
 
-service SpeculativeService {
-  // Used by the draft client to initialize target generation.
-  rpc StartGeneration(StartRequest) returns (StartResponse);
-  // (Optionally, a single-token generation method.)
-  rpc Generate(GenerateRequest) returns (GenerateResponse);
-  // New method: verify an entire chunk of draft tokens in one shot.
-  rpc VerifyDraftChunk(VerifyChunkRequest) returns (VerifyChunkResponse);
-  // (Optional, legacy single-token verification.)
-  rpc VerifyDraftToken(VerifyRequest) returns (VerifyResponse);
+// Request to start generation with prompt and max tokens.
+message StartRequest {
+  string prompt = 1;
+  uint32 max_new_tokens = 2;
 }
 
-// Initialize the target model for generation.
-message StartRequest {
-  string prompt = 1;           // The initial prompt text
-  int32 max_new_tokens = 2;    // Maximum number of new tokens to generate (if desired)
-}
 message StartResponse {
   bool acknowledged = 1;
 }
 
-// Used for single-token generation (optional)
+// Single-token generation request/response (not used in speculative decoding).
 message GenerateRequest {
-  // For future use (e.g. context pass-through).
+  // Reserved for future use.
 }
 message GenerateResponse {
   int32 token_id = 1;
 }
 
-// Legacy single-token verification (optional)
+// **Legacy single-token verification (optional)** 
 message VerifyRequest {
   int32 draft_token_id = 1;
 }
@@ -38,12 +29,21 @@ message VerifyResponse {
   int32 correct_token_id = 2;
 }
 
-// New messages for chunk verification
+// **New multi-token (chunk) verification** 
 message VerifyChunkRequest {
-  repeated int32 draft_tokens = 1;  // The entire chunk proposed by the draft model
+  repeated int32 draft_tokens = 1;
 }
 message VerifyChunkResponse {
-  bool all_match = 1;               // True if the entire chunk matches
-  uint32 match_prefix_length = 2;   // Number of tokens from the start that matched
-  int32 correct_token_id = 3;       // If a mismatch occurred, the target’s token at that position
+  bool all_matched = 1;          // True if the entire chunk matches
+  uint32 match_count = 2;        // Number of tokens from the start that matched
+  int32 correct_token = 3;       // Target’s token at first mismatch (0 if none)
+  bool finished = 4;             // True if target model reached EOS in this chunk
+}
+
+// Speculative Decoding gRPC Service
+service SpeculativeService {
+  rpc StartGeneration(StartRequest) returns (StartResponse);
+  rpc VerifyDraftToken(VerifyRequest) returns (VerifyResponse);       // legacy
+  rpc VerifyDraftChunk(VerifyChunkRequest) returns (VerifyChunkResponse);  // new
+  rpc GenerateFull(StartRequest) returns (GenerateResponse);
 }

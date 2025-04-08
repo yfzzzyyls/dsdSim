@@ -34,6 +34,8 @@ def main():
                         help="(Draft role only) Run draft model without target (standalone draft mode)")
     parser.add_argument("--draft_chunk_size", type=int, default=4,
                         help="Number of tokens per speculative draft step (chunk size for draft model)")
+    parser.add_argument("--gamma", type=int, default=4,
+                        help="Number of draft tokens to generate per verification step (speculative decoding chunk size).")
     args = parser.parse_args()
 
     if args.role == "compile":
@@ -78,24 +80,18 @@ def main():
         from inference import draft_worker
         if args.no_target:
             # Run draft model standalone (no target server)
-            if args.profile:
-                logger.info("Profiling enabled for standalone draft generation.")
-            else:
-                logger.info("Standalone draft generation (no target server).")
             draft_worker.run_client(draft_model, target_host=None, port=args.port,
-                                     prompt=prompt_text, target_model_name=target_model,
-                                     max_new_tokens=args.max_new_tokens, sequence_length=args.sequence_length,
-                                     draft_chunk_size=args.draft_chunk_size,
-                                     profile=args.profile, no_target=True)
+                                    prompt=prompt_text, target_model_name=target_model,
+                                    max_new_tokens=args.max_new_tokens, sequence_length=args.sequence_length,
+                                    draft_chunk_size=args.gamma,
+                                    profile=args.profile, no_target=True)
         else:
             # Run speculative decoding with a target server
-            if args.profile:
-                logger.info("Profiling enabled for speculative decoding (draft client).")
             draft_worker.run_client(draft_model, target_host=args.target_host, port=args.port,
-                                     prompt=prompt_text, target_model_name=target_model,
-                                     max_new_tokens=args.max_new_tokens, sequence_length=args.sequence_length,
-                                     draft_chunk_size=args.draft_chunk_size,
-                                     profile=args.profile, no_target=False)
+                                    prompt=prompt_text, target_model_name=target_model,
+                                    max_new_tokens=args.max_new_tokens, sequence_length=args.sequence_length,
+                                    draft_chunk_size=args.gamma,
+                                    profile=args.profile, no_target=False)
 
     elif args.role == "verify_target":
         model_name = args.model

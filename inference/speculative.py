@@ -3,8 +3,7 @@ import json
 import os
 import logging
 import torch
-from grpc_comm.inference_pb2 import StartRequest, VerifyRequest
-
+from grpc_comm.inference_pb2 import StartRequest, VerifyChunkRequest  # import the correct request class
 logger = logging.getLogger(__name__)
 
 def speculative_decode(draft_model, tokenizer, target_stub, prompt_text: str,
@@ -29,8 +28,9 @@ def speculative_decode(draft_model, tokenizer, target_stub, prompt_text: str,
         logger.error(f"Failed to start generation on target server: {e}")
         return ""
 
-    # Profiling timer start
+    # (Optional profiling start)
     start_time = time.perf_counter() if profile else None
+
     tokens_generated = 0
     matched_tokens = 0
     eos_token_id = tokenizer.eos_token_id if tokenizer.eos_token_id is not None else None
@@ -41,60 +41,66 @@ def speculative_decode(draft_model, tokenizer, target_stub, prompt_text: str,
         tokens_remaining = max_new_tokens - tokens_generated
         current_chunk_size = min(chunk_size, tokens_remaining)
         seq_len_before = input_ids.shape[1]
-        # Draft model generates next chunk of tokens
+
+        # Draft model generates the next chunk of tokens
         try:
             draft_output = draft_model.sample(input_ids, sequence_length=seq_len_before + current_chunk_size)
         except Exception as e:
             logger.error(f"Draft model generation failed: {e}")
             break
+
         # Extract draft's newly generated tokens
         draft_seq = draft_output[0] if isinstance(draft_output, (list, tuple)) else draft_output[0]
         draft_new_ids = draft_seq[seq_len_before:]
         draft_new_ids = [int(t) for t in draft_new_ids]
+
         # Check for EOS token in draft output
         draft_finished = False
         if eos_token_id is not None and eos_token_id in draft_new_ids:
             idx = draft_new_ids.index(eos_token_id)
-            draft_new_ids = draft_new_ids[:idx+1]  # include EOS and truncate after
+            draft_new_ids = draft_new_ids[:idx+1]  # include EOS in the chunk
             draft_finished = True
             current_chunk_size = len(draft_new_ids)
-        # Send draft tokens to target for verification
-        verify_req = VerifyRequest(draft_tokens=draft_new_ids)
+
+        # Send draft tokens to target for verification (batch verification)
+        verify_req = VerifyChunkRequest(draft_tokens=draft_new_ids)
         try:
-            verify_resp = target_stub.VerifyDraftTokens(verify_req)
+            verify_resp = target_stub.VerifyDraftChunk(verify_req)
         except Exception as e:
-            logger.error(f"VerifyDraftTokens RPC failed: {e}")
+            logger.error(f"VerifyDraftChunk RPC failed: {e}")
             break
+
+        # Retrieve verification results
         all_matched = verify_resp.all_matched
         match_count = verify_resp.match_count
-        correct_token = verify_resp.correct_token  # target's token at first mismatch (0 if not applicable)
+        correct_token = verify_resp.correct_token  # target's token at divergence (0 if none)
         target_finished = verify_resp.finished
 
-        # Append tokens to output based on verification result
+        # Append tokens to output_text based on verification result
         if all_matched:
-            # All draft tokens accepted
+            # All draft tokens are accepted by target
             text_to_add = tokenizer.decode(draft_new_ids, skip_special_tokens=False)
             output_text += text_to_add
             tokens_generated += len(draft_new_ids)
             matched_tokens += len(draft_new_ids)
-            # Append these tokens to draft model context for next iteration
+            # Append these tokens to the draft model context for next iteration
             if draft_new_ids:
                 new_tokens_tensor = torch.tensor([draft_new_ids], dtype=input_ids.dtype)
                 input_ids = torch.cat([input_ids, new_tokens_tensor], dim=1)
             logger.info(f"Draft chunk of {len(draft_new_ids)} tokens accepted (all matched).")
         else:
-            # Partial match: accept the matching prefix and the target's correction
+            # Partial match: accept the matching prefix and use target’s token for the first mismatch
             prefix_ids = draft_new_ids[:match_count]
-            correct_id = correct_token  # target model's token at the divergence point
+            correct_id = correct_token  # token from target at the divergence point
             text_to_add = ""
             if prefix_ids:
                 text_to_add += tokenizer.decode(prefix_ids, skip_special_tokens=False)
             if correct_id != 0:
                 text_to_add += tokenizer.decode([correct_id], skip_special_tokens=False)
             output_text += text_to_add
-            tokens_generated += (match_count + 1)  # matched prefix + one correct token
+            tokens_generated += (match_count + (1 if correct_id != 0 else 0))
             matched_tokens += match_count
-            # Update draft context with accepted prefix + correct token
+            # Update draft context with accepted prefix plus the target’s correct token
             accepted_ids = prefix_ids + ([correct_id] if correct_id != 0 else [])
             if accepted_ids:
                 new_tokens_tensor = torch.tensor([accepted_ids], dtype=input_ids.dtype)
@@ -105,9 +111,8 @@ def speculative_decode(draft_model, tokenizer, target_stub, prompt_text: str,
         if target_finished or draft_finished or tokens_generated >= max_new_tokens:
             logger.info(f"Generation finished (target_finished={target_finished}, draft_finished={draft_finished}, tokens_generated={tokens_generated}).")
             break
-        # Otherwise, continue to next speculative chunk
 
-    # End of generation loop
+    # (Optional profiling end)
     if profile and start_time is not None:
         end_time = time.perf_counter()
         total_time = end_time - start_time
@@ -115,34 +120,7 @@ def speculative_decode(draft_model, tokenizer, target_stub, prompt_text: str,
         avg_time_per_token = total_time / total_tokens if total_tokens > 0 else 0.0
         throughput = total_tokens / total_time if total_time > 0 else 0.0
         match_rate = matched_tokens / total_tokens if total_tokens > 0 else 0.0
-        # Log overall performance metrics
-        logger.info(f"End-to-end latency: {total_time:.3f} seconds for {total_tokens} tokens")
-        logger.info(f"Per-token generation time: {avg_time_per_token*1000:.1f} ms/token")
-        logger.info(f"Throughput: {throughput:.2f} tokens/sec")
-        logger.info(f"Token match rate: {match_rate*100:.1f}% ({matched_tokens}/{total_tokens} tokens from draft model)")
-        # Save metrics to CSV and JSON
-        try:
-            metrics = {
-                "prompt": prompt_text,
-                "total_tokens": total_tokens,
-                "chunk_size": chunk_size,
-                "total_time_sec": round(total_time, 4),
-                "avg_time_per_token_sec": round(avg_time_per_token, 6),
-                "throughput_tokens_per_sec": round(throughput, 4),
-                "match_rate": round(match_rate, 4)
-            }
-            csv_header = "prompt,total_tokens,chunk_size,total_time_sec,avg_time_per_token_sec,throughput_tokens_per_sec,match_rate"
-            csv_line = (f"\"{prompt_text}\",{total_tokens},{chunk_size},"
-                        f"{metrics['total_time_sec']},{metrics['avg_time_per_token_sec']},"
-                        f"{metrics['throughput_tokens_per_sec']},{metrics['match_rate']}\n")
-            csv_file = "profile.csv"
-            write_header = not os.path.isfile(csv_file) or os.path.getsize(csv_file) == 0
-            with open(csv_file, "a") as cf:
-                if write_header:
-                    cf.write(csv_header + "\n")
-                cf.write(csv_line)
-            with open("profile.json", "w") as jf:
-                json.dump(metrics, jf, indent=4)
-        except Exception as e:
-            logger.error(f"Failed to write profile data to file: {e}")
+        logger.info(f"Speculative decoding completed in {total_time:.2f} seconds, avg {avg_time_per_token:.4f}s per token.")
+        logger.info(f"Tokens generated: {total_tokens}, Throughput: {throughput:.2f} tokens/sec, Match rate: {match_rate:.2f}")
+
     return output_text
