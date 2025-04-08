@@ -87,10 +87,18 @@ export NEURON_CC_FLAGS="--model-type transformer"
 export NEURON_RT_NUM_CORES=2
 ```
 
+### **Optional:**
+
+Clean cache before compile:
+
+```
+rm -rf /var/tmp/neuron-compile-cache
+```
+
 ### **Compile & Run the Target Model Server**
 
 ```
-python main.py --role target --model /home/ubuntu/models/llama-3.2-3b --port 50051 --sequence_length 128 --max_new_tokens 20 --profile
+python main.py --role target --model /home/ubuntu/models/llama-3.2-3b/ --port 50051 --sequence_length 128
 ```
 
 ### **Compile & Run the Draft Model server**
@@ -125,7 +133,7 @@ You can also run either the draft or target model **standalone** (without specul
 To run the **target model** by itself on a prompt:
 
 ```
-python main.py --role verify_target --model /home/ubuntu/models/llama-3.2-3b --prompt "Once upon a time," --max_new_tokens 20 --sequence_length 128 --profile
+python main.py --role verify_target --model /home/ubuntu/models/llama-3.2-3b/ --prompt "Once upon a time," --max_new_tokens 100 --sequence_length 128 --profile
 ```
 
 This will load the 3B target model and generate 20 tokens continuing the prompt, printing each generated token as it arrives, followed by the full output text.
