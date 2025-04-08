@@ -27,7 +27,17 @@ Choral-Spec/
 
 ## Dpendencies
 
-install dependencies
+Create a Trainium instance with AWS Neuron SDK using EC2 with the following settings:
+
+1. 1. **Name:** Your Name
+   2. **AMI:** Deep Learning AMI Neuron (Ubuntu 22.04)
+   3. **Instance type:** trn1.2xlarge
+   4. **Key pair (login):** create a new key pair
+   5. **Metadata version [under “Advanced details”]:** V2 only (otherwise, you will encounter a not authorized error)
+   6. **When connecting to these instances via SSH, use the username of *ubuntu***
+2. Activate the Neuron virtual environment to run inference by running `source /opt/aws_neuronx_venv_pytorch_2_5_nxd_inference/bin/activate`.
+
+Install dependencies
 
 ```
 pip install grpcio==1.71.0 grpcio-tools==1.66.2
@@ -128,7 +138,21 @@ python main.py --role verify_draft --model /home/ubuntu/models/llama-3.2-1b --pr
 
 This will use the 1B draft model to generate text token-by-token for the given prompt.
 
-*Note:* In verification modes, the model will be compiled on the fly if a compiled Neuron model is not found. By default, **`--sequence_length 128` is used; ensure you use the same sequence length that the model was compiled with (or specify** **`--sequence_length` accordingly) to avoid recompilation. The** `--max_tokens` option controls how many new tokens to generate for the prompt.
+*Note:* In verification modes, the model will be compiled on the fly if a compiled Neuron model is not found. By default,** **`--sequence_length 128` is used; ensure you use the same sequence length that the model was compiled with (or specify** **`--sequence_length` accordingly) to avoid recompilation. The** **`--max_tokens` option controls how many new tokens to generate for the prompt.
+
+## **Performance Testing**
+
+Run the **evaluate_test.py** script to compare speculative decoding vs. target-only:
+
+```
+Speculative decoding result:
+Once upon a time, ...
+Spec time: 2.12s, tokens=40, throughput=18.87 t/sBaseline target-only result:
+Once upon a time, ...
+Baseline time: 3.95s, tokens=40, throughput=10.12 t/s
+```
+
+This shows ~1.8x speedup from speculative decoding.
 
 ## **Advanced Tips**
 
