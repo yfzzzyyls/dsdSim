@@ -80,13 +80,13 @@ export NEURON_RT_NUM_CORES=2
 ### **Compile & Run the Target Model Server**
 
 ```
-python main.py --role target --model /home/ubuntu/models/llama-3.2-3b --port 50051 --sequence_length 128 --profile
+python main.py --role target --model /home/ubuntu/models/llama-3.2-3b --port 50051 --sequence_length 128 --max_new_tokens 20 --profile
 ```
 
 ### **Compile & Run the Draft Model server**
 
 ```
-python main.py --role draft --model /home/ubuntu/models/llama-3.2-1b --target_host 3.16.109.246 --port 50051 --prompt "Once upon a time," --target_model /home/ubuntu/models/llama-3.2-3b
+python main.py --role draft --model /home/ubuntu/models/llama-3.2-1b --target_host 3.16.109.246 --port 50051 --max_new_tokens 20 --prompt "Once upon a time," --target_model /home/ubuntu/models/llama-3.2-3b --profile
 ```
 
 ### **Example Output**
