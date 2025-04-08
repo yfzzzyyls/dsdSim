@@ -2,42 +2,48 @@ syntax = "proto3";
 package specdecode;
 
 service SpeculativeService {
-  // Existing single-token generation, if used
+  // Used by the draft client to initialize target generation.
+  rpc StartGeneration(StartRequest) returns (StartResponse);
+  // (Optionally, a single-token generation method.)
   rpc Generate(GenerateRequest) returns (GenerateResponse);
-
-  // Possibly existing single-token verification, if you keep it
-  rpc VerifyDraftToken(VerifyRequest) returns (VerifyResponse);
-
-  // NEW: single-shot chunk verification
+  // New method: verify an entire chunk of draft tokens in one shot.
   rpc VerifyDraftChunk(VerifyChunkRequest) returns (VerifyChunkResponse);
+  // (Optional, legacy single-token verification.)
+  rpc VerifyDraftToken(VerifyRequest) returns (VerifyResponse);
 }
 
-// For single-token generation
+// Initialize the target model for generation.
+message StartRequest {
+  string prompt = 1;           // The initial prompt text
+  int32 max_new_tokens = 2;    // Maximum number of new tokens to generate (if desired)
+}
+message StartResponse {
+  bool acknowledged = 1;
+}
+
+// Used for single-token generation (optional)
 message GenerateRequest {
-  // (You can define fields like 'input_ids' or 'past_key_values' if needed.
-  // This demo just uses a placeholder.)
+  // For future use (e.g. context pass-through).
 }
 message GenerateResponse {
-  int32 token_id = 1;  // The single token the target model outputs
+  int32 token_id = 1;
 }
 
-// For single-token verification (if you keep it)
+// Legacy single-token verification (optional)
 message VerifyRequest {
   int32 draft_token_id = 1;
 }
 message VerifyResponse {
   bool match = 1;
-  int32 correct_token_id = 2; // only if match=false
+  int32 correct_token_id = 2;
 }
 
-// NEW: chunk-based verification request
+// New messages for chunk verification
 message VerifyChunkRequest {
-  repeated int32 draft_tokens = 1;  // The entire chunk from draft
+  repeated int32 draft_tokens = 1;  // The entire chunk proposed by the draft model
 }
-
-// NEW: chunk-based verification response
 message VerifyChunkResponse {
-  bool all_match = 1;               // True if entire chunk matched
-  uint32 match_prefix_length = 2;   // # of tokens (from the start) that matched
-  int32 correct_token_id = 3;       // The target’s correct token at first mismatch (if all_match=false)
+  bool all_match = 1;               // True if the entire chunk matches
+  uint32 match_prefix_length = 2;   // Number of tokens from the start that matched
+  int32 correct_token_id = 3;       // If a mismatch occurred, the target’s token at that position
 }

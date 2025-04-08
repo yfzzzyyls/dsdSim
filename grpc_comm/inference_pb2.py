@@ -24,25 +24,29 @@ _sym_db = _symbol_database.Default()
 
 
 
-DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x0finference.proto\x12\nspecdecode\"\x11\n\x0fGenerateRequest\"$\n\x10GenerateResponse\x12\x10\n\x08token_id\x18\x01 \x01(\x05\"\'\n\rVerifyRequest\x12\x16\n\x0e\x64raft_token_id\x18\x01 \x01(\x05\"9\n\x0eVerifyResponse\x12\r\n\x05match\x18\x01 \x01(\x08\x12\x18\n\x10\x63orrect_token_id\x18\x02 \x01(\x05\"*\n\x12VerifyChunkRequest\x12\x14\n\x0c\x64raft_tokens\x18\x01 \x03(\x05\"_\n\x13VerifyChunkResponse\x12\x11\n\tall_match\x18\x01 \x01(\x08\x12\x1b\n\x13match_prefix_length\x18\x02 \x01(\r\x12\x18\n\x10\x63orrect_token_id\x18\x03 \x01(\x05\x32\xfb\x01\n\x12SpeculativeService\x12\x45\n\x08Generate\x12\x1b.specdecode.GenerateRequest\x1a\x1c.specdecode.GenerateResponse\x12I\n\x10VerifyDraftToken\x12\x19.specdecode.VerifyRequest\x1a\x1a.specdecode.VerifyResponse\x12S\n\x10VerifyDraftChunk\x12\x1e.specdecode.VerifyChunkRequest\x1a\x1f.specdecode.VerifyChunkResponseb\x06proto3')
+DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x0finference.proto\x12\nspecdecode\"6\n\x0cStartRequest\x12\x0e\n\x06prompt\x18\x01 \x01(\t\x12\x16\n\x0emax_new_tokens\x18\x02 \x01(\x05\"%\n\rStartResponse\x12\x14\n\x0c\x61\x63knowledged\x18\x01 \x01(\x08\"\x11\n\x0fGenerateRequest\"$\n\x10GenerateResponse\x12\x10\n\x08token_id\x18\x01 \x01(\x05\"\'\n\rVerifyRequest\x12\x16\n\x0e\x64raft_token_id\x18\x01 \x01(\x05\"9\n\x0eVerifyResponse\x12\r\n\x05match\x18\x01 \x01(\x08\x12\x18\n\x10\x63orrect_token_id\x18\x02 \x01(\x05\"*\n\x12VerifyChunkRequest\x12\x14\n\x0c\x64raft_tokens\x18\x01 \x03(\x05\"_\n\x13VerifyChunkResponse\x12\x11\n\tall_match\x18\x01 \x01(\x08\x12\x1b\n\x13match_prefix_length\x18\x02 \x01(\r\x12\x18\n\x10\x63orrect_token_id\x18\x03 \x01(\x05\x32\xc3\x02\n\x12SpeculativeService\x12\x46\n\x0fStartGeneration\x12\x18.specdecode.StartRequest\x1a\x19.specdecode.StartResponse\x12\x45\n\x08Generate\x12\x1b.specdecode.GenerateRequest\x1a\x1c.specdecode.GenerateResponse\x12S\n\x10VerifyDraftChunk\x12\x1e.specdecode.VerifyChunkRequest\x1a\x1f.specdecode.VerifyChunkResponse\x12I\n\x10VerifyDraftToken\x12\x19.specdecode.VerifyRequest\x1a\x1a.specdecode.VerifyResponseb\x06proto3')
 
 _globals = globals()
 _builder.BuildMessageAndEnumDescriptors(DESCRIPTOR, _globals)
 _builder.BuildTopDescriptorsAndMessages(DESCRIPTOR, 'inference_pb2', _globals)
 if not _descriptor._USE_C_DESCRIPTORS:
   DESCRIPTOR._loaded_options = None
-  _globals['_GENERATEREQUEST']._serialized_start=31
-  _globals['_GENERATEREQUEST']._serialized_end=48
-  _globals['_GENERATERESPONSE']._serialized_start=50
-  _globals['_GENERATERESPONSE']._serialized_end=86
-  _globals['_VERIFYREQUEST']._serialized_start=88
-  _globals['_VERIFYREQUEST']._serialized_end=127
-  _globals['_VERIFYRESPONSE']._serialized_start=129
-  _globals['_VERIFYRESPONSE']._serialized_end=186
-  _globals['_VERIFYCHUNKREQUEST']._serialized_start=188
-  _globals['_VERIFYCHUNKREQUEST']._serialized_end=230
-  _globals['_VERIFYCHUNKRESPONSE']._serialized_start=232
-  _globals['_VERIFYCHUNKRESPONSE']._serialized_end=327
-  _globals['_SPECULATIVESERVICE']._serialized_start=330
-  _globals['_SPECULATIVESERVICE']._serialized_end=581
+  _globals['_STARTREQUEST']._serialized_start=31
+  _globals['_STARTREQUEST']._serialized_end=85
+  _globals['_STARTRESPONSE']._serialized_start=87
+  _globals['_STARTRESPONSE']._serialized_end=124
+  _globals['_GENERATEREQUEST']._serialized_start=126
+  _globals['_GENERATEREQUEST']._serialized_end=143
+  _globals['_GENERATERESPONSE']._serialized_start=145
+  _globals['_GENERATERESPONSE']._serialized_end=181
+  _globals['_VERIFYREQUEST']._serialized_start=183
+  _globals['_VERIFYREQUEST']._serialized_end=222
+  _globals['_VERIFYRESPONSE']._serialized_start=224
+  _globals['_VERIFYRESPONSE']._serialized_end=281
+  _globals['_VERIFYCHUNKREQUEST']._serialized_start=283
+  _globals['_VERIFYCHUNKREQUEST']._serialized_end=325
+  _globals['_VERIFYCHUNKRESPONSE']._serialized_start=327
+  _globals['_VERIFYCHUNKRESPONSE']._serialized_end=422
+  _globals['_SPECULATIVESERVICE']._serialized_start=425
+  _globals['_SPECULATIVESERVICE']._serialized_end=748
 # @@protoc_insertion_point(module_scope)
