@@ -111,7 +111,7 @@ This will load the 3B target model and generate 20 tokens continuing the prompt,
 Similarly, to run the **draft model** by itself:
 
 ```
-python main.py --role verify_draft --model /home/ubuntu/models/llama-3.2-1b --prompt "Once upon a time," --max_tokens 20
+python main.py --role verify_draft --model /home/ubuntu/models/llama-3.2-1b --prompt "Once upon a time," --max_new_tokens 20 --sequence_length 128 --profile
 ```
 
 This will use the 1B draft model to generate text token-by-token for the given prompt.

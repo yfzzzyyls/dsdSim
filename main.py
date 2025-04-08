@@ -27,9 +27,9 @@ def main():
     parser.add_argument("--sequence_length", type=int, default=128,
                         help="Sequence length for model compilation (if not already compiled)")
     parser.add_argument("--max_new_tokens", type=int, default=50,
-                        help="Maximum number of new tokens to generate")
+                        help="Maximum number of new tokens to generate (for any run)")
     parser.add_argument("--profile", action="store_true",
-                        help="Enable performance profiling and metrics output")
+                        help="Enable total-time performance profiling (no overhead from per-token timing)")
     parser.add_argument("--no_target", action="store_true",
                         help="(Draft role only) Run draft model without target (standalone draft mode)")
     args = parser.parse_args()
@@ -51,14 +51,13 @@ def main():
         if model_name is None:
             logger.error("Please specify --model (target model path) for target role")
             return
+        # If a prompt is provided along with profiling => run standalone local generation
         if args.profile and args.prompt:
-            # Run standalone local generation with profiling
             from inference import target_worker
             logger.info("Profiling enabled for standalone target generation.")
             target_worker.run_local(model_name, prompt=args.prompt, max_new_tokens=args.max_new_tokens,
                                     sequence_length=args.sequence_length, profile=True)
         else:
-            # Run target server
             from inference import target_worker
             target_worker.run_server(model_name, port=args.port, sequence_length=args.sequence_length,
                                      profile=args.profile)
@@ -81,6 +80,7 @@ def main():
                                     max_new_tokens=args.max_new_tokens, sequence_length=args.sequence_length,
                                     profile=args.profile, no_target=True)
         else:
+            # Speculative decoding with target
             if args.profile:
                 logger.info("Profiling enabled for speculative decoding (draft client).")
             draft_worker.run_client(draft_model, target_host=args.target_host, port=args.port,
@@ -107,6 +107,7 @@ def main():
         from inference import verify
         verify.run_model(model_name, prompt=prompt, max_tokens=args.max_new_tokens,
                          sequence_length=args.sequence_length, role="draft", profile=args.profile)
+
     else:
         logger.error("Unknown role. Use --role target|draft|compile|verify_target|verify_draft.")
 
