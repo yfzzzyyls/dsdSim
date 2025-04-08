@@ -92,15 +92,27 @@ python main.py --role draft --model /home/ubuntu/models/llama-3.2-1b --target_ho
 ### **Example Output**
 
 ```
-[Draft] Final output: Once upon a time, ...
-[Draft] Time: 2.35 s, tokens: 20, speed: 8.51 tokens/s
+INFO:inference.verify:Target model generation completed in 0.61 seconds.
+INFO:inference.verify:Tokens generated: 20, Throughput: 32.96 t/s
+INFO:inference.verify:Performance metrics saved to performance_target_only_20250408_013547.csv and performance_target_only_20250408_013547.json
+
+=== Final Output ===
+Once upon a time, not so very long ago, it was enough to say that the best thing that ever came along was
 ```
+
+## **Performance Profiling Stats**
+
+```
+INFO:inference.verify:Performance metrics saved to performance_target_only_20250408_013547.csv and performance_target_only_20250408_013547.json
+```
+
+Performance stats are saved to .cvs and .json files
 
 ## **Run a Single Model for Verification**
 
 You can also run either the draft or target model **standalone** (without speculative decoding) to verify its generation output token-by-token. This is useful for debugging and sanity checks to ensure each model behaves as expected given a prompt.
 
-For example, to run the **target model** by itself on a prompt:
+To run the **target model** by itself on a prompt:
 
 ```
 python main.py --role verify_target --model /home/ubuntu/models/llama-3.2-3b --prompt "Once upon a time," --max_new_tokens 20 --sequence_length 128 --profile
@@ -116,21 +128,7 @@ python main.py --role verify_draft --model /home/ubuntu/models/llama-3.2-1b --pr
 
 This will use the 1B draft model to generate text token-by-token for the given prompt.
 
-*Note:* In verification modes, the model will be compiled on the fly if a compiled Neuron model is not found. By default,** **`--sequence_length 128` is used; ensure you use the same sequence length that the model was compiled with (or specify** **`--sequence_length` accordingly) to avoid recompilation. The** **`--max_tokens` option controls how many new tokens to generate for the prompt.
-
-## **Performance Testing**
-
-Run the **evaluate_test.py** script to compare speculative decoding vs. target-only:
-
-```
-Speculative decoding result:
-Once upon a time, ...
-Spec time: 2.12s, tokens=40, throughput=18.87 t/sBaseline target-only result:
-Once upon a time, ...
-Baseline time: 3.95s, tokens=40, throughput=10.12 t/s
-```
-
-This shows ~1.8x speedup from speculative decoding.
+*Note:* In verification modes, the model will be compiled on the fly if a compiled Neuron model is not found. By default, **`--sequence_length 128` is used; ensure you use the same sequence length that the model was compiled with (or specify** **`--sequence_length` accordingly) to avoid recompilation. The** `--max_tokens` option controls how many new tokens to generate for the prompt.
 
 ## **Advanced Tips**
 
