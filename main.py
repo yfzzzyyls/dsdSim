@@ -1,27 +1,43 @@
-import logging
 import argparse
+import logging
+import os
 
+# Configure logging globally
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 def main():
-    parser = argparse.ArgumentParser(description="Distributed Speculative Decoding CLI")
-    parser.add_argument("--role", type=str, required=True, choices=["compile", "target", "draft", "verify_target", "verify_draft"],
-                        help="Role of this process: compile models, run target server, run draft client, or verify outputs.")
-    parser.add_argument("--model", type=str, help="Path or name of the model to use (for compile/target roles, or for verify roles).")
-    parser.add_argument("--draft_model", type=str, help="Path or name of the draft model (for draft role, if different from --model).")
-    parser.add_argument("--target_model", type=str, help="Path or name of the target model (for draft role, used for tokenizer consistency).")
-    parser.add_argument("--prompt", type=str, help="Initial prompt text for generation (for draft or verify roles).")
-    parser.add_argument("--port", type=int, default=50051, help="Port for gRPC communication (target server listens, draft connects).")
-    parser.add_argument("--target_host", type=str, default="localhost", help="Target host address (for draft role to connect).")
-    parser.add_argument("--sequence_length", type=int, default=128, help="Sequence length for model compilation or inference.")
-    parser.add_argument("--max_tokens", type=int, default=50, help="Maximum number of new tokens to generate (for draft and verify roles).")
-    parser.add_argument("--draft_chunk_size", type=int, default=4, help="Number of tokens the draft model generates per speculative chunk.")
-    parser.add_argument("--profile", action="store_true", help="Enable profiling to log latency, throughput, and match rate to CSV/JSON.")
+    parser = argparse.ArgumentParser(description="Choral-Spec main launcher")
+    parser.add_argument("--role", choices=["target", "draft", "compile", "verify_target", "verify_draft"], required=True,
+                        help=("Role to run: 'target' for target server, 'draft' for draft client, "
+                              "'compile' to compile a model, 'verify_target' to run the target model standalone, "
+                              "'verify_draft' to run the draft model standalone"))
+    parser.add_argument("--model", type=str,
+                        help="Model path for the primary model (for target, draft, or verification roles)")
+    parser.add_argument("--target_model", type=str,
+                        help="Target model path (for draft role, used for tokenizer or loading compiled target model)")
+    parser.add_argument("--draft_model", type=str,
+                        help="Draft model path (alternative to --model for draft role)")
+    parser.add_argument("--prompt", type=str,
+                        help="Initial prompt text for generation (for draft or verification roles)")
+    parser.add_argument("--port", type=int, default=50051,
+                        help="Port for gRPC server (target role) or client connection (draft role)")
+    parser.add_argument("--target_host", type=str, default="localhost",
+                        help="Target server host address (for draft role to connect to target server)")
+    parser.add_argument("--sequence_length", type=int, default=128,
+                        help="Sequence length for model compilation (if not already compiled)")
+    parser.add_argument("--max_new_tokens", type=int, default=50,
+                        help="Maximum number of new tokens to generate")
+    parser.add_argument("--profile", action="store_true",
+                        help="Enable performance profiling (latency/throughput metrics)")
+    parser.add_argument("--no_target", action="store_true",
+                        help="(Draft role only) Run draft model without target (standalone draft mode)")
+    parser.add_argument("--draft_chunk_size", type=int, default=4,
+                        help="Number of tokens per speculative draft step (chunk size for draft model)")
     args = parser.parse_args()
 
     if args.role == "compile":
-        # Compile the specified model for AWS Trainium
+        # Compile the specified model to Neuron
         model_name = args.model
         seq_length = args.sequence_length
         if model_name is None:
@@ -33,64 +49,79 @@ def main():
         logger.info("Model compilation completed.")
 
     elif args.role == "target":
-        # Launch the target model gRPC server
         model_name = args.model or args.target_model
         if model_name is None:
             logger.error("Please specify --model (target model path) for target role")
             return
-        from inference import target_worker
-        logger.info(f"Starting target server with model '{model_name}' on port {args.port}...")
-        target_worker.run_server(model_name, port=args.port, sequence_length=args.sequence_length)
+        # If a prompt is provided with --profile, run a local generation for profiling (target-only mode)
+        if args.profile and args.prompt:
+            from inference import target_worker
+            logger.info("Profiling enabled for standalone target generation.")
+            target_worker.run_local(model_name, prompt=args.prompt,
+                                    max_new_tokens=args.max_new_tokens,
+                                    sequence_length=args.sequence_length,
+                                    profile=True)
+        else:
+            # Launch the target model gRPC server
+            from inference import target_worker
+            target_worker.run_server(model_name, port=args.port,
+                                     sequence_length=args.sequence_length,
+                                     profile=args.profile)
 
     elif args.role == "draft":
-        # Run the speculative decoding draft client, which connects to the target server
         draft_model = args.model or args.draft_model
-        target_model = args.target_model  # used for tokenizer vocabulary if provided
+        target_model = args.target_model  # Path to target model (for tokenizer consistency)
         if draft_model is None:
             logger.error("Please specify --model (draft model path) for draft role")
             return
-        prompt = args.prompt or ""
-        if prompt == "":
-            logger.error("Please specify --prompt for draft role (the prompt cannot be empty).")
-            return
+        prompt_text = args.prompt or ""
         from inference import draft_worker
-        logger.info(f"Running draft client with draft model '{draft_model}', connecting to {args.target_host}:{args.port}")
-        draft_worker.run_client(
-            draft_model,
-            target_host=args.target_host,
-            port=args.port,
-            prompt=prompt,
-            target_model_name=target_model,
-            max_new_tokens=args.max_tokens,
-            sequence_length=args.sequence_length,
-            draft_chunk_size=args.draft_chunk_size,
-            profile=args.profile
-        )
+        if args.no_target:
+            # Run draft model standalone (no target server)
+            if args.profile:
+                logger.info("Profiling enabled for standalone draft generation.")
+            else:
+                logger.info("Standalone draft generation (no target server).")
+            draft_worker.run_client(draft_model, target_host=None, port=args.port,
+                                     prompt=prompt_text, target_model_name=target_model,
+                                     max_new_tokens=args.max_new_tokens, sequence_length=args.sequence_length,
+                                     draft_chunk_size=args.draft_chunk_size,
+                                     profile=args.profile, no_target=True)
+        else:
+            # Run speculative decoding with a target server
+            if args.profile:
+                logger.info("Profiling enabled for speculative decoding (draft client).")
+            draft_worker.run_client(draft_model, target_host=args.target_host, port=args.port,
+                                     prompt=prompt_text, target_model_name=target_model,
+                                     max_new_tokens=args.max_new_tokens, sequence_length=args.sequence_length,
+                                     draft_chunk_size=args.draft_chunk_size,
+                                     profile=args.profile, no_target=False)
 
     elif args.role == "verify_target":
-        # Run the target model locally (single-process) to generate text token-by-token for verification
         model_name = args.model
         if model_name is None:
             logger.error("Please specify --model for verify_target role")
             return
-        prompt = args.prompt or ""
+        prompt_text = args.prompt or ""
         from inference import verify
-        logger.info(f"Verifying output using target model '{model_name}' locally...")
-        verify.run_model(model_name, prompt=prompt, max_tokens=args.max_tokens, sequence_length=args.sequence_length)
+        verify.run_model(model_name, prompt=prompt_text,
+                         max_tokens=args.max_new_tokens,
+                         sequence_length=args.sequence_length,
+                         role="target", profile=args.profile)
 
     elif args.role == "verify_draft":
-        # Run the draft model locally to generate text token-by-token for verification
         model_name = args.model
         if model_name is None:
             logger.error("Please specify --model for verify_draft role")
             return
-        prompt = args.prompt or ""
+        prompt_text = args.prompt or ""
         from inference import verify
-        logger.info(f"Verifying output using draft model '{model_name}' locally...")
-        verify.run_model(model_name, prompt=prompt, max_tokens=args.max_tokens, sequence_length=args.sequence_length)
-
+        verify.run_model(model_name, prompt=prompt_text,
+                         max_tokens=args.max_new_tokens,
+                         sequence_length=args.sequence_length,
+                         role="draft", profile=args.profile)
     else:
-        logger.error("Unknown role. Use --role compile|target|draft|verify_target|verify_draft.")
+        logger.error("Unknown role. Use --role target|draft|compile|verify_target|verify_draft.")
 
 if __name__ == "__main__":
     main()
