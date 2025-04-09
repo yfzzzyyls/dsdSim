@@ -34,7 +34,7 @@ def compile_model(model_path: str, sequence_length: int = DEFAULT_SEQUENCE_LENGT
     """
     base_name = os.path.basename(os.path.normpath(model_path))
     compiled_dir = f"{base_name}-compiled-{sequence_length}"
-    os.makedirs(compiled_dir, exist_ok=True)
+    # os.makedirs(compiled_dir, exist_ok=True)
     logger.info(f"Compiling model '{model_path}' to Neuron (sequence_length={sequence_length})...")
 
     model_type = ""

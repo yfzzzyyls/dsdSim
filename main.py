@@ -42,7 +42,7 @@ def main():
             logger.error("Please specify --model (target model path) for target role")
             return
         # If a prompt is provided with --profile, run a local generation for profiling (target-only mode)
-        if args.profile and args.prompt:
+        if args.prompt:
             from inference import target_worker
             logger.info("Profiling enabled for standalone target generation.")
             target_worker.run_local(model_name, prompt=args.prompt,
