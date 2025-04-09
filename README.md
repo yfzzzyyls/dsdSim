@@ -98,13 +98,13 @@ rm -r /var/tmp/neuron-compile-cache
 ### **Compile & Run the Target Model Server**
 
 ```
-python main.py --role target --model /home/ubuntu/models/llama-3.2-3b/ --port 50051 --sequence_length 128
+python main.py --role target --model /home/ubuntu/models/llama-3.2-3b/ --port 50051 --sequence_length 640
 ```
 
 ### **Compile & Run the Draft Model server**
 
 ```
-python main.py --role draft --model /home/ubuntu/models/llama-3.2-1b/ --target_host 18.222.253.234 --port 50051 --prompt "Once upon a time," --max_new_tokens 100 --gamma 4 --profile
+python main.py --role draft --model /home/ubuntu/models/llama-3.2-1b/ --target_host 18.222.253.234 --port 50051 --prompt "Once upon a time," --max_new_tokens 100 --gamma 4 --profile --sequence_length 640
 ```
 
 ### **Example Output**
