@@ -45,6 +45,12 @@ def main():
         if model_name is None:
             logger.error("Please specify --model for compile role")
             return
+        # Check for existing compiled model directory to avoid duplicate compilation
+        base_name = os.path.basename(os.path.normpath(model_name))
+        compiled_dir = f"{base_name}-compiled-{seq_length}"
+        if os.path.isdir(compiled_dir):
+            logger.info(f"Compiled model directory '{compiled_dir}' already exists. Skipping compilation.")
+            return
         from inference import model_loader
         logger.info(f"Compiling model '{model_name}' with sequence length {seq_length}...")
         model_loader.compile_model(model_name, sequence_length=seq_length)

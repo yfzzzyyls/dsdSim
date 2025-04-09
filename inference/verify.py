@@ -12,6 +12,9 @@ def run_model(model_name: str, prompt: str, max_tokens: int = 50, sequence_lengt
     logger.info(f"Loading {role} model '{model_name}' for standalone generation (sequence_length={sequence_length})...")
     model = load_model(model_name, sequence_length=sequence_length)
     tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=False)
+    if model is None:
+        logger.error("Failed to load the model for verification.")
+        return  # Exit early if model could not be loaded
     if not prompt:
         logger.error("No prompt provided for generation.")
         return

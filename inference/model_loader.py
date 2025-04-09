@@ -1,5 +1,6 @@
 import os
 import logging
+import shutil
 import re
 import json
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -16,6 +17,19 @@ def load_model(model_path: str, sequence_length: int = DEFAULT_SEQUENCE_LENGTH):
     Load a model for inference. If a Neuron-compiled model is available in the directory, 
     load it directly. Otherwise, fall back to compiling or loading from Hugging Face.
     """
+
+    # Check if a precompiled model directory exists in the current working directory
+    base_name = os.path.basename(os.path.normpath(model_path))
+    compiled_dir = f"{base_name}-compiled-{sequence_length}"
+    if os.path.isdir(compiled_dir):
+        # If compiled artifacts exist in compiled_dir, load from there instead
+        compiled_files = [f for f in os.listdir(compiled_dir)
+                        if f.startswith("model_neuron") and (f.endswith(".pt") or f.endswith(".ts"))]
+        if compiled_files:
+            logger.info(f"Found precompiled model in '{compiled_dir}', loading it instead of recompiling.")
+            # Update model_path to the compiled directory for loading
+            model_path = compiled_dir
+
     # Check for local directory with config
     config_file = os.path.join(model_path, "config.json")
     if os.path.isdir(model_path) and os.path.isfile(config_file):
@@ -65,17 +79,29 @@ def load_model(model_path: str, sequence_length: int = DEFAULT_SEQUENCE_LENGTH):
                 if model_type.lower() == "llama" or "llama" in model_path.lower():
                     # For LLaMA models, compile to Neuron rather than loading to CPU
                     logger.info(f"Found HF checkpoint in '{model_path}' – compiling to Neuron for inference.")
-                    return compile_model(model_path, sequence_length=sequence_length)
+                    model = compile_model(model_path, sequence_length=sequence_length)
+                    if model is None:
+                        # If compile_model didn't return a model (should not happen after fix), load from compiled artifacts
+                        return load_model(model_path, sequence_length=sequence_length)
+                    return model
+                    # return compile_model(model_path, sequence_length=sequence_length)
                 else:
                     logger.info(f"Loading model from Hugging Face checkpoint at '{model_path}'...")
                     return AutoModelForCausalLM.from_pretrained(model_path)
             else:
                 # No weights found at all, attempt to compile from source (HF Hub or other path)
                 logger.info(f"No weights found in '{model_path}'. Attempting to download/compile from source.")
-                return compile_model(model_path, sequence_length=sequence_length)
+                model = compile_model(model_path, sequence_length=sequence_length)
+                if model is None:
+                    return load_model(model_path, sequence_length=sequence_length)
+                return model
+                # return compile_model(model_path, sequence_length=sequence_length)
     else:
         # model_path is not a local directory (could be a model ID or file path) – attempt to compile/load
-        return compile_model(model_path, sequence_length=sequence_length)
+        model = compile_model(model_path, sequence_length=sequence_length)
+        if model is None:
+            return load_model(model_path, sequence_length=sequence_length)
+        return model
 
 def compile_model(model_path: str, sequence_length: int = DEFAULT_SEQUENCE_LENGTH):
     """
@@ -117,7 +143,6 @@ def compile_model(model_path: str, sequence_length: int = DEFAULT_SEQUENCE_LENGT
         model = LlamaForSampling.from_pretrained(model_path, batch_size=1, amp='bf16',
                                                  n_positions=sequence_length, tp_degree=tp_degree)
         model.to_neuron()  # This triggers the Neuron compilation
-
         # Save the compiled model artifacts for future runs
         try:
             save_pretrained_split(model, compiled_dir)
@@ -130,10 +155,13 @@ def compile_model(model_path: str, sequence_length: int = DEFAULT_SEQUENCE_LENGT
         # Save the tokenizer to the same directory
         tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=False)
         tokenizer.save_pretrained(compiled_dir)
+        # Copy the model config to the compiled directory for future loading
+        try:
+            shutil.copyfile(os.path.join(model_path, "config.json"), os.path.join(compiled_dir, "config.json"))
+        except Exception as e:
+            logger.warning(f"Could not copy config.json to '{compiled_dir}': {e}")
         logger.info(f"Neuron compiled model saved to '{compiled_dir}'.")
-        # Clean up model to avoid Neuron destructor warnings
-        del model
-        return  # No model object returned; artifacts saved in compiled_dir
+        return model
     else:
         # Fallback: load the model weights and save them (no Neuron compilation performed)
         model = AutoModelForCausalLM.from_pretrained(model_path)
@@ -141,6 +169,4 @@ def compile_model(model_path: str, sequence_length: int = DEFAULT_SEQUENCE_LENGT
         tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=False)
         tokenizer.save_pretrained(compiled_dir)
         logger.info(f"Model and tokenizer saved to '{compiled_dir}' (no Neuron compilation performed).")
-        # Clean up model to avoid warnings on exit
-        del model
-        return
+        return model
