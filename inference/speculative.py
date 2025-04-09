@@ -127,9 +127,9 @@ def speculative_decode(draft_model, tokenizer, target_stub, prompt_text: str,
         stats = {
             "total_time": total_time,
             "tokens_generated": total_tokens,
-            "avg_time_per_token": avg_time_per_token,
+            "avg_token_time": avg_time_per_token,     # rename here
             "throughput": throughput,
-            "match_rate": match_rate
+            "token_match_rate": match_rate            # rename here
         }
 
     return output_text, stats
