@@ -49,7 +49,7 @@ pip install --upgrade transformers-neuronx
 
 1. **Clone Repo & Install**:
 
-   ```bash
+   ```
    git clone https://github.com/yfzzzyyls/Choral-Spec
    ```
 2. **Download Models** (1B draft, 3B target) from Hugging Face. For example:
@@ -104,18 +104,38 @@ python main.py --role target --model /home/ubuntu/models/llama-3.2-3b/ --port 50
 ### **Compile & Run the Draft Model server**
 
 ```
-python main.py --role draft --model /home/ubuntu/models/llama-3.2-1b --target_host 3.16.109.246 --port 50051 --max_new_tokens 20 --prompt "Once upon a time," --target_model /home/ubuntu/models/llama-3.2-3b --profile
+python main.py --role draft --model /home/ubuntu/models/llama-3.2-1b/ --target_model llama-3.2-3b-compiled-128/ --target_host 18.222.253.234 --port 50051 --prompt "Once upon a time," --max_new_tokens 100 --gamma 4 --profile
 ```
 
 ### **Example Output**
 
 ```
-INFO:inference.verify:Target model generation completed in 0.61 seconds.
-INFO:inference.verify:Tokens generated: 20, Throughput: 32.96 t/s
-INFO:inference.verify:Performance metrics saved to performance_target_only_20250408_013547.csv and performance_target_only_20250408_013547.json
+......
+INFO:inference.speculative:Draft chunk of 4 tokens accepted (all matched).
+INFO:inference.speculative:Draft chunk of 4 tokens accepted (all matched).
+INFO:inference.speculative:Draft predicted 2 tokens correctly, then diverged. Replaced mismatch token with target's token.
+INFO:inference.speculative:Draft predicted 0 tokens correctly, then diverged. Replaced mismatch token with target's token.
+INFO:inference.speculative:Draft predicted 3 tokens correctly, then diverged. Replaced mismatch token with target's token.
+INFO:inference.speculative:Draft predicted 0 tokens correctly, then diverged. Replaced mismatch token with target's token.
+INFO:inference.speculative:Draft predicted 1 tokens correctly, then diverged. Replaced mismatch token with target's token.
+INFO:inference.speculative:Draft predicted 0 tokens correctly, then diverged. Replaced mismatch token with target's token.
+INFO:inference.speculative:Draft predicted 1 tokens correctly, then diverged. Replaced mismatch token with target's token.
+INFO:inference.speculative:Draft predicted 2 tokens correctly, then diverged. Replaced mismatch token with target's token.
+INFO:inference.speculative:Draft predicted 0 tokens correctly, then diverged. Replaced mismatch token with target's token.
+INFO:inference.speculative:Draft predicted 1 tokens correctly, then diverged. Replaced mismatch token with target's token.
+INFO:inference.speculative:Draft predicted 0 tokens correctly, then diverged. Replaced mismatch token with target's token.
+INFO:inference.speculative:Draft predicted 0 tokens correctly, then diverged. Replaced mismatch token with target's token.
+INFO:inference.speculative:Draft predicted 1 tokens correctly, then diverged. Replaced mismatch token with target's token.
+INFO:inference.speculative:Draft predicted 2 tokens correctly, then diverged. Replaced mismatch token with target's token.
+INFO:inference.speculative:Draft predicted 0 tokens correctly, then diverged. Replaced mismatch token with target's token.
+INFO:inference.speculative:Generation finished (target_finished=False, draft_finished=False, tokens_generated=100).
+INFO:inference.speculative:Speculative decoding completed in 48.79 seconds, avg 0.4879s per token.
+INFO:inference.speculative:Tokens generated: 100, Throughput: 2.05 tokens/sec, Match rate: 0.32
+INFO:inference.draft_worker:Speculative decoding completed.
 
 === Final Output ===
-Once upon a time, not so very long ago, it was enough to say that the best thing that ever came along was
+Once upon a time, when I was in college, I loved to watch old movies on my computer. As a matter of fact, I still love to watch old movies on my computer. However, if I use my computer to watch one of these movies, I must take some actions to optimize the video performance in advance, usually because I must have good video quality. So, what are the main factors affecting the ability of a notebook pc to display video?
+1, The display of the laptop is dependent on the screen of
 ```
 
 ## **Performance Profiling Stats**
@@ -136,7 +156,7 @@ To run the **target model** by itself on a prompt:
 python main.py --role verify_target --model /home/ubuntu/models/llama-3.2-3b/ --prompt "Once upon a time," --max_new_tokens 100 --sequence_length 128 --profile
 ```
 
-This will load the 3B target model and generate 20 tokens continuing the prompt, printing each generated token as it arrives, followed by the full output text.
+This will load the 3B target model and generate 100 tokens continuing the prompt, printing each generated token as it arrives, followed by the full output text.
 
 Similarly, to run the **draft model** by itself:
 
@@ -146,21 +166,7 @@ python main.py --role verify_draft --model /home/ubuntu/models/llama-3.2-1b --pr
 
 This will use the 1B draft model to generate text token-by-token for the given prompt.
 
-*Note:* In verification modes, the model will be compiled on the fly if a compiled Neuron model is not found. By default,** **`--sequence_length 128` is used; ensure you use the same sequence length that the model was compiled with (or specify** **`--sequence_length` accordingly) to avoid recompilation. The** **`--max_tokens` option controls how many new tokens to generate for the prompt.
-
-## **Performance Testing**
-
-Run the **evaluate_test.py** script to compare speculative decoding vs. target-only:
-
-```
-Speculative decoding result:
-Once upon a time, ...
-Spec time: 2.12s, tokens=40, throughput=18.87 t/sBaseline target-only result:
-Once upon a time, ...
-Baseline time: 3.95s, tokens=40, throughput=10.12 t/s
-```
-
-This shows ~1.8x speedup from speculative decoding.
+*Note:* In verification modes, the model will be compiled on the fly if a compiled Neuron model is not found. By default, **`--sequence_length 128` is used; ensure you use the same sequence length that the model was compiled with (or specify** **`--sequence_length` accordingly) to avoid recompilation. The** `--max_tokens` option controls how many new tokens to generate for the prompt.
 
 ## **Advanced Tips**
 
