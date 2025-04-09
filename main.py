@@ -8,9 +8,9 @@ logger = logging.getLogger(__name__)
 
 def main():
     parser = argparse.ArgumentParser(description="Choral-Spec main launcher")
-    parser.add_argument("--role", choices=["target", "draft", "compile", "verify_target", "verify_draft"], required=True,
+    parser.add_argument("--role", choices=["target", "draft", "verify_target", "verify_draft"], required=True,
                         help=("Role to run: 'target' for target server, 'draft' for draft client, "
-                              "'compile' to compile a model, 'verify_target' to run the target model standalone, "
+                              "'verify_target' to run the target model standalone, "
                               "'verify_draft' to run the draft model standalone"))
     parser.add_argument("--model", type=str,
                         help="Model path for the primary model (for target, draft, or verification roles)")
@@ -32,31 +32,11 @@ def main():
                         help="Enable performance profiling (latency/throughput metrics)")
     parser.add_argument("--no_target", action="store_true",
                         help="(Draft role only) Run draft model without target (standalone draft mode)")
-    parser.add_argument("--draft_chunk_size", type=int, default=4,
-                        help="Number of tokens per speculative draft step (chunk size for draft model)")
     parser.add_argument("--gamma", type=int, default=4,
                         help="Number of draft tokens to generate per verification step (speculative decoding chunk size).")
     args = parser.parse_args()
 
-    if args.role == "compile":
-        # Compile the specified model to Neuron
-        model_name = args.model
-        seq_length = args.sequence_length
-        if model_name is None:
-            logger.error("Please specify --model for compile role")
-            return
-        # Check for existing compiled model directory to avoid duplicate compilation
-        base_name = os.path.basename(os.path.normpath(model_name))
-        compiled_dir = f"{base_name}-compiled-{seq_length}"
-        if os.path.isdir(compiled_dir):
-            logger.info(f"Compiled model directory '{compiled_dir}' already exists. Skipping compilation.")
-            return
-        from inference import model_loader
-        logger.info(f"Compiling model '{model_name}' with sequence length {seq_length}...")
-        model_loader.compile_model(model_name, sequence_length=seq_length)
-        logger.info("Model compilation completed.")
-
-    elif args.role == "target":
+    if args.role == "target":
         model_name = args.model or args.target_model
         if model_name is None:
             logger.error("Please specify --model (target model path) for target role")
