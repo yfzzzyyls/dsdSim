@@ -15,7 +15,7 @@ def run_client(draft_model_name: str,
                target_host: str = "localhost",
                port: int = 50051,
                prompt: str = "",
-               target_model_name: str = None,
+               target_tokenizer: str = None,
                max_new_tokens: int = 50,
                sequence_length: int = 128,
                draft_chunk_size: int = 4,
@@ -27,7 +27,7 @@ def run_client(draft_model_name: str,
     logger.info(f"Loading draft model '{draft_model_name}' (sequence_length={sequence_length})...")
     draft_model = load_model(draft_model_name, sequence_length=sequence_length)
     # Use the target model's tokenizer if provided, otherwise the draft's
-    tokenizer_source = target_model_name or draft_model_name
+    tokenizer_source = target_tokenizer or draft_model_name
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_source, use_fast=False)
     if not prompt:
         logger.error("No prompt provided for draft client.")
