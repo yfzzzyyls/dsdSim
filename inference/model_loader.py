@@ -14,94 +14,17 @@ DEFAULT_SEQUENCE_LENGTH = 128
 
 def load_model(model_path: str, sequence_length: int = DEFAULT_SEQUENCE_LENGTH):
     """
-    Load a model for inference. If a Neuron-compiled model is available in the directory, 
-    load it directly. Otherwise, fall back to compiling or loading from Hugging Face.
+    Load or compile a model for inference.
     """
-
-    # Check if a precompiled model directory exists in the current working directory
-    base_name = os.path.basename(os.path.normpath(model_path))
-    compiled_dir = f"{base_name}-compiled-{sequence_length}"
-    if os.path.isdir(compiled_dir):
-        # If compiled artifacts exist in compiled_dir, load from there instead
-        compiled_files = [f for f in os.listdir(compiled_dir)
-                        if f.startswith("model_neuron") and (f.endswith(".pt") or f.endswith(".ts"))]
-        if compiled_files:
-            logger.info(f"Found precompiled model in '{compiled_dir}', loading it instead of recompiling.")
-            # Update model_path to the compiled directory for loading
-            model_path = compiled_dir
-
     # Check for local directory with config
-    config_file = os.path.join(model_path, "config.json")
-    if os.path.isdir(model_path) and os.path.isfile(config_file):
-        # List any Neuron compiled model files in the directory
-        compiled_files = [f for f in os.listdir(model_path) 
-                          if f.startswith("model_neuron") and (f.endswith(".pt") or f.endswith(".ts"))]
-        weight_file = os.path.join(model_path, "pytorch_model.bin")
-        if compiled_files:
-            # Found Neuron-compiled model artifacts (TorchScript or partitioned files)
-            logger.info(f"Found compiled Neuron model artifacts in '{model_path}': {compiled_files}")
-            # Identify model architecture from config (to choose appropriate NeuronX class)
-            model_type = ""
-            try:
-                with open(config_file, "r") as cf:
-                    cfg = json.load(cf)
-                    model_type = cfg.get("model_type", "")
-            except Exception as e:
-                logger.warning(f"Could not read model config: {e}")
-            # Use LLaMA optimized class if applicable
-            if model_type.lower() == "llama" or "llama" in model_path.lower():
-                tp_degree = len(compiled_files) if len(compiled_files) > 1 else 1
-                # Initialize Neuron model (no weights loading needed if artifacts exist)
-                model = LlamaForSampling.from_pretrained(model_path, batch_size=1, amp='bf16', 
-                                                        n_positions=sequence_length, tp_degree=tp_degree)
-                try:
-                    model.load(model_path)  # Load compiled model (neuron artifacts) into NeuronCores
-                    logger.info("Loaded Neuron-compiled model from TorchScript artifacts.")
-                except Exception as e:
-                    logger.info(f"No precompiled cache loaded (will compile now): {e}")
-                # Ensure model is loaded onto Neuron cores
-                model.to_neuron()
-                return model
-            else:
-                logger.info(f"Compiled model artifacts found, but unrecognized model type '{model_type}'. Loading with AutoModelForCausalLM as fallback.")
-                return AutoModelForCausalLM.from_pretrained(model_path)
-        else:
-            # No Neuron artifacts found in directory
-            if os.path.isfile(weight_file):
-                # If standard Hugging Face weights are present, decide on loading vs compile
-                model_type = ""
-                try:
-                    with open(config_file, "r") as cf:
-                        cfg = json.load(cf)
-                        model_type = cfg.get("model_type", "")
-                except Exception:
-                    pass
-                if model_type.lower() == "llama" or "llama" in model_path.lower():
-                    # For LLaMA models, compile to Neuron rather than loading to CPU
-                    logger.info(f"Found HF checkpoint in '{model_path}' – compiling to Neuron for inference.")
-                    model = compile_model(model_path, sequence_length=sequence_length)
-                    if model is None:
-                        # If compile_model didn't return a model (should not happen after fix), load from compiled artifacts
-                        return load_model(model_path, sequence_length=sequence_length)
-                    return model
-                    # return compile_model(model_path, sequence_length=sequence_length)
-                else:
-                    logger.info(f"Loading model from Hugging Face checkpoint at '{model_path}'...")
-                    return AutoModelForCausalLM.from_pretrained(model_path)
-            else:
-                # No weights found at all, attempt to compile from source (HF Hub or other path)
-                logger.info(f"No weights found in '{model_path}'. Attempting to download/compile from source.")
-                model = compile_model(model_path, sequence_length=sequence_length)
-                if model is None:
-                    return load_model(model_path, sequence_length=sequence_length)
-                return model
-                # return compile_model(model_path, sequence_length=sequence_length)
-    else:
-        # model_path is not a local directory (could be a model ID or file path) – attempt to compile/load
-        model = compile_model(model_path, sequence_length=sequence_length)
-        if model is None:
-            return load_model(model_path, sequence_length=sequence_length)
-        return model
+    # config_file = os.path.join(model_path, "config.json")
+    # if os.path.isdir(model_path) and os.path.isfile(config_file):
+    logger.info(f"Attempting to download/compile from source.")
+    model = compile_model(model_path, sequence_length=sequence_length)
+    if model is None:
+        return load_model(model_path, sequence_length=sequence_length)
+    return model
+
 
 def compile_model(model_path: str, sequence_length: int = DEFAULT_SEQUENCE_LENGTH):
     """
@@ -109,14 +32,6 @@ def compile_model(model_path: str, sequence_length: int = DEFAULT_SEQUENCE_LENGT
     compiles it to a TorchScript that can run on NeuronCores, and saves the compiled model
     and tokenizer to a local folder for future use.
     """
-    # If model_path already contains compiled artifacts, reuse instead of nesting
-    if os.path.isdir(model_path):
-        compiled_files = [f for f in os.listdir(model_path) 
-                          if f.startswith("model_neuron") and (f.endswith(".pt") or f.endswith(".ts"))]
-        if compiled_files:
-            logger.info(f"Model '{model_path}' is already compiled (artifacts found). Skipping recompilation.")
-            return  # Reuse existing compiled model directory
-
     base_name = os.path.basename(os.path.normpath(model_path))
     compiled_dir = f"{base_name}-compiled-{sequence_length}"
     os.makedirs(compiled_dir, exist_ok=True)
@@ -140,27 +55,10 @@ def compile_model(model_path: str, sequence_length: int = DEFAULT_SEQUENCE_LENGT
     tp_degree = int(os.environ.get("NEURON_RT_NUM_CORES", "1"))
     if model_type.lower() == "llama" or "llama" in model_path.lower():
         # Compile using optimized LLaMA class for Neuron
+        logger.info(f"Compiling model using optimized LLaMA for Neuron ...")
         model = LlamaForSampling.from_pretrained(model_path, batch_size=1, amp='bf16',
                                                  n_positions=sequence_length, tp_degree=tp_degree)
         model.to_neuron()  # This triggers the Neuron compilation
-        # Save the compiled model artifacts for future runs
-        try:
-            save_pretrained_split(model, compiled_dir)
-        except Exception as e:
-            # If the model is single-part, fall back to standard save
-            try:
-                model.save(compiled_dir)
-            except Exception as e2:
-                logger.error(f"Failed to save compiled model artifacts: {e2}")
-        # Save the tokenizer to the same directory
-        tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=False)
-        tokenizer.save_pretrained(compiled_dir)
-        # Copy the model config to the compiled directory for future loading
-        try:
-            shutil.copyfile(os.path.join(model_path, "config.json"), os.path.join(compiled_dir, "config.json"))
-        except Exception as e:
-            logger.warning(f"Could not copy config.json to '{compiled_dir}': {e}")
-        logger.info(f"Neuron compiled model saved to '{compiled_dir}'.")
         return model
     else:
         # Fallback: load the model weights and save them (no Neuron compilation performed)
