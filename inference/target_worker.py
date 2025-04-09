@@ -169,8 +169,9 @@ def run_local(model_path, prompt="", max_new_tokens=50, sequence_length=128, pro
             logger.info("EOS token encountered, stopping generation.")
             break
     # Profiling logs
+    end_time = time.time()
     if profile and start_time is not None:
-        total_time = time.time() - start_time
+        total_time = end_time - start_time
         throughput = tokens_generated / total_time if total_time > 0 else float('inf')
         logger.info(f"Target model generation completed in {total_time:.2f} seconds.")
         logger.info(f"Tokens generated: {tokens_generated}, Throughput: {throughput:.2f} tokens/sec")

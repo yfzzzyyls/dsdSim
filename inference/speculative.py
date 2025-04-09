@@ -111,10 +111,10 @@ def speculative_decode(draft_model, tokenizer, target_stub, prompt_text: str,
         if target_finished or draft_finished or tokens_generated >= max_new_tokens:
             logger.info(f"Generation finished (target_finished={target_finished}, draft_finished={draft_finished}, tokens_generated={tokens_generated}).")
             break
-
+    end_time = time.perf_counter()
     # (Optional profiling end)
     if profile and start_time is not None:
-        end_time = time.perf_counter()
+        # end_time = time.perf_counter()
         total_time = end_time - start_time
         total_tokens = tokens_generated
         avg_time_per_token = total_time / total_tokens if total_tokens > 0 else 0.0
@@ -123,4 +123,13 @@ def speculative_decode(draft_model, tokenizer, target_stub, prompt_text: str,
         logger.info(f"Speculative decoding completed in {total_time:.2f} seconds, avg {avg_time_per_token:.4f}s per token.")
         logger.info(f"Tokens generated: {total_tokens}, Throughput: {throughput:.2f} tokens/sec, Match rate: {match_rate:.2f}")
 
-    return output_text
+        # Store these in a dict so the caller can use them
+        stats = {
+            "total_time": total_time,
+            "tokens_generated": total_tokens,
+            "avg_time_per_token": avg_time_per_token,
+            "throughput": throughput,
+            "match_rate": match_rate
+        }
+
+    return output_text, stats
