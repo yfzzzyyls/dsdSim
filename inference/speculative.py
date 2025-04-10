@@ -5,7 +5,7 @@ from grpc_comm import grpc_client
 
 logger = logging.getLogger(__name__)
 
-def speculative_decode(draft_model, tokenizer, stub, max_new_tokens, gamma, top_p=0.9):
+def speculative_decode(draft_model, tokenizer, stub, max_new_tokens, gamma, profile=False, top_p=0.9):
     """
     Perform probability-based speculative decoding using a draft model and a target model via gRPC.
     draft_model: the smaller draft model (with a HuggingFace-like interface for generation)
