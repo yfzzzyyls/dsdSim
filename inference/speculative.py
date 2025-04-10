@@ -5,7 +5,15 @@ from grpc_comm import grpc_client
 
 logger = logging.getLogger(__name__)
 
-def speculative_decode(draft_model, tokenizer, stub, max_new_tokens, gamma, profile=False, top_p=0.9):
+def speculative_decode(
+        draft_model, 
+        tokenizer, 
+        stub,
+        prompt, 
+        max_new_tokens,
+        gamma, 
+        profile=False, 
+        top_p=0.9):
     """
     Perform probability-based speculative decoding using a draft model and a target model via gRPC.
     draft_model: the smaller draft model (with a HuggingFace-like interface for generation)
@@ -48,7 +56,7 @@ def speculative_decode(draft_model, tokenizer, stub, max_new_tokens, gamma, prof
                 # Use cached past state for faster generation of next token
                 last_token_id = torch.tensor([[output_tokens[-1]]], dtype=torch.long) if output_tokens else None
                 outputs = draft_model(input_ids=last_token_id, use_cache=True, past_key_values=past)
-            logits = outputs.logits  # shape: [batch=1, seq_len=1 (for new token), vocab_size]
+            logits = outputs  # shape: [batch=1, seq_len=1 (for new token), vocab_size]
             past = getattr(outputs, "past_key_values", None)  # update past state if available
 
             # Apply softmax to get probabilities
