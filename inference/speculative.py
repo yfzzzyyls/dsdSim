@@ -1,135 +1,175 @@
-import time
-import json
-import os
-import logging
+import random
 import torch
-from grpc_comm.inference_pb2 import StartRequest, VerifyChunkRequest  # import the correct request class
+import logging
+from grpc_comm import grpc_client
+
 logger = logging.getLogger(__name__)
 
-def speculative_decode(draft_model, tokenizer, target_stub, prompt_text: str,
-                       max_new_tokens: int = 50, chunk_size: int = 4, profile: bool = False) -> str:
+def speculative_decode(draft_model, tokenizer, stub, max_new_tokens, draft_chunk_size, top_p=0.9):
     """
-    Perform distributed speculative decoding using a draft model (local) and a target model (via gRPC).
-    Generates up to max_new_tokens tokens continuing from prompt_text.
-    Returns the generated continuation text (excluding the prompt).
+    Perform probability-based speculative decoding using a draft model and a target model via gRPC.
+    draft_model: the smaller draft model (with a HuggingFace-like interface for generation)
+    tokenizer: tokenizer used (shared by draft and target models)
+    stub: gRPC stub for SpeculativeService connecting to the target model server
+    max_new_tokens: maximum number of tokens to generate
+    draft_chunk_size: number of draft tokens to sample per speculative iteration (gamma)
+    top_p: top-p sampling cutoff for draft model token generation
+    Returns the generated text (continuation) as a string.
     """
-    # Encode the prompt for the draft model
-    input_ids = tokenizer(prompt_text, return_tensors='pt').input_ids
-    output_text = ""
-
-    # Initialize target with the prompt and max token count
-    start_req = StartRequest(prompt=prompt_text, max_new_tokens=max_new_tokens)
-    try:
-        start_resp = target_stub.StartGeneration(start_req)
-        if not start_resp.acknowledged:
-            logger.error("Target server failed to acknowledge StartGeneration.")
-            return ""
-    except Exception as e:
-        logger.error(f"Failed to start generation on target server: {e}")
-        return ""
-
-    # (Optional profiling start)
-    start_time = time.perf_counter() if profile else None
-
+    # Initialize output token list and tracking
+    output_tokens = []
     tokens_generated = 0
-    matched_tokens = 0
-    eos_token_id = tokenizer.eos_token_id if tokenizer.eos_token_id is not None else None
+    finished = False
 
-    # Generate tokens until max_new_tokens reached or generation finishes
-    while tokens_generated < max_new_tokens:
-        # Determine how many tokens to speculate in this iteration
-        tokens_remaining = max_new_tokens - tokens_generated
-        current_chunk_size = min(chunk_size, tokens_remaining)
-        seq_len_before = input_ids.shape[1]
+    # Prepare initial context: the target server should have been primed with prompt via StartGeneration,
+    # and the draft model can be primed by encoding the prompt if not empty.
+    # Here we assume the draft_model's context is already set to the prompt (e.g., by passing input_ids).
+    past = None  # for storing draft model's past state if available (for incremental generation)
+    accepted_tokens_total = 0
+    target_tokens_total = 0
 
-        # Draft model generates the next chunk of tokens
-        try:
-            draft_output = draft_model.sample(input_ids, sequence_length=seq_len_before + current_chunk_size)
-        except Exception as e:
-            logger.error(f"Draft model generation failed: {e}")
+    # Main decoding loop
+    while not finished and tokens_generated < max_new_tokens:
+        # 1. Draft model generates a chunk of tokens with top-p sampling
+        draft_tokens = []
+        draft_probs = []
+        for i in range(draft_chunk_size):
+            # Get next token logits from draft model
+            if past is None:
+                # Feed the current context (output_tokens so far) to get initial logits
+                if output_tokens:
+                    # Use the already generated tokens as additional context
+                    input_ids = torch.tensor([output_tokens], dtype=torch.long)
+                else:
+                    # If no prior output, just feed the last token of prompt context (handled externally)
+                    input_ids = torch.tensor([[]], dtype=torch.long)  # empty tensor as placeholder
+                outputs = draft_model(input_ids=input_ids, use_cache=True)
+            else:
+                # Use cached past state for faster generation of next token
+                last_token_id = torch.tensor([[output_tokens[-1]]], dtype=torch.long) if output_tokens else None
+                outputs = draft_model(input_ids=last_token_id, use_cache=True, past_key_values=past)
+            logits = outputs.logits  # shape: [batch=1, seq_len=1 (for new token), vocab_size]
+            past = getattr(outputs, "past_key_values", None)  # update past state if available
+
+            # Apply softmax to get probabilities
+            logits = logits[0, -1, :]  # vocab distribution for the next token
+            probs = torch.softmax(logits, dim=-1)
+
+            # Top-p filtering: select the smallest set of tokens whose cumulative probability >= top_p
+            sorted_probs, sorted_indices = torch.sort(probs, descending=True)
+            cumulative_probs = torch.cumsum(sorted_probs, dim=0)
+            # Find cutoff index for top_p
+            cutoff_index = torch.where(cumulative_probs >= top_p)[0][0].item() if torch.any(cumulative_probs >= top_p) else (len(sorted_probs) - 1)
+            top_probs = sorted_probs[:cutoff_index+1]
+            top_indices = sorted_indices[:cutoff_index+1]
+            # Renormalize the probabilities of the top-p set
+            top_probs = top_probs / torch.sum(top_probs)
+            # Sample a token from the top-p filtered distribution
+            choice_index = torch.multinomial(top_probs, num_samples=1).item()
+            token_id = int(top_indices[choice_index].item())
+            # Probability of the chosen token under the *truncated* draft distribution (Q_draft)
+            token_prob = float(top_probs[choice_index].item())
+
+            # Append draft token and its probability
+            draft_tokens.append(token_id)
+            draft_probs.append(token_prob)
+            # Add this token to context for further generation
+            output_tokens.append(token_id)
+            tokens_generated += 1
+
+            # Check for end-of-sequence token
+            if tokenizer.eos_token_id is not None and token_id == tokenizer.eos_token_id:
+                finished = True
+                # We include the EOS token in output and stop extending the draft chunk further
+                break
+
+            # If reached max_new_tokens, stop drafting further tokens
+            if tokens_generated >= max_new_tokens:
+                break
+
+        # Remove any extra tokens in draft_tokens beyond max_new_tokens (if loop exited due to limit)
+        if len(draft_tokens) > 0 and tokens_generated > max_new_tokens:
+            # Adjust for overshoot
+            overshoot = tokens_generated - max_new_tokens
+            # Trim the last 'overshoot' tokens from draft_tokens and output_tokens
+            draft_tokens = draft_tokens[:-overshoot]
+            draft_probs = draft_probs[:-overshoot]
+            output_tokens = output_tokens[:-overshoot]
+            tokens_generated = max_new_tokens
+            finished = True
+
+        if not draft_tokens:
+            # No draft tokens generated (should not happen unless max_new_tokens is 0 or immediate finish)
             break
 
-        # Extract draft's newly generated tokens
-        draft_seq = draft_output[0] if isinstance(draft_output, (list, tuple)) else draft_output[0]
-        draft_new_ids = draft_seq[seq_len_before:]
-        draft_new_ids = [int(t) for t in draft_new_ids]
+        # 2. Verify draft tokens with target model to get acceptance probabilities
+        target_probs, target_finished = grpc_client.verify_draft_tokens(stub, draft_tokens)
+        # Ensure lengths match or truncate if target finished early
+        if target_finished and len(target_probs) < len(draft_tokens):
+            # Target model reached EOS before consuming all draft tokens
+            # Treat remaining draft tokens as effectively rejected (target cannot continue)
+            draft_tokens = draft_tokens[:len(target_probs)]
+            draft_probs = draft_probs[:len(target_probs)]
+            finished = True  # Target finished implies overall generation finished
 
-        # Check for EOS token in draft output
-        draft_finished = False
-        if eos_token_id is not None and eos_token_id in draft_new_ids:
-            idx = draft_new_ids.index(eos_token_id)
-            draft_new_ids = draft_new_ids[:idx+1]  # include EOS in the chunk
-            draft_finished = True
-            current_chunk_size = len(draft_new_ids)
+        # 3. Accept or reject each draft token based on acceptance ratio
+        accept_count = 0
+        break_point = False
+        for idx, token_id in enumerate(draft_tokens):
+            # Calculate acceptance ratio = P_target(token) / P_draft(token), capped at 1
+            p_target = float(target_probs[idx]) if idx < len(target_probs) else 0.0
+            p_draft = float(draft_probs[idx]) if idx < len(draft_probs) else 1e-9
+            ratio = p_target / p_draft if p_draft > 0 else 0.0
+            if ratio > 1.0:
+                ratio = 1.0  # cap the acceptance probability at 1
 
-        # Send draft tokens to target for verification (batch verification)
-        verify_req = VerifyChunkRequest(draft_tokens=draft_new_ids)
-        try:
-            verify_resp = target_stub.VerifyDraftChunk(verify_req)
-        except Exception as e:
-            logger.error(f"VerifyDraftChunk RPC failed: {e}")
-            break
+            # Accept or reject this token
+            if random.random() < ratio:
+                # Accept the draft token
+                accept_count += 1
+                accepted_tokens_total += 1
+                # If this token is EOS, we accept and finish generation
+                if tokenizer.eos_token_id is not None and token_id == tokenizer.eos_token_id:
+                    finished = True
+                    # Accept EOS and stop further processing
+                    break_point = True
+                    break
+                # Otherwise, continue to next token in draft_tokens
+            else:
+                # Reject this draft token - break at this point
+                break_point = True
+                break
 
-        # Retrieve verification results
-        all_matched = verify_resp.all_matched
-        match_count = verify_resp.match_count
-        correct_token = verify_resp.correct_token  # target's token at divergence (0 if none)
-        target_finished = verify_resp.finished
+        # If we broke out early (token idx was rejected or EOS reached), we may not use the rest of draft_tokens
+        if break_point and accept_count < len(draft_tokens):
+            # There are draft tokens that were not accepted (from index accept_count onward)
+            # Remove unaccepted draft tokens from output (they were tentatively added)
+            while len(output_tokens) > 0 and len(output_tokens) > accepted_tokens_total + target_tokens_total:
+                # Remove tokens beyond the accepted ones from the output context
+                output_tokens.pop()
+                tokens_generated -= 1
 
-        # Append tokens to output_text based on verification result
-        if all_matched:
-            # All draft tokens are accepted by target
-            text_to_add = tokenizer.decode(draft_new_ids, skip_special_tokens=False)
-            output_text += text_to_add
-            tokens_generated += len(draft_new_ids)
-            matched_tokens += len(draft_new_ids)
-            # Append these tokens to the draft model context for next iteration
-            if draft_new_ids:
-                new_tokens_tensor = torch.tensor([draft_new_ids], dtype=input_ids.dtype)
-                input_ids = torch.cat([input_ids, new_tokens_tensor], dim=1)
-            logger.info(f"Draft chunk of {len(draft_new_ids)} tokens accepted (all matched).")
-        else:
-            # Partial match: accept the matching prefix and use target’s token for the first mismatch
-            prefix_ids = draft_new_ids[:match_count]
-            correct_id = correct_token  # token from target at the divergence point
-            text_to_add = ""
-            if prefix_ids:
-                text_to_add += tokenizer.decode(prefix_ids, skip_special_tokens=False)
-            if correct_id != 0:
-                text_to_add += tokenizer.decode([correct_id], skip_special_tokens=False)
-            output_text += text_to_add
-            tokens_generated += (match_count + (1 if correct_id != 0 else 0))
-            matched_tokens += match_count
-            # Update draft context with accepted prefix plus the target’s correct token
-            accepted_ids = prefix_ids + ([correct_id] if correct_id != 0 else [])
-            if accepted_ids:
-                new_tokens_tensor = torch.tensor([accepted_ids], dtype=input_ids.dtype)
-                input_ids = torch.cat([input_ids, new_tokens_tensor], dim=1)
-            logger.info(f"Draft predicted {match_count} tokens correctly, then diverged. Replaced mismatch token with target's token.")
+        # 4. Finalize: update target model state and possibly get a token from target if rejection occurred
+        final_token_id, finalize_finished = grpc_client.finalize_tokens(stub, accept_count)
+        if final_token_id != 0:
+            # A token was generated by target to replace a rejected draft token
+            output_tokens.append(final_token_id)
+            tokens_generated += 1
+            target_tokens_total += 1
+            # Check if the final token is EOS
+            if tokenizer.eos_token_id is not None and final_token_id == tokenizer.eos_token_id:
+                finished = True
 
-        # Determine if generation should stop
-        if target_finished or draft_finished or tokens_generated >= max_new_tokens:
-            logger.info(f"Generation finished (target_finished={target_finished}, draft_finished={draft_finished}, tokens_generated={tokens_generated}).")
-            break
-    end_time = time.perf_counter()
-    # (Optional profiling end)
-    if profile and start_time is not None:
-        # end_time = time.perf_counter()
-        total_time = end_time - start_time
-        total_tokens = tokens_generated
-        avg_time_per_token = total_time / total_tokens if total_tokens > 0 else 0.0
-        throughput = total_tokens / total_time if total_time > 0 else 0.0
-        match_rate = matched_tokens / total_tokens if total_tokens > 0 else 0.0
-        logger.info(f"Speculative decoding completed in {total_time:.2f} seconds, avg {avg_time_per_token:.4f}s per token.")
-        logger.info(f"Tokens generated: {total_tokens}, Throughput: {throughput:.2f} tokens/sec, Match rate: {match_rate:.2f}")
+        # If target model signaled it finished, or we've reached max tokens, end the loop
+        if finalize_finished or tokens_generated >= max_new_tokens:
+            finished = True
 
-        # Store these in a dict so the caller can use them
-        stats = {
-            "total_time": total_time,
-            "tokens_generated": total_tokens,
-            "avg_token_time": avg_time_per_token,     # rename here
-            "throughput": throughput,
-            "token_match_rate": match_rate            # rename here
-        }
-
-    return output_text, stats
+    # Convert the generated tokens (beyond the prompt) back to text
+    generated_text = tokenizer.decode(output_tokens[len(output_tokens) - tokens_generated:]) if output_tokens else ""
+    # Log the match rate (percentage of tokens from draft model accepted)
+    total_output_tokens = accepted_tokens_total + target_tokens_total
+    if total_output_tokens > 0:
+        match_rate = accepted_tokens_total / total_output_tokens
+        logger.info(f"Speculative decoding match rate: {match_rate:.2%} "
+                    f"(Draft accepted: {accepted_tokens_total}, Target generated: {target_tokens_total})")
+    return generated_text
