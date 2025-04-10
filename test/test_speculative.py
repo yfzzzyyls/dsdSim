@@ -92,7 +92,7 @@ def test_speculative_acceptance():
     # Perform speculative decoding with dummy components
     output_text = speculative.speculative_decode(
         draft_model, tokenizer, stub,
-        max_new_tokens=2, draft_chunk_size=3, top_p=0.9
+        max_new_tokens=2, gamma=3, top_p=0.9
     )
     # The draft model would propose tokens [10, 11, ...]; target likely rejects token 11 and replaces with 13.
     # So the output sequence should be "10 13".

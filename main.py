@@ -69,14 +69,14 @@ def main():
             draft_worker.run_client(draft_model, target_host=None, port=args.port,
                                     prompt=prompt_text, target_tokenizer=target_model_tokenizer,
                                     max_new_tokens=args.max_new_tokens, sequence_length=args.sequence_length,
-                                    draft_chunk_size=args.gamma,
+                                    gamma=args.gamma,
                                     profile=args.profile, no_target=True)
         else:
             # Run speculative decoding with a target server
             draft_worker.run_client(draft_model, target_host=args.target_host, port=args.port,
                                     prompt=prompt_text, target_tokenizer=target_model_tokenizer,
                                     max_new_tokens=args.max_new_tokens, sequence_length=args.sequence_length,
-                                    draft_chunk_size=args.gamma,
+                                    gamma=args.gamma,
                                     profile=args.profile, no_target=False)
 
     elif args.role == "verify_target":

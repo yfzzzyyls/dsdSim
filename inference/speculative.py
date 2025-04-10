@@ -5,14 +5,14 @@ from grpc_comm import grpc_client
 
 logger = logging.getLogger(__name__)
 
-def speculative_decode(draft_model, tokenizer, stub, max_new_tokens, draft_chunk_size, top_p=0.9):
+def speculative_decode(draft_model, tokenizer, stub, max_new_tokens, gamma, top_p=0.9):
     """
     Perform probability-based speculative decoding using a draft model and a target model via gRPC.
     draft_model: the smaller draft model (with a HuggingFace-like interface for generation)
     tokenizer: tokenizer used (shared by draft and target models)
     stub: gRPC stub for SpeculativeService connecting to the target model server
     max_new_tokens: maximum number of tokens to generate
-    draft_chunk_size: number of draft tokens to sample per speculative iteration (gamma)
+    gamma: number of draft tokens to sample per speculative iteration (gamma)
     top_p: top-p sampling cutoff for draft model token generation
     Returns the generated text (continuation) as a string.
     """
@@ -33,7 +33,7 @@ def speculative_decode(draft_model, tokenizer, stub, max_new_tokens, draft_chunk
         # 1. Draft model generates a chunk of tokens with top-p sampling
         draft_tokens = []
         draft_probs = []
-        for i in range(draft_chunk_size):
+        for i in range(gamma):
             # Get next token logits from draft model
             if past is None:
                 # Feed the current context (output_tokens so far) to get initial logits

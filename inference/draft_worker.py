@@ -61,7 +61,7 @@ def run_client(draft_model_name: str,
                target_tokenizer: str = None,
                max_new_tokens: int = 50,
                sequence_length: int = 128,
-               draft_chunk_size: int = 4,
+               gamma: int = 4,
                profile: bool = False,
                no_target: bool = False):
     """
@@ -146,7 +146,7 @@ def run_client(draft_model_name: str,
         stub,
         prompt,
         max_new_tokens=max_new_tokens,
-        chunk_size=draft_chunk_size,
+        gamma=gamma,
         profile=profile
     )
 
