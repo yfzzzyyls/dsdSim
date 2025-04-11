@@ -1,6 +1,7 @@
 import logging
 import grpc
 from grpc_comm import inference_pb2_grpc
+from grpc_comm import inference_pb2
 from inference.model_loader import load_model
 from inference.speculative import speculative_decode
 from transformers import AutoTokenizer
@@ -137,6 +138,14 @@ def run_client(draft_model_name: str,
     logger.info(f"Connecting to target server at {address}...")
     channel = grpc.insecure_channel(address)
     stub = inference_pb2_grpc.SpeculativeServiceStub(channel)
+
+    # CRITICAL FIX: Prime the target server with prompt & max_new_tokens
+    stub.StartGeneration(
+        inference_pb2.StartRequest(
+            prompt=prompt,
+            max_new_tokens=max_new_tokens
+        )
+    )
 
     logger.info(f"Starting speculative decoding for prompt: \"{prompt}\"")
     # Speculative_decode to return (generated_text, perf_stats)
