@@ -105,18 +105,27 @@ python main.py --role target --model /home/ubuntu/models/llama-3.2-3b/ --port 50
 ### **Compile & Run the Draft Model server**
 
 ```
-python main.py --role draft --model /home/ubuntu/models/llama-3.2-1b/ --target_host 18.218.111.79 --port 50051 --prompt "Tell me about the difference between llama and alpaca." --max_new_tokens 128 --gamma 4 --sequence_length 640 --top_p 0.8 --temperature 0.1
+python main.py --role draft --model /home/ubuntu/models/llama-3.2-1b/ --target_host 18.190.157.61 --port 50051 --prompt_text prompt.txt --max_new_tokens 128 --gamma 4 --sequence_length 640 --top_p 0.8 --temperature 0.1
 ```
 
 ### **Example Output**
 
 ```
-INFO:inference.draft_worker:Connecting to target server at 18.218.111.79:50051...
-INFO:inference.draft_worker:Starting speculative decoding for prompt: "Tell me about the difference between llama and alpaca."
-INFO:inference.speculative:Speculative decoding match rate: 37.98% (Draft accepted: 49, Target generated: 80)
-INFO:inference.draft_worker:Speculative decoding completed.
+INFO:inference.draft_worker:[Thread-2] Starting speculative decoding with session_id=104464132
+INFO:inference.draft_worker:[Thread-0] Starting speculative decoding with session_id=3780988024
+INFO:inference.draft_worker:[Thread-1] Starting speculative decoding with session_id=1574770097
+INFO:inference.speculative:Speculative decoding match rate: 37.50% (Draft accepted: 48, Target generated: 80)
+INFO:inference.speculative:Speculative decoding match rate: 22.48% (Draft accepted: 29, Target generated: 100)
+INFO:inference.speculative:Speculative decoding match rate: 17.83% (Draft accepted: 23, Target generated: 106)
 
-=== Final Output ===
+=== Final Batched Outputs ===
+
+[Prompt 0 Output]:
+Once upon a time, there there
+......
+[Prompt 1 Output]:
+......
+[Prompt 2 Output]:
 ......
 ```
 
