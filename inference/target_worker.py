@@ -27,12 +27,12 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
 
     # 1) StartGeneration (already matches proto)
     def StartGeneration(self, request, context):
-        """Initialize generation with the given prompt and optional max token limit."""
         prompt_text = request.prompt or ""
         max_tokens = request.max_new_tokens
-        logger.info(f"StartGeneration called with prompt: \"{prompt_text}\", max_new_tokens: {max_tokens}")
+        self.gamma = request.gamma  # store from the client
 
-        # Encode prompt into input IDs and reset generation state
+        logger.info(f"StartGeneration called with prompt=\"{prompt_text}\", max_new_tokens={max_tokens}, gamma={self.gamma}")
+
         self.current_ids = self.tokenizer(prompt_text, return_tensors="pt").input_ids
         self.max_tokens = max_tokens
         self.tokens_generated = 0
@@ -61,23 +61,16 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
 
     # 3) ADD THIS: FinalizeTokens (exactly matches your .proto)
     def FinalizeTokens(self, request, context):
-        """
-        Merged from grpc_server.py:
-        Called by the client with `FinalizeRequest(accepted_count)`.
-        Must return `FinalizeResponse(final_token, finished)`.
-        """
         accepted_count = request.accepted_count
-        logger.info(f"FinalizeTokens called with accepted_count={accepted_count}")
+        draft_chunk_size = request.draft_chunk_size
+        logger.info(f"FinalizeTokens called with accepted_count={accepted_count}, chunk_size={draft_chunk_size}")
 
-        # We'll define a helper method self.finalize_tokens(...) below
-        result = self.finalize_tokens(accepted_count)
+        result = self.finalize_tokens(accepted_count, draft_chunk_size)
         final_token = result.get("final_token", 0)
         finished = result.get("finished", False)
 
-        return inference_pb2.FinalizeResponse(
-            final_token=final_token,
-            finished=finished
-        )
+        return inference_pb2.FinalizeResponse(final_token=final_token, finished=finished)
+
 
     # 4) GenerateFull (already matches proto)
     def GenerateFull(self, request, context):
@@ -161,70 +154,45 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
         # If never hit EOS, finished=False
         return {"target_probs": target_probs, "finished": False}
     
-    def finalize_tokens(self, accepted_count):
-        """
-        After verifying a chunk, the client tells us how many draft tokens were accepted.
-        We commit those to self.current_ids, and if there's a rejection, we generate a fallback token.
-        Must return dict: {"final_token": <int>, "finished": bool}
-        """
-        if self.current_ids is None:
-            logger.warning("finalize_tokens called but no StartGeneration context found.")
-            return {"final_token": 0, "finished": True}
+def finalize_tokens(self, accepted_count, draft_chunk_size):
+    """
+    If accepted_count < draft_chunk_size => partial acceptance => fallback token
+    If accepted_count == 0 => full reject => fallback
+    If accepted_count == draft_chunk_size => fully accepted => +1 big token
+    """
+    if self.current_ids is None:
+        logger.warning("No active generation context.")
+        return {"final_token": 0, "finished": True}
 
-        # We'll assume the client has appended the 'accepted_count' tokens to self.current_ids 
-        # or we can do it ourselves. For now, let's do a simple approach:
-        # If accepted_count < #draft_tokens => that means one token was rejected and replaced.
-        # We generate 1 big-model token to replace it.
+    if accepted_count == 0:
+        # Full rejection => produce fallback
+        seq_len = self.current_ids.shape[1]
+        output = self.model.sample(self.current_ids, sequence_length=seq_len + 1)
+        new_token = int(output[0, -1].item())
+        self.current_ids = torch.cat([self.current_ids, torch.tensor([[new_token]])], dim=1)
+        self.tokens_generated += 1
+        finished = bool(self.eos_token_id and new_token == self.eos_token_id)
+        return {"final_token": new_token, "finished": finished}
 
-        # For demonstration, let's just always generate 0 if everything was accepted (no replacement).
-        # or 1 new token if there's a rejection. In practice, you'd keep track of how many tokens 
-        # were originally proposed vs how many were accepted, etc.
-
-        if accepted_count == 0:
-            # Full rejection => generate 1 fallback token
-            seq_len = self.current_ids.shape[1]
-            output = self.model.sample(self.current_ids, sequence_length=seq_len + 1)
-            new_token = int(output[0, -1].item())
-            # Append it to self.current_ids
-            self.current_ids = torch.cat([self.current_ids, torch.tensor([[new_token]])], dim=1)
-            self.tokens_generated += 1
-            # Check EOS
-            finished = (new_token == self.eos_token_id) if (self.eos_token_id is not None) else False
-            return {"final_token": new_token, "finished": finished}
-
-        else:
-            # Some tokens were accepted => client has appended them in its context
-            # Possibly no new token needed if everything is accepted
-            # But if partial acceptance => first 'accepted_count' were appended, one was rejected => 
-            # we still do a fallback for the rejection. We'll assume the client always calls 
-            # finalize_tokens exactly once, so let's do a new token if accepted_count < total draft?
-            # We'll do a simplified version:
-
-            # If partial acceptance => generate 1 fallback:
-            # (This logic can be improved depending on your algorithm.)
-            # For brevity, let's do it only if accepted_count < gamma. 
-            # The client is the one that knows the original chunk size, though.
-
-            # We'll just assume if accepted_count < gamma => we do 1 fallback:
-            gamma = 4  # or wherever you store it
-            if accepted_count < gamma:
-                seq_len = self.current_ids.shape[1]
-                output = self.model.sample(self.current_ids, sequence_length=seq_len + 1)
-                new_token = int(output[0, -1].item())
-                self.current_ids = torch.cat([self.current_ids, torch.tensor([[new_token]])], dim=1)
-                self.tokens_generated += 1
-                finished = (new_token == self.eos_token_id) if (self.eos_token_id is not None) else False
-                return {"final_token": new_token, "finished": finished}
-            else:
-                # all tokens accepted => no fallback
-                # accepted_count == gamma => fully accepted => generate “+1” big token
-                seq_len = self.current_ids.shape[1]
-                output = self.model.sample(self.current_ids, sequence_length=seq_len + 1)
-                new_token = int(output[0, -1].item())
-                self.current_ids = torch.cat([self.current_ids, torch.tensor([[new_token]])], dim=1)
-                self.tokens_generated += 1
-                finished = bool(self.eos_token_id and new_token == self.eos_token_id)
-                return {"final_token": new_token, "finished": finished}
+    # partial or full acceptance
+    if accepted_count < draft_chunk_size:
+        # partial => fallback
+        seq_len = self.current_ids.shape[1]
+        output = self.model.sample(self.current_ids, sequence_length=seq_len + 1)
+        new_token = int(output[0, -1].item())
+        self.current_ids = torch.cat([self.current_ids, torch.tensor([[new_token]])], dim=1)
+        self.tokens_generated += 1
+        finished = bool(self.eos_token_id and new_token == self.eos_token_id)
+        return {"final_token": new_token, "finished": finished}
+    else:
+        # accepted_count == draft_chunk_size => fully accepted => produce +1 big token
+        seq_len = self.current_ids.shape[1]
+        output = self.model.sample(self.current_ids, sequence_length=seq_len + 1)
+        new_token = int(output[0, -1].item())
+        self.current_ids = torch.cat([self.current_ids, torch.tensor([[new_token]])], dim=1)
+        self.tokens_generated += 1
+        finished = bool(self.eos_token_id and new_token == self.eos_token_id)
+        return {"final_token": new_token, "finished": finished}
 
     # (You can refine the above logic however you prefer to manage accepted vs. rejected tokens.)
 

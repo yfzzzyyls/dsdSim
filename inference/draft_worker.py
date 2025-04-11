@@ -143,7 +143,8 @@ def run_client(draft_model_name: str,
     stub.StartGeneration(
         inference_pb2.StartRequest(
             prompt=prompt,
-            max_new_tokens=max_new_tokens
+            max_new_tokens=max_new_tokens,
+            gamma=gamma
         )
     )
 
