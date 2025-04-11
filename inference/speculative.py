@@ -194,4 +194,4 @@ def speculative_decode(
         logger.info(f"Speculative decoding match rate: {match_rate:.2%} "
                     f"(Draft accepted: {accepted_tokens_total}, Target generated: {target_tokens_total})")
         perf_stats["token_match_rate"] = match_rate
-    return generated_text
+    return generated_text, perf_stats
