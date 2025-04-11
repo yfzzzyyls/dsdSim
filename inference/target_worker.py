@@ -62,21 +62,38 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
                 logger.info(f"Session {session_id} is already finished. Returning empty verification.")
                 return inference_pb2.VerifyResponse(target_probs=[], finished=True)
 
-            # We'll compute the probability of each draft token under the target model, stepping one token at a time
+            if not draft_tokens:
+                # no tokens => no probabilities
+                return inference_pb2.VerifyResponse(target_probs=[], finished=False)
+
+            # Convert draft_tokens to a tensor of shape [1, len(draft_tokens)]
+            draft_tokens_tensor = torch.tensor([draft_tokens], dtype=sess.current_ids.dtype)
+
+            # Build a temp input by concatenating the current_ids with the entire draft chunk
+            # shape = [1, seq_len + len(draft_tokens)]
+            expanded_ids = torch.cat([sess.current_ids, draft_tokens_tensor], dim=1)
+
+            # Single forward pass over the entire new sequence
+            outputs = self.model(expanded_ids)
+            logits = _extract_logits_all(outputs)  # We'll define a helper to get all logits, not just the last.
+            # Suppose logits now has shape [1, expanded_len, vocab_size]
+
+            # The portion of interest is the last len(draft_tokens) positions
+            num_new = len(draft_tokens)
+            # slice shape: [1, num_new, vocab_size]
+            logits_slice = logits[:, -num_new:, :]
+
+            # Now compute probabilities for each position
+            # We'll gather each token's probability from the corresponding row
+            # i.e. draft_tokens[i] from logits_slice[0, i, :]
             target_probs = []
-            temp_ids = sess.current_ids.clone().detach()  # shape [1, seq_len]
-            for token in draft_tokens:
-                if self.eos_token_id is not None and token == self.eos_token_id and not sess.finished:
-                    pass
-                outputs = self.model(temp_ids)
-                logits_for_last = _extract_logits(outputs)
-                probs = torch.softmax(logits_for_last, dim=-1)
-                p = float(probs[0, token].item())
+            for i, token_id in enumerate(draft_tokens):
+                row_logits = logits_slice[0, i, :]
+                row_probs = torch.softmax(row_logits, dim=-1)
+                p = float(row_probs[token_id].item())
                 target_probs.append(p)
-                next_token_t = torch.tensor([[token]], dtype=temp_ids.dtype)
-                temp_ids = torch.cat([temp_ids, next_token_t], dim=1)
-            
-            # **Store these draft tokens for finalize**
+
+            # Store draft tokens in last_draft_chunk for finalize
             sess.last_draft_chunk = draft_tokens
 
             return inference_pb2.VerifyResponse(
@@ -161,6 +178,24 @@ def _extract_logits(outputs):
         raise ValueError(...)
 
     return out_t.float()
+
+def _extract_logits_all(outputs):
+    """Return the full logits tensor for [batch, seq_len, vocab]. If HF style, it's outputs.logits."""
+    if hasattr(outputs, "logits"):
+        return outputs.logits.float()  # shape [B, seq_len, vocab]
+    # Otherwise assume it's a raw tensor
+    # shape could be [B, seq_len, vocab] or something else
+    out_t = outputs
+    if len(out_t.shape) == 3:
+        return out_t.float()  # already [B, seq_len, vocab]
+    elif len(out_t.shape) == 2:
+        # [B, vocab], unsqueeze a seq_len=1 dimension
+        return out_t.unsqueeze(1).float()
+    elif len(out_t.shape) == 1:
+        # [vocab], unsqueeze batch=1 and seq=1
+        return out_t.unsqueeze(0).unsqueeze(0).float()
+    else:
+        raise ValueError(f"Unhandled shape for model output: {out_t.shape}")
 
 def run_server(model_path, port=50051, sequence_length=128, profile=False):
     import sys
