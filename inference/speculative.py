@@ -62,32 +62,49 @@ def speculative_decode(
 
             outputs = draft_model(input_ids=input_ids, use_cache=True, past_key_values=past)
 
-            # 3) Extract logits
             try:
-                logits = outputs.logits[0, -1, :]  # final position
+                logits = outputs.logits[0, -1, :]
             except AttributeError:
                 logits = outputs[0]  # compiled neuron shape
 
-            # 4) temperature + top-p sampling
+            # ---- Our improved numeric stability start ----
+            # 4) temperature + clamp
             logits = logits / temperature
+            logits = torch.clamp(logits, min=-1e10, max=1e10)
+
             probs = torch.softmax(logits, dim=-1)
+            if not torch.isfinite(probs).all():
+                # fallback if we have NaN/Inf
+                probs = torch.ones_like(probs)
+                probs /= probs.sum()
+
             sorted_probs, sorted_indices = torch.sort(probs, descending=True)
             cumulative_probs = torch.cumsum(sorted_probs, dim=0)
             if torch.any(cumulative_probs >= top_p):
                 cutoff_index = torch.where(cumulative_probs >= top_p)[0][0].item()
             else:
                 cutoff_index = len(sorted_probs) - 1
+
             top_probs = sorted_probs[:cutoff_index+1]
             top_indices = sorted_indices[:cutoff_index+1]
-            top_probs = top_probs / torch.sum(top_probs)
-            choice_index = torch.multinomial(top_probs, 1).item()
 
+            # Check sum
+            top_sum = top_probs.sum()
+            if not torch.isfinite(top_sum) or top_sum <= 1e-9:
+                # fallback
+                top_probs = torch.ones_like(top_probs)
+                top_sum = top_probs.sum()
+
+            top_probs = top_probs / top_sum
+            top_probs = torch.clamp(top_probs, min=0.0, max=1.0)
+
+            choice_index = torch.multinomial(top_probs, 1).item()
             token_id = int(top_indices[choice_index].item())
             token_prob = float(top_probs[choice_index].item())
+            # ---- End numeric stability patch ----
 
             draft_tokens.append(token_id)
             draft_probs.append(token_prob)
-
             output_tokens.append(token_id)
             tokens_generated += 1
 
@@ -95,6 +112,7 @@ def speculative_decode(
             past_states.append(new_past)
             past = new_past
 
+            # EOS checks...
             if tokenizer.eos_token_id is not None and token_id == tokenizer.eos_token_id:
                 finished = True
                 break
