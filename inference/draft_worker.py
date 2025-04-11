@@ -56,7 +56,7 @@ def run_client(draft_model_name: str,
 
         for i in range(max_new_tokens):
             try:
-                output = draft_model.sample(input_ids, sequence_length=input_ids.shape[1] + 1, temperature=temperature)
+                output = draft_model.sample(input_ids, sequence_length=input_ids.shape[1] + 1)
             except Exception as e:
                 logger.error(f"Draft model generation failed: {e}")
                 break
