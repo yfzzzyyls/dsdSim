@@ -150,20 +150,18 @@ def _extract_logits(outputs):
     # check shape
     if len(out_t.shape) == 3:
         # e.g. [batch, seq_len, vocab]
-        return out_t[:, -1, :].float()
+        out_t = out_t[:, -1, :]  # shape: [batch, vocab]
     elif len(out_t.shape) == 2:
-        # e.g. [1, vocab], just return out_t[0]
-        if out_t.size(0) == 1:
-            return out_t[0, :].float()
-        else:
-            # if out_t is e.g. [B, vocab], pick the last row?
-            # in typical usage B=1 anyway, but let's be safe.
-            return out_t[-1, :].float()
+        pass
+        # e.g. [batch, vocab]
+        # do nothing, out_t is already [batch, vocab]
     elif len(out_t.shape) == 1:
-        # e.g. [vocab]
-        return out_t.float()
+        # e.g. [vocab], make it [1, vocab]
+        out_t = out_t.unsqueeze(0)
     else:
-        raise ValueError(f"Unknown shape for outputs: {out_t.shape}")
+        raise ValueError(...)
+
+    return out_t.float()
 
 def run_server(model_path, port=50051, sequence_length=128, profile=False):
     import sys
