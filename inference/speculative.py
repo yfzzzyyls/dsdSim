@@ -56,11 +56,21 @@ def speculative_decode(
                 # Use cached past state for faster generation of next token
                 last_token_id = torch.tensor([[output_tokens[-1]]], dtype=torch.long) if output_tokens else None
                 outputs = draft_model(input_ids=last_token_id, use_cache=True, past_key_values=past)
-            logits = outputs.logits  # shape: [batch=1, seq_len=1 (for new token), vocab_size]
+            # logits = outputs.logits  # shape: [batch=1, seq_len=1 (for new token), vocab_size]
+            try:
+                # HuggingFace-style output => shape [batch=1, seq_len=1, vocab_size]
+                logits = outputs.logits
+                # Apply softmax to get probabilities
+                logits = logits[0, -1, :]  # final step's logits, shape [vocab_size]
+            except AttributeError:
+                # Compiled model => shape [1, vocab_size]
+                # Apply softmax to get probabilities
+                logits = outputs[0]        # shape [vocab_size]
+            # if isinstance(outputs, torch.Tensor):
+            #     print("Draft model output shape:", outputs.shape)
+            
             past = getattr(outputs, "past_key_values", None)  # update past state if available
 
-            # Apply softmax to get probabilities
-            logits = logits[0, -1, :]  # vocab distribution for the next token
             probs = torch.softmax(logits, dim=-1)
 
             # Top-p filtering: select the smallest set of tokens whose cumulative probability >= top_p
