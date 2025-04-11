@@ -185,9 +185,13 @@ def speculative_decode(
     # Convert the generated tokens (beyond the prompt) back to text
     generated_text = tokenizer.decode(output_tokens[len(output_tokens) - tokens_generated:]) if output_tokens else ""
     # Log the match rate (percentage of tokens from draft model accepted)
+
+    perf_stats = {}
+
     total_output_tokens = accepted_tokens_total + target_tokens_total
     if total_output_tokens > 0:
         match_rate = accepted_tokens_total / total_output_tokens
         logger.info(f"Speculative decoding match rate: {match_rate:.2%} "
                     f"(Draft accepted: {accepted_tokens_total}, Target generated: {target_tokens_total})")
+        perf_stats["token_match_rate"] = match_rate
     return generated_text
