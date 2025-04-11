@@ -13,7 +13,8 @@ def speculative_decode(
     max_new_tokens,
     gamma,
     profile=False,
-    top_p=0.9
+    top_p=0.9,
+    temperature=1.0
 ):
     """
     Perform probability-based speculative decoding using a draft model and a target model via gRPC,

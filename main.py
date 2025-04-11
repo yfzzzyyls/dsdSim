@@ -34,6 +34,10 @@ def main():
                         help="(Draft role only) Run draft model without target (standalone draft mode)")
     parser.add_argument("--gamma", type=int, default=4,
                         help="Number of draft tokens to generate per verification step (speculative decoding chunk size).")
+    parser.add_argument("--top_p", type=float, default=0.9,
+                        help="Top-p for draft sampling (default 0.9)")
+    parser.add_argument("--temperature", type=float, default=1.0,
+                        help="Temperature for draft sampling (default 1.0)")
     args = parser.parse_args()
 
     if args.role == "target":
@@ -77,7 +81,9 @@ def main():
                                     prompt=prompt_text, target_tokenizer=target_model_tokenizer,
                                     max_new_tokens=args.max_new_tokens, sequence_length=args.sequence_length,
                                     gamma=args.gamma,
-                                    profile=args.profile, no_target=False)
+                                    profile=args.profile, no_target=False, 
+                                    top_p=args.top_p,              # pass top_p
+                                    temperature=args.temperature)   # pass temperature)
 
     elif args.role == "verify_target":
         model_name = args.model
