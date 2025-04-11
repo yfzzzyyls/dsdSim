@@ -104,42 +104,63 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
 
     def verify_tokens(self, draft_tokens):
         """
-        Example: run the big model to compute P(target_token) for each draft_token
-        without permanently updating the state. 
-        Must return dict: {"target_probs": [...], "finished": bool}.
+        Example: run the big model forward pass to get float logits, for each draft token,
+        so we can compute probabilities. Instead of 'self.model.sample()', we do a forward pass
+        that returns a float logits tensor.
         """
         if self.current_ids is None:
-            # No session started
             logger.warning("verify_tokens called but no StartGeneration context found.")
             return {"target_probs": [0.0]*len(draft_tokens), "finished": True}
 
-        # For demonstration: we run the big model step by step for each draft token
-        # and extract probability. You can optimize or adapt as needed.
-
         target_probs = []
-        temp_ids = self.current_ids.clone()  # to avoid permanently updating self.current_ids
+        temp_ids = self.current_ids.clone()  # do not mutate self.current_ids
 
         for token_id in draft_tokens:
-            # 1) run model to get next logits
             seq_len = temp_ids.shape[1]
-            output = self.model.sample(temp_ids, sequence_length=seq_len + 1)
-            logits_for_next = output[0][-1]  # shape: [vocab_size], last new token's logits
-            # 2) softmax => probability
-            probs = torch.softmax(logits_for_next, dim=-1)
+            
+            # 1) forward pass => raw logits over next token
+            #    If your model is a Neuron-compiled *CausalLM*, you might call it like:
+            #    outputs = self.model(input_ids=temp_ids) 
+            #    then outputs.logits => shape [batch=1, seq_len, vocab_size].
+            #    We'll do a single pass for the last position, but to keep it simple:
+            
+            outputs = self.model(temp_ids)  
+            # If using TorchScript / neuron compiled, it might return just a Tensor 
+            # shaped [batch=1, seq_len, vocab_size] or [seq_len, vocab_size].
+            
+            # 2) extract the logits of the *last position*
+            if isinstance(outputs, torch.Tensor):
+                # e.g. shape [seq_len, vocab_size] or [1, seq_len, vocab_size]
+                if outputs.dim() == 3:
+                    # [batch=1, seq_len, vocab_size]
+                    logits_for_lastpos = outputs[0, -1, :]  # shape [vocab_size]
+                else:
+                    # [seq_len, vocab_size]
+                    logits_for_lastpos = outputs[-1, :]     # shape [vocab_size]
+            else:
+                # If HF model => 'outputs.logits'
+                logits_for_lastpos = outputs.logits[0, -1, :]  # shape [vocab_size]
+
+            # cast to float just to be safe
+            logits_for_lastpos = logits_for_lastpos.float()
+            
+            # 3) get probability of this 'token_id'
+            probs = torch.softmax(logits_for_lastpos, dim=-1)
             p = float(probs[token_id].item())
             target_probs.append(p)
 
-            # 3) append the draft token to temp_ids
+            # 4) append the draft token to temp_ids so the next iteration 
+            #    sees that token in context
             token_tensor = torch.tensor([[token_id]], dtype=temp_ids.dtype)
             temp_ids = torch.cat([temp_ids, token_tensor], dim=1)
 
-            # 4) Check EOS
+            # 5) check if we generated EOS
             if self.eos_token_id is not None and token_id == self.eos_token_id:
                 return {"target_probs": target_probs, "finished": True}
 
-        # If we never hit EOS, just return false for now:
+        # If never hit EOS, finished=False
         return {"target_probs": target_probs, "finished": False}
-
+    
     def finalize_tokens(self, accepted_count):
         """
         After verifying a chunk, the client tells us how many draft tokens were accepted.
