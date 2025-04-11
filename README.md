@@ -111,31 +111,13 @@ python main.py --role draft --model /home/ubuntu/models/llama-3.2-1b/ --target_h
 
 ```
 ......
-INFO:inference.speculative:Draft chunk of 4 tokens accepted (all matched).
-INFO:inference.speculative:Draft chunk of 4 tokens accepted (all matched).
-INFO:inference.speculative:Draft predicted 2 tokens correctly, then diverged. Replaced mismatch token with target's token.
-INFO:inference.speculative:Draft predicted 0 tokens correctly, then diverged. Replaced mismatch token with target's token.
-INFO:inference.speculative:Draft predicted 3 tokens correctly, then diverged. Replaced mismatch token with target's token.
-INFO:inference.speculative:Draft predicted 0 tokens correctly, then diverged. Replaced mismatch token with target's token.
-INFO:inference.speculative:Draft predicted 1 tokens correctly, then diverged. Replaced mismatch token with target's token.
-INFO:inference.speculative:Draft predicted 0 tokens correctly, then diverged. Replaced mismatch token with target's token.
-INFO:inference.speculative:Draft predicted 1 tokens correctly, then diverged. Replaced mismatch token with target's token.
-INFO:inference.speculative:Draft predicted 2 tokens correctly, then diverged. Replaced mismatch token with target's token.
-INFO:inference.speculative:Draft predicted 0 tokens correctly, then diverged. Replaced mismatch token with target's token.
-INFO:inference.speculative:Draft predicted 1 tokens correctly, then diverged. Replaced mismatch token with target's token.
-INFO:inference.speculative:Draft predicted 0 tokens correctly, then diverged. Replaced mismatch token with target's token.
-INFO:inference.speculative:Draft predicted 0 tokens correctly, then diverged. Replaced mismatch token with target's token.
-INFO:inference.speculative:Draft predicted 1 tokens correctly, then diverged. Replaced mismatch token with target's token.
-INFO:inference.speculative:Draft predicted 2 tokens correctly, then diverged. Replaced mismatch token with target's token.
-INFO:inference.speculative:Draft predicted 0 tokens correctly, then diverged. Replaced mismatch token with target's token.
-INFO:inference.speculative:Generation finished (target_finished=False, draft_finished=False, tokens_generated=100).
-INFO:inference.speculative:Speculative decoding completed in 48.79 seconds, avg 0.4879s per token.
-INFO:inference.speculative:Tokens generated: 100, Throughput: 2.05 tokens/sec, Match rate: 0.32
+INFO:inference.draft_worker:Connecting to target server at 18.218.111.79:50051...
+INFO:inference.draft_worker:Starting speculative decoding for prompt: "Hi, how are you? Tell me about llama model."
+INFO:inference.speculative:Speculative decoding match rate: 40.00% (Draft accepted: 14, Target generated: 21)
 INFO:inference.draft_worker:Speculative decoding completed.
-
+......
 === Final Output ===
-Once upon a time, when I was in college, I loved to watch old movies on my computer. As a matter of fact, I still love to watch old movies on my computer. However, if I use my computer to watch one of these movies, I must take some actions to optimize the video performance in advance, usually because I must have good video quality. So, what are the main factors affecting the ability of a notebook pc to display video?
-1, The display of the laptop is dependent on the screen of
+......
 ```
 
 ## **Performance Profiling Stats**
@@ -153,7 +135,7 @@ You can also run either the draft or target model **standalone** (without specul
 To run the **target model** by itself on a prompt:
 
 ```
-python main.py --role verify_target --model /home/ubuntu/models/llama-3.2-3b/ --prompt "Once upon a time," --max_new_tokens 100 --sequence_length 128 --profile
+python main.py --role verify_target --model /home/ubuntu/models/llama-3.2-3b --prompt "Hi, how are you? Tell me about the difference between llama and alpaca." --sequence_length 640 --max_new_tokens 128 --profile
 ```
 
 This will load the 3B target model and generate 100 tokens continuing the prompt, printing each generated token as it arrives, followed by the full output text.
@@ -161,7 +143,7 @@ This will load the 3B target model and generate 100 tokens continuing the prompt
 Similarly, to run the **draft model** by itself:
 
 ```
-python main.py --role verify_draft --model /home/ubuntu/models/llama-3.2-1b --prompt "Once upon a time," --max_new_tokens 20 --sequence_length 128 --profile
+python main.py --role verify_draft --model /home/ubuntu/models/llama-3.2-1b --prompt "Hi, how are you? Tell me about the difference between llama and alpaca." --sequence_length 640 --max_new_tokens 128 --profile
 ```
 
 This will use the 1B draft model to generate text token-by-token for the given prompt.
