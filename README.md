@@ -110,12 +110,11 @@ python main.py --role draft --model /home/ubuntu/models/llama-3.2-1b/ --target_h
 ### **Example Output**
 
 ```
-......
 INFO:inference.draft_worker:Connecting to target server at 18.218.111.79:50051...
-INFO:inference.draft_worker:Starting speculative decoding for prompt: "Hi, how are you? Tell me about llama model."
-INFO:inference.speculative:Speculative decoding match rate: 40.00% (Draft accepted: 14, Target generated: 21)
+INFO:inference.draft_worker:Starting speculative decoding for prompt: "Tell me about the difference between llama and alpaca."
+INFO:inference.speculative:Speculative decoding match rate: 37.98% (Draft accepted: 49, Target generated: 80)
 INFO:inference.draft_worker:Speculative decoding completed.
-......
+
 === Final Output ===
 ......
 ```
