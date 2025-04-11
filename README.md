@@ -16,6 +16,7 @@ Choral-Spec/
 │   ├── speculative.py       # Implements the speculative decoding algorithm (combines draft model predictions with target verification)
 │   └── verify.py            # Verification utilities: can run a model standalone for debugging, and compare draft vs target outputs
 ├── grpc_comm/               # gRPC definitions and generated code for inter-process communication
+│   ├── grpc_client.py          # Definition of SpeculativeService (gRPC 
 │   ├── inference.proto          # Definition of SpeculativeService (gRPC service for generation and verification)
 │   ├── inference_pb2.py         # Generated Python classes from the proto definitions
 │   └── inference_pb2_grpc.py    # Generated gRPC client/server code based on the proto
