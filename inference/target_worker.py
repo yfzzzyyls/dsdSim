@@ -11,11 +11,11 @@ from grpc_comm import inference_pb2, inference_pb2_grpc
 logger = logging.getLogger(__name__)
 
 class TargetSession:
-    """Stores per-session context: the current input_ids and stats."""
     def __init__(self, input_ids):
         self.current_ids = input_ids  # Torch tensor with shape [1, seq_len]
         self.tokens_generated = 0
         self.finished = False
+        self.last_draft_chunk = None  # for storing the last draft tokens we verified
 
 class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
     def __init__(self, model_path, sequence_length=128):
@@ -66,27 +66,19 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
             target_probs = []
             temp_ids = sess.current_ids.clone().detach()  # shape [1, seq_len]
             for token in draft_tokens:
-                if self.eos_token_id is not None and token == self.eos_token_id and sess.finished is False:
-                    # Even if the draft says EOS, we still want to compute p(EOS).
+                if self.eos_token_id is not None and token == self.eos_token_id and not sess.finished:
                     pass
-
-                # forward pass
                 outputs = self.model(temp_ids)
                 logits_for_last = _extract_logits(outputs)
                 probs = torch.softmax(logits_for_last, dim=-1)
                 p = float(probs[0, token].item())
                 target_probs.append(p)
-
-                # append the draft token to the temp context
                 next_token_t = torch.tensor([[token]], dtype=temp_ids.dtype)
                 temp_ids = torch.cat([temp_ids, next_token_t], dim=1)
+            
+            # **Store these draft tokens for finalize**
+            sess.last_draft_chunk = draft_tokens
 
-                if self.eos_token_id is not None and token == self.eos_token_id:
-                    logger.info(f"[session={session_id}] Draft proposed EOS => might finish after acceptance.")
-                    # We do not break here because we want to compute probabilities for the entire chunk
-                    # But finishing logic occurs after acceptance.
-
-            # Return them. finished stays false unless user forcibly ended.
             return inference_pb2.VerifyResponse(
                 target_probs=target_probs,
                 finished=False
@@ -108,11 +100,18 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
                 logger.info(f"Session {session_id} is already finished. Returning no-op.")
                 return inference_pb2.FinalizeResponse(final_token=0, finished=True)
 
-            # If accepted_count < draft_chunk_size, partial reject => fallback
-            # If accepted_count == draft_chunk_size, fully accepted => big token
-            # If accepted_count == 0, full reject => fallback
+            # If we have stored draft tokens, incorporate the accepted portion
+            if sess.last_draft_chunk:
+                # accept_count tokens are accepted
+                accepted_tokens = sess.last_draft_chunk[:accepted_count]
+                for t in accepted_tokens:
+                    token_t = torch.tensor([[t]], dtype=sess.current_ids.dtype)
+                    sess.current_ids = torch.cat([sess.current_ids, token_t], dim=1)
+                # Clear last_draft_chunk or set it to None
+                sess.last_draft_chunk = None
+
             if accepted_count < draft_chunk_size:
-                # fallback => generate 1 token from the target model on the current session context
+                # fallback => generate 1 token from the target model
                 fallback_token = self._generate_one_token(sess)
                 if self.eos_token_id is not None and fallback_token == self.eos_token_id:
                     sess.finished = True
