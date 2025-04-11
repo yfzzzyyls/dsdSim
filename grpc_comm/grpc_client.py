@@ -7,19 +7,19 @@ def create_stub(target_address):
     stub = inference_pb2_grpc.SpeculativeServiceStub(channel)
     return stub
 
-def verify_draft_tokens(stub, draft_tokens):
-    request = inference_pb2.VerifyRequest(draft_tokens=draft_tokens)
+def verify_draft_tokens(stub, draft_tokens, session_id=0):
+    request = inference_pb2.VerifyRequest(
+        session_id=session_id,
+        draft_tokens=draft_tokens
+    )
     response = stub.VerifyDraftTokens(request)
     target_probs = list(response.target_probs)
     finished = response.finished
     return target_probs, finished
 
-# CHANGE: add draft_chunk_size param
-def finalize_tokens(stub, accepted_count, draft_chunk_size):
-    """
-    Call FinalizeTokens with the number of accepted tokens AND the chunk size.
-    """
+def finalize_tokens(stub, accepted_count, draft_chunk_size, session_id=0):
     request = inference_pb2.FinalizeRequest(
+        session_id=session_id,
         accepted_count=accepted_count,
         draft_chunk_size=draft_chunk_size
     )

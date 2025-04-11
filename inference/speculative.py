@@ -1,6 +1,7 @@
 import random
 import torch
 import logging
+
 from grpc_comm import grpc_client
 
 logger = logging.getLogger(__name__)
@@ -14,17 +15,14 @@ def speculative_decode(
     gamma,
     profile=False,
     top_p=0.9,
-    temperature=1.0
+    temperature=1.0,
+    session_id=0
 ):
     """
     Perform probability-based speculative decoding using a draft model and a target model via gRPC,
-    with full rollback of the draft model's past states, just like lucidrains.
-    Returns (generated_text, perf_stats).
-
-    :param top_p: top-p value for sampling
-    :param temperature: temperature to scale logits (logits /= temperature)
+    with full rollback of the draft model's past states.
+    Extended to handle a session_id so multiple prompts can run concurrently on the server.
     """
-
     output_tokens = []
     tokens_generated = 0
     finished = False
@@ -38,18 +36,18 @@ def speculative_decode(
     # We'll keep 'past' for the draft model so it can incrementally generate
     past = None
 
-    # Main decoding loop
+    import time
+    start_t = time.time() if profile else None
+
     while not finished and tokens_generated < max_new_tokens:
         # The draft model proposes up to 'gamma' tokens
         draft_tokens = []
         draft_probs = []
 
         # We also store a list of 'past' states, so we can rollback
-        # past_states[i] = the 'past' right BEFORE generating draft_tokens[i].
         past_states = [past]
 
         for i in range(gamma):
-            # 1) Prepare input_ids
             if past is None:
                 if output_tokens:
                     input_ids = torch.tensor([output_tokens], dtype=torch.long)
@@ -62,21 +60,16 @@ def speculative_decode(
                     last_token_id = prompt_ids
                 input_ids = last_token_id
 
-            # 2) Forward pass on the draft model
             outputs = draft_model(input_ids=input_ids, use_cache=True, past_key_values=past)
 
-            # 3) Extract logits from standard HF or compiled model
+            # 3) Extract logits
             try:
-                # HF => shape [batch=1, seq_len=1, vocab_size]
                 logits = outputs.logits[0, -1, :]  # final position
             except AttributeError:
-                # Compiled => shape [1, vocab_size]
-                logits = outputs[0]
+                logits = outputs[0]  # compiled neuron shape
 
-            # 4) Apply temperature => logits /= temperature
-            #    Then convert to probabilities & do top-p sampling
+            # 4) temperature + top-p sampling
             logits = logits / temperature
-
             probs = torch.softmax(logits, dim=-1)
             sorted_probs, sorted_indices = torch.sort(probs, descending=True)
             cumulative_probs = torch.cumsum(sorted_probs, dim=0)
@@ -92,11 +85,9 @@ def speculative_decode(
             token_id = int(top_indices[choice_index].item())
             token_prob = float(top_probs[choice_index].item())
 
-            # 5) Save draft token + prob
             draft_tokens.append(token_id)
             draft_probs.append(token_prob)
 
-            # 6) Append the draft token tentatively to output + update 'past'
             output_tokens.append(token_id)
             tokens_generated += 1
 
@@ -104,14 +95,13 @@ def speculative_decode(
             past_states.append(new_past)
             past = new_past
 
-            # 7) Check EOS or token limit
             if tokenizer.eos_token_id is not None and token_id == tokenizer.eos_token_id:
                 finished = True
                 break
             if tokens_generated >= max_new_tokens:
                 break
 
-        # If overshoot max_new_tokens
+        # If overshoot
         if len(draft_tokens) > 0 and tokens_generated > max_new_tokens:
             overshoot = tokens_generated - max_new_tokens
             draft_tokens = draft_tokens[:-overshoot]
@@ -124,7 +114,9 @@ def speculative_decode(
             break
 
         # 8) Verify tokens with target model
-        target_probs, target_finished = grpc_client.verify_draft_tokens(stub, draft_tokens)
+        target_probs, target_finished = grpc_client.verify_draft_tokens(
+            stub, draft_tokens, session_id=session_id
+        )
         if target_finished and len(target_probs) < len(draft_tokens):
             # partial consumption => treat rest as rejected
             draft_tokens = draft_tokens[:len(target_probs)]
@@ -134,6 +126,7 @@ def speculative_decode(
         # 9) Accept or reject
         accept_count = 0
         break_point = False
+        import random
         for idx, token_id in enumerate(draft_tokens):
             p_target = float(target_probs[idx]) if idx < len(target_probs) else 0.0
             p_draft = float(draft_probs[idx]) if idx < len(draft_probs) else 1e-9
@@ -144,7 +137,6 @@ def speculative_decode(
             if random.random() < ratio:
                 accept_count += 1
                 accepted_tokens_total += 1
-                # EOS check
                 if tokenizer.eos_token_id is not None and token_id == tokenizer.eos_token_id:
                     finished = True
                     break_point = True
@@ -153,22 +145,16 @@ def speculative_decode(
                 break_point = True
                 break
 
-        # 10) If partial rejection, remove unaccepted tokens from output_tokens
-        #     and revert the small model's past
         if break_point and accept_count < len(draft_tokens):
             unaccepted = len(draft_tokens) - accept_count
             while unaccepted > 0:
                 output_tokens.pop()
                 tokens_generated -= 1
                 unaccepted -= 1
-            # rollback
             past = past_states[accept_count]
 
-        # 11) Finalize => fallback or +1 token from big model
         final_token_id, finalize_finished = grpc_client.finalize_tokens(
-            stub,
-            accept_count,
-            len(draft_tokens)
+            stub, accept_count, len(draft_tokens), session_id=session_id
         )
         if final_token_id != 0:
             output_tokens.append(final_token_id)
@@ -183,9 +169,19 @@ def speculative_decode(
     # Build final text
     generated_text = tokenizer.decode(output_tokens[-tokens_generated:]) if output_tokens else ""
 
-    # Build perf stats
-    total_output_tokens = accepted_tokens_total + target_tokens_total
+    # Performance stats
     perf_stats = {}
+    if profile:
+        end_t = time.time()
+        total_time = end_t - start_t
+        tokens_generated_total = accepted_tokens_total + target_tokens_total
+        throughput = tokens_generated_total / total_time if total_time>0 else 0.0
+        perf_stats["total_time"] = total_time
+        perf_stats["tokens_generated"] = tokens_generated_total
+        perf_stats["throughput"] = throughput
+        perf_stats["avg_token_time"] = total_time / tokens_generated_total if tokens_generated_total>0 else 0.0
+
+    total_output_tokens = accepted_tokens_total + target_tokens_total
     if total_output_tokens > 0:
         match_rate = accepted_tokens_total / total_output_tokens
         logger.info(

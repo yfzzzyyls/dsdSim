@@ -19,7 +19,9 @@ def main():
     parser.add_argument("--draft_model", type=str,
                         help="Draft model path (alternative to --model for draft role)")
     parser.add_argument("--prompt", type=str,
-                        help="Initial prompt text for generation (for draft or verification roles)")
+                        help="Single prompt text for generation (used if --prompt_text is not provided)")
+    parser.add_argument("--prompt_text", type=str,
+                        help="Path to a text file containing multiple prompts (one per line) for concurrent/batch decoding.")
     parser.add_argument("--port", type=int, default=50051,
                         help="Port for gRPC server (target role) or client connection (draft role)")
     parser.add_argument("--target_host", type=str, default="localhost",
@@ -61,29 +63,42 @@ def main():
                                      profile=args.profile)
 
     elif args.role == "draft":
+        # Running the draft side
         draft_model = args.model or args.draft_model
-        target_model_tokenizer = args.target_model  # Path to target model (for tokenizer consistency)
         if draft_model is None:
             logger.error("Please specify --model (draft model path) for draft role")
             return
-        prompt_text = args.prompt or ""
-        from inference import draft_worker
-        if args.no_target:
-            # Run draft model standalone (no target server)
-            draft_worker.run_client(draft_model, target_host=None, port=args.port,
-                                    prompt=prompt_text, target_tokenizer=target_model_tokenizer,
-                                    max_new_tokens=args.max_new_tokens, sequence_length=args.sequence_length,
-                                    gamma=args.gamma,
-                                    profile=args.profile, no_target=True)
+
+        # If the user provided --prompt_text, we'll run concurrency with multiple prompts
+        if args.prompt_text:
+            # Batch mode: multiple prompts from file, each in a separate gRPC session
+            from inference import draft_worker
+            draft_worker.run_concurrent_clients(
+                draft_model_name=draft_model,
+                target_host=args.target_host,
+                port=args.port,
+                prompt_text_file=args.prompt_text,
+                target_tokenizer=args.target_model,
+                max_new_tokens=args.max_new_tokens,
+                sequence_length=args.sequence_length,
+                gamma=args.gamma,
+                profile=args.profile,
+                no_target=args.no_target,
+                top_p=args.top_p,
+                temperature=args.temperature
+            )
         else:
-            # Run speculative decoding with a target server
+            # Single-prompt mode
+            prompt_text = args.prompt or ""
+            from inference import draft_worker
             draft_worker.run_client(draft_model, target_host=args.target_host, port=args.port,
-                                    prompt=prompt_text, target_tokenizer=target_model_tokenizer,
-                                    max_new_tokens=args.max_new_tokens, sequence_length=args.sequence_length,
+                                    prompt=prompt_text,
+                                    target_tokenizer=args.target_model,
+                                    max_new_tokens=args.max_new_tokens,
+                                    sequence_length=args.sequence_length,
                                     gamma=args.gamma,
-                                    profile=args.profile, no_target=False, 
-                                    top_p=args.top_p,              # pass top_p
-                                    temperature=args.temperature)   # pass temperature)
+                                    profile=args.profile, no_target=args.no_target,
+                                    top_p=args.top_p, temperature=args.temperature)
 
     elif args.role == "verify_target":
         model_name = args.model
@@ -109,7 +124,7 @@ def main():
                          sequence_length=args.sequence_length,
                          role="draft", profile=args.profile)
     else:
-        logger.error("Unknown role. Use --role target|draft|compile|verify_target|verify_draft.")
+        logger.error("Unknown role. Use --role target|draft|verify_target|verify_draft.")
 
 if __name__ == "__main__":
     main()
