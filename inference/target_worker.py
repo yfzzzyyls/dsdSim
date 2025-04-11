@@ -73,33 +73,59 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
             # shape = [1, seq_len + len(draft_tokens)]
             expanded_ids = torch.cat([sess.current_ids, draft_tokens_tensor], dim=1)
 
-            # Single forward pass over the entire new sequence
+            # Single forward pass attempt
             outputs = self.model(expanded_ids)
-            logits = _extract_logits_all(outputs)  # We'll define a helper to get all logits, not just the last.
-            # Suppose logits now has shape [1, expanded_len, vocab_size]
+            logits_all = _extract_logits_all(outputs)  # shape ideally [1, expanded_len, vocab]
 
-            # The portion of interest is the last len(draft_tokens) positions
-            num_new = len(draft_tokens)
-            # slice shape: [1, num_new, vocab_size]
-            logits_slice = logits[:, -num_new:, :]
+            # If the model only returns shape [1, 1, vocab] or [1, vocab],
+            # then we cannot slice out each position for each draft token in a single pass.
+            # Check if we got enough time-steps:
+            #   ideally logits_all.shape[1] == expanded_ids.shape[1]
+            expanded_len = expanded_ids.size(1)
+            actual_time_dim = logits_all.shape[1]
 
-            # Now compute probabilities for each position
-            # We'll gather each token's probability from the corresponding row
-            # i.e. draft_tokens[i] from logits_slice[0, i, :]
-            target_probs = []
-            for i, token_id in enumerate(draft_tokens):
-                row_logits = logits_slice[0, i, :]
-                row_probs = torch.softmax(row_logits, dim=-1)
-                p = float(row_probs[token_id].item())
-                target_probs.append(p)
+            if actual_time_dim >= expanded_len:
+                # We can proceed with single-pass logic
+                num_new = len(draft_tokens)
+                logits_slice = logits_all[:, -num_new:, :]  # shape [1, num_new, vocab]
+                target_probs = []
+                for i, token_id in enumerate(draft_tokens):
+                    row_logits = logits_slice[0, i, :]
+                    row_probs = torch.softmax(row_logits, dim=-1)
+                    p = float(row_probs[token_id].item())
+                    target_probs.append(p)
+                sess.last_draft_chunk = draft_tokens
+                return inference_pb2.VerifyResponse(
+                    target_probs=target_probs,
+                    finished=False
+                )
+            else:
+                # Fallback: per-token loop
+                logger.warning("Model returned only one step. Falling back to per-token verification.")
+                fallback_probs = self._verify_draft_tokens_single_step(sess, draft_tokens)
+                # store the chunk for finalize
+                sess.last_draft_chunk = draft_tokens
+                return inference_pb2.VerifyResponse(
+                    target_probs=fallback_probs,
+                    finished=False
+                )
 
-            # Store draft tokens in last_draft_chunk for finalize
-            sess.last_draft_chunk = draft_tokens
+    def _verify_draft_tokens_single_step(self, sess, draft_tokens):
+        # "Loop-based verification: calls model once per token, appending it to temp_ids each time."
+        target_probs = []
+        temp_ids = sess.current_ids.clone().detach()
+        for token in draft_tokens:
+            out = self.model(temp_ids)
+            # Use the same _extract_logits to get the final position
+            logits_for_last = _extract_logits(out)
+            probs = torch.softmax(logits_for_last, dim=-1)
+            p = float(probs[0, token].item())
+            target_probs.append(p)
+            # append token
+            token_t = torch.tensor([[token]], dtype=temp_ids.dtype)
+            temp_ids = torch.cat([temp_ids, token_t], dim=1)
+        return target_probs
 
-            return inference_pb2.VerifyResponse(
-                target_probs=target_probs,
-                finished=False
-            )
 
     def FinalizeTokens(self, request, context):
         session_id = request.session_id
