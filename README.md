@@ -20,7 +20,6 @@ Choral-Spec/
 │   ├── inference.proto          # Definition of SpeculativeService (gRPC service for generation and verification)
 │   ├── inference_pb2.py         # Generated Python classes from the proto definitions
 │   └── inference_pb2_grpc.py    # Generated gRPC client/server code based on the proto
-├── evaluate_test.py         # Script to evaluate performance of speculative decoding vs. baseline
 ├── requirements.txt         # Python dependencies for the project
 └── README.md                # Documentation and usage instructions
 
