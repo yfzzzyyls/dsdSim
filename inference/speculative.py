@@ -1,7 +1,7 @@
 import random
 import torch
 import logging
-from inference.draft_worker import verify_draft_tokens, finalize_tokens
+from grpc_comm import grpc_client
 
 logger = logging.getLogger(__name__)
 
@@ -125,7 +125,7 @@ def speculative_decode(
             break
 
         # 9) Verify tokens with target model
-        target_probs, target_finished = verify_draft_tokens(stub, draft_tokens)
+        target_probs, target_finished = grpc_client.verify_draft_tokens(stub, draft_tokens)
         if target_finished and len(target_probs) < len(draft_tokens):
             # partial consumption => treat the rest as rejected
             draft_tokens = draft_tokens[:len(target_probs)]
@@ -173,7 +173,7 @@ def speculative_decode(
         # 12) Finalize
         all_accepted = (accept_count == len(draft_tokens))
 
-        final_token_id, finalize_finished = finalize_tokens(
+        final_token_id, finalize_finished = grpc_client.finalize_tokens(
                                                 stub,
                                                 accept_count,
                                                 len(draft_tokens)
