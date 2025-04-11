@@ -104,7 +104,7 @@ python main.py --role target --model /home/ubuntu/models/llama-3.2-3b/ --port 50
 ### **Compile & Run the Draft Model server**
 
 ```
-python main.py --role draft --model /home/ubuntu/models/llama-3.2-1b/ --target_host 18.222.253.234 --port 50051 --prompt "Once upon a time," --max_new_tokens 100 --gamma 4 --profile --sequence_length 640
+python main.py --role draft --model /home/ubuntu/models/llama-3.2-1b/ --target_host 18.218.111.79 --port 50051 --prompt "Tell me about the difference between llama and alpaca." --max_new_tokens 128 --gamma 4 --sequence_length 640 --top_p 0.8 --temperature 0.1
 ```
 
 ### **Example Output**
