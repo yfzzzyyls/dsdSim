@@ -72,11 +72,7 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
 
                 # forward pass
                 outputs = self.model(temp_ids)
-                if hasattr(outputs, "logits"):
-                    logits_for_last = outputs.logits[:, -1, :].float()
-                else:
-                    # compiled might be a direct tensor
-                    logits_for_last = outputs[0, -1, :].float()
+                logits_for_last = _extract_logits(outputs)
                 probs = torch.softmax(logits_for_last, dim=-1)
                 p = float(probs[0, token].item())
                 target_probs.append(p)
@@ -137,15 +133,37 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
     def _generate_one_token(self, sess: TargetSession):
         """Helper: runs the model on sess.current_ids, greedily picks next token, appends it."""
         outputs = self.model(sess.current_ids)
-        if hasattr(outputs, "logits"):
-            logits = outputs.logits[:, -1, :].float()
-        else:
-            logits = outputs[0, -1, :].float()
+        logits = _extract_logits(outputs)
         token_id = int(torch.argmax(logits, dim=-1)[0].item())
         new_tok = torch.tensor([[token_id]], dtype=sess.current_ids.dtype)
         sess.current_ids = torch.cat([sess.current_ids, new_tok], dim=1)
         sess.tokens_generated += 1
         return token_id
+
+def _extract_logits(outputs):
+    """Helper to extract final-logits from various possible shapes (HF or compiled)."""
+    if hasattr(outputs, "logits"):
+        # HF style => [batch, seq_len, vocab_size]
+        return outputs.logits[:, -1, :].float()
+    # else we assume it's a raw tensor
+    out_t = outputs
+    # check shape
+    if len(out_t.shape) == 3:
+        # e.g. [batch, seq_len, vocab]
+        return out_t[:, -1, :].float()
+    elif len(out_t.shape) == 2:
+        # e.g. [1, vocab], just return out_t[0]
+        if out_t.size(0) == 1:
+            return out_t[0, :].float()
+        else:
+            # if out_t is e.g. [B, vocab], pick the last row?
+            # in typical usage B=1 anyway, but let's be safe.
+            return out_t[-1, :].float()
+    elif len(out_t.shape) == 1:
+        # e.g. [vocab]
+        return out_t.float()
+    else:
+        raise ValueError(f"Unknown shape for outputs: {out_t.shape}")
 
 def run_server(model_path, port=50051, sequence_length=128, profile=False):
     import sys
