@@ -217,7 +217,14 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
                 return {"final_token": new_token, "finished": finished}
             else:
                 # all tokens accepted => no fallback
-                return {"final_token": 0, "finished": False}
+                # accepted_count == gamma => fully accepted => generate “+1” big token
+                seq_len = self.current_ids.shape[1]
+                output = self.model.sample(self.current_ids, sequence_length=seq_len + 1)
+                new_token = int(output[0, -1].item())
+                self.current_ids = torch.cat([self.current_ids, torch.tensor([[new_token]])], dim=1)
+                self.tokens_generated += 1
+                finished = bool(self.eos_token_id and new_token == self.eos_token_id)
+                return {"final_token": new_token, "finished": finished}
 
     # (You can refine the above logic however you prefer to manage accepted vs. rejected tokens.)
 

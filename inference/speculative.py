@@ -170,8 +170,16 @@ def speculative_decode(
             # the state at 'past_states[accept_count]' is the last accepted token's past
             past = past_states[accept_count]
 
-        # 12) Finalize => if partial acceptance, the target might give us a fallback token
-        final_token_id, finalize_finished = grpc_client.finalize_tokens(stub, accept_count)
+        # 12) Finalize
+        all_accepted = (accept_count == len(draft_tokens))
+
+        if all_accepted:
+            # If fully accepted, we ask the target model for the “+1” big token
+            final_token_id, finalize_finished = grpc_client.finalize_tokens(stub, accept_count)
+        else:
+            # partial acceptance => fallback token
+            final_token_id, finalize_finished = grpc_client.finalize_tokens(stub, accept_count)
+
         if final_token_id != 0:
             output_tokens.append(final_token_id)
             tokens_generated += 1
