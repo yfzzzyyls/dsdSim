@@ -40,6 +40,16 @@ class SpeculativeServiceStub(object):
                 request_serializer=inference__pb2.StartRequest.SerializeToString,
                 response_deserializer=inference__pb2.StartResponse.FromString,
                 _registered_method=True)
+        self.VerifyBatchTokens = channel.unary_unary(
+                '/specdecode.SpeculativeService/VerifyBatchTokens',
+                request_serializer=inference__pb2.VerifyBatchRequest.SerializeToString,
+                response_deserializer=inference__pb2.VerifyBatchResponse.FromString,
+                _registered_method=True)
+        self.FinalizeBatchTokens = channel.unary_unary(
+                '/specdecode.SpeculativeService/FinalizeBatchTokens',
+                request_serializer=inference__pb2.FinalizeBatchRequest.SerializeToString,
+                response_deserializer=inference__pb2.FinalizeBatchResponse.FromString,
+                _registered_method=True)
         self.VerifyDraftTokens = channel.unary_unary(
                 '/specdecode.SpeculativeService/VerifyDraftTokens',
                 request_serializer=inference__pb2.VerifyRequest.SerializeToString,
@@ -67,8 +77,22 @@ class SpeculativeServiceServicer(object):
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
-    def VerifyDraftTokens(self, request, context):
+    def VerifyBatchTokens(self, request, context):
+        """BATCH calls
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def FinalizeBatchTokens(self, request, context):
         """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def VerifyDraftTokens(self, request, context):
+        """Single-sequence calls
+        """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
@@ -80,7 +104,8 @@ class SpeculativeServiceServicer(object):
         raise NotImplementedError('Method not implemented!')
 
     def GenerateFull(self, request, context):
-        """Missing associated documentation comment in .proto file."""
+        """Optional full generation for baseline
+        """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
@@ -92,6 +117,16 @@ def add_SpeculativeServiceServicer_to_server(servicer, server):
                     servicer.StartGeneration,
                     request_deserializer=inference__pb2.StartRequest.FromString,
                     response_serializer=inference__pb2.StartResponse.SerializeToString,
+            ),
+            'VerifyBatchTokens': grpc.unary_unary_rpc_method_handler(
+                    servicer.VerifyBatchTokens,
+                    request_deserializer=inference__pb2.VerifyBatchRequest.FromString,
+                    response_serializer=inference__pb2.VerifyBatchResponse.SerializeToString,
+            ),
+            'FinalizeBatchTokens': grpc.unary_unary_rpc_method_handler(
+                    servicer.FinalizeBatchTokens,
+                    request_deserializer=inference__pb2.FinalizeBatchRequest.FromString,
+                    response_serializer=inference__pb2.FinalizeBatchResponse.SerializeToString,
             ),
             'VerifyDraftTokens': grpc.unary_unary_rpc_method_handler(
                     servicer.VerifyDraftTokens,
@@ -137,6 +172,60 @@ class SpeculativeService(object):
             '/specdecode.SpeculativeService/StartGeneration',
             inference__pb2.StartRequest.SerializeToString,
             inference__pb2.StartResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def VerifyBatchTokens(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/specdecode.SpeculativeService/VerifyBatchTokens',
+            inference__pb2.VerifyBatchRequest.SerializeToString,
+            inference__pb2.VerifyBatchResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def FinalizeBatchTokens(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/specdecode.SpeculativeService/FinalizeBatchTokens',
+            inference__pb2.FinalizeBatchRequest.SerializeToString,
+            inference__pb2.FinalizeBatchResponse.FromString,
             options,
             channel_credentials,
             insecure,
