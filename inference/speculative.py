@@ -188,9 +188,9 @@ def speculative_decode(
     generated_text = tokenizer.decode(output_tokens[-tokens_generated:]) if output_tokens else ""
 
     # Performance stats
+    end_t = time.time()
     perf_stats = {}
     if profile:
-        end_t = time.time()
         total_time = end_t - start_t
         tokens_generated_total = accepted_tokens_total + target_tokens_total
         throughput = tokens_generated_total / total_time if total_time>0 else 0.0
@@ -203,6 +203,7 @@ def speculative_decode(
     if total_output_tokens > 0:
         match_rate = accepted_tokens_total / total_output_tokens
         logger.info(
+            f"Latency: {total_time:.2%}"
             f"Speculative decoding match rate: {match_rate:.2%} "
             f"(Draft accepted: {accepted_tokens_total}, Target generated: {target_tokens_total})"
         )

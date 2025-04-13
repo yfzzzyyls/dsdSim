@@ -43,9 +43,10 @@ def run_model(model_name: str, prompt: str, max_tokens: int = 50, sequence_lengt
             logger.info("EOS token encountered, stopping generation.")
             break
 
+    end_time = time.time()
     total_time = 0.0
     if profile:
-        total_time = time.time() - start_time
+        total_time = end_time - start_time
         throughput = tokens_generated / total_time if total_time > 0 else float('inf')
         logger.info(f"{role.capitalize()} model generation completed in {total_time:.2f} seconds.")
         logger.info(f"Tokens generated: {tokens_generated}, Throughput: {throughput:.2f} t/s")
