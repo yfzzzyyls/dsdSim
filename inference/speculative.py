@@ -37,7 +37,7 @@ def speculative_decode(
     past = None
 
     import time
-    start_t = time.time() if profile else None
+    start_t = time.time() #if profile else None
 
     while not finished and tokens_generated < max_new_tokens:
         # The draft model proposes up to 'gamma' tokens
