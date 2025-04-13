@@ -152,7 +152,7 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
     def VerifyDraftTokens(self, request, context):
         sid = request.session_id
         draft_tokens = list(request.draft_tokens)
-        logger.info(f"[session={sid}] VerifyDraftTokens: {draft_tokens}")
+        # logger.info(f"[session={sid}] VerifyDraftTokens: {draft_tokens}")
         with self.lock:
             if sid not in self.sessions:
                 logger.warning(f"Session {sid} not found.")
@@ -190,7 +190,7 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
         sid = request.session_id
         accepted_count = request.accepted_count
         draft_chunk_size = request.draft_chunk_size
-        logger.info(f"[session={sid}] FinalizeTokens: accepted_count={accepted_count}, chunk_size={draft_chunk_size}")
+        # logger.info(f"[session={sid}] FinalizeTokens: accepted_count={accepted_count}, chunk_size={draft_chunk_size}")
         with self.lock:
             if sid not in self.sessions:
                 logger.warning(f"Session {sid} not found.")

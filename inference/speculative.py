@@ -189,9 +189,9 @@ def speculative_decode(
 
     # Performance stats
     end_t = time.time()
+    total_time = end_t - start_t
     perf_stats = {}
     if profile:
-        total_time = end_t - start_t
         tokens_generated_total = accepted_tokens_total + target_tokens_total
         throughput = tokens_generated_total / total_time if total_time>0 else 0.0
         perf_stats["total_time"] = total_time
