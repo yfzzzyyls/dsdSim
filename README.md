@@ -104,7 +104,7 @@ python main.py --role target --model /home/ubuntu/models/llama-3.2-3b/ --port 50
 ### **Compile & Run the Draft Model server**
 
 ```
-python main.py --role draft --model /home/ubuntu/models/llama-3.2-1b/ --target_host 18.190.157.61 --port 50051 --prompt_text prompt.txt --max_new_tokens 128 --gamma 4 --sequence_length 640 --top_p 0.8 --temperature 0.1
+python main.py --role draft --model /home/ubuntu/models/llama-3.2-1b/ --target_host 18.190.157.61 --port 50051 --prompt_text prompt.txt --max_new_tokens 128 --gamma 4 --sequence_length 640 --top_p 0.8 --temperature 0.9
 ```
 
 ### **Example Output**
