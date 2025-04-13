@@ -202,11 +202,9 @@ def speculative_decode(
     total_output_tokens = accepted_tokens_total + target_tokens_total
     if total_output_tokens > 0:
         match_rate = accepted_tokens_total / total_output_tokens
-        logger.info(
-            f"Latency: {total_time:.2%}"
-            f"Speculative decoding match rate: {match_rate:.2%} "
-            f"(Draft accepted: {accepted_tokens_total}, Target generated: {target_tokens_total})"
-        )
+        logger.info(f"Latency: {total_time:.2f} seconds")
+        logger.info(f"Speculative decoding match rate: {match_rate:.2%}")
+        logger.info(f"(Draft accepted: {accepted_tokens_total}, Target generated: {target_tokens_total})")
         perf_stats["token_match_rate"] = match_rate
 
     return generated_text, perf_stats
