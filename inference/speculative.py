@@ -37,7 +37,7 @@ def speculative_decode(
     past = None
 
     import time
-    start_t = time.time() #if profile else None
+    start_t = time.time()
 
     while not finished and tokens_generated < max_new_tokens:
         # The draft model proposes up to 'gamma' tokens
@@ -50,6 +50,7 @@ def speculative_decode(
         for i in range(gamma):
             if past is None:
                 if output_tokens:
+                    logger.error("Draft model past state is None, but output_tokens is not empty.")
                     input_ids = torch.tensor([output_tokens], dtype=torch.long)
                 else:
                     input_ids = prompt_ids
@@ -203,8 +204,7 @@ def speculative_decode(
     if total_output_tokens > 0:
         match_rate = accepted_tokens_total / total_output_tokens
         logger.info(f"Latency: {total_time:.2f} seconds")
-        logger.info(f"Speculative decoding match rate: {match_rate:.2%}")
-        logger.info(f"(Draft accepted: {accepted_tokens_total}, Target generated: {target_tokens_total})")
+        logger.info(f"Speculative decoding match rate: {match_rate:.2%} (Draft accepted: {accepted_tokens_total}, Target generated: {target_tokens_total})")
         perf_stats["token_match_rate"] = match_rate
 
     return generated_text, perf_stats

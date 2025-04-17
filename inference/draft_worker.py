@@ -98,7 +98,7 @@ def run_batched_prompt_file(
 
     # naive loop for demonstration: do up to max_new_tokens steps in batch
     import time
-    start_time = time.time() if profile else None
+    start_time = time.time()
 
     # This is a placeholder. Real batch decode means we combine the forward calls to the draft model.
     # For now, let's do a loop in Python that calls speculative_decode for each prompt *in sequence.*
@@ -117,10 +117,9 @@ def run_batched_prompt_file(
             accepted_counts[i] = perf_stats.get("accepted_tokens_total", 0)
             target_counts[i] = perf_stats.get("target_tokens_total", 0)
 
-    end_time = time.time() if profile else None
-    if profile:
-        total_time = end_time - start_time
-        logger.info(f"Batched decode completed in {total_time:.2f}s.")
+    end_time = time.time()
+    total_time = end_time - start_time
+    logger.info(f"Batched decode completed in {total_time:.2f}s.")
 
     print("\n=== Final Outputs (BATCH approach) ===")
     for i, text in enumerate(final_texts):
