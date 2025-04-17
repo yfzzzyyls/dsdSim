@@ -82,17 +82,8 @@ def main():
                 temperature=args.temperature
             )
         else:
-            # Single-prompt mode
-            prompt_text = args.prompt or ""
-            from inference import draft_worker
-            draft_worker.run_client(draft_model, target_host=args.target_host, port=args.port,
-                                    prompt=prompt_text,
-                                    target_tokenizer=args.target_model,
-                                    max_new_tokens=args.max_new_tokens,
-                                    sequence_length=args.sequence_length,
-                                    gamma=args.gamma,
-                                    profile=args.profile, no_target=args.no_target,
-                                    top_p=args.top_p, temperature=args.temperature)
+            logger.error("No prompt text .txt file provided. Use --verify_target to run draft model independently.")
+            return
 
     elif args.role == "verify_target":
         model_name = args.model
