@@ -47,20 +47,11 @@ def main():
         if model_name is None:
             logger.error("Please specify --model (target model path) for target role")
             return
-        # If a prompt is provided with --profile, run a local generation for profiling (target-only mode)
-        if args.prompt:
-            from inference import target_worker
-            logger.info("Profiling enabled for standalone target generation.")
-            target_worker.run_local(model_name, prompt=args.prompt,
-                                    max_new_tokens=args.max_new_tokens,
+        # Launch the target model gRPC server
+        from inference import target_worker
+        target_worker.run_server(model_name, port=args.port,
                                     sequence_length=args.sequence_length,
-                                    profile=True)
-        else:
-            # Launch the target model gRPC server
-            from inference import target_worker
-            target_worker.run_server(model_name, port=args.port,
-                                     sequence_length=args.sequence_length,
-                                     profile=args.profile)
+                                    profile=args.profile)
 
     elif args.role == "draft":
         # Running the draft side
