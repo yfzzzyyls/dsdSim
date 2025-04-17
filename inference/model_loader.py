@@ -21,8 +21,6 @@ def load_model(model_path: str, sequence_length: int = DEFAULT_SEQUENCE_LENGTH):
     # if os.path.isdir(model_path) and os.path.isfile(config_file):
     logger.info(f"Attempting to download/compile from source.")
     model = compile_model(model_path, sequence_length=sequence_length)
-    if model is None:
-        return load_model(model_path, sequence_length=sequence_length)
     return model
 
 
@@ -52,7 +50,7 @@ def compile_model(model_path: str, sequence_length: int = DEFAULT_SEQUENCE_LENGT
         logger.warning(f"Could not determine model type for '{model_path}': {e}")
 
     # Use all available NeuronCores for tensor parallelism
-    tp_degree = int(os.environ.get("NEURON_RT_NUM_CORES", "1"))
+    tp_degree = int(os.environ.get("NEURON_RT_NUM_CORES", "2"))
     if model_type.lower() == "llama" or "llama" in model_path.lower():
         # Compile using optimized LLaMA class for Neuron
         logger.info(f"Compiling model using optimized LLaMA for Neuron ...")
