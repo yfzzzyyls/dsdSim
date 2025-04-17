@@ -51,7 +51,6 @@ def run_batched_prompt_file(
     sequence_length: int = 128,
     gamma: int = 4,
     profile: bool = False,
-    no_target: bool = False,
     top_p: float = 0.9,
     temperature: float = 1.0
 ):
@@ -69,13 +68,7 @@ def run_batched_prompt_file(
     draft_model = load_model(draft_model_name, sequence_length=sequence_length)
     tokenizer_source = target_tokenizer or draft_model_name
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_source, use_fast=False)
-
-    if no_target:
-        logger.info("No target usage. We will just run the draft model locally in a single batch.")
-        # For demonstration, we won't implement a fully batch local decode here.
-        # This is left as an exercise or extension.
-        return
-
+    
     address = f"{target_host}:{port}"
     channel = grpc.insecure_channel(address)
     stub = inference_pb2_grpc.SpeculativeServiceStub(channel)
@@ -96,10 +89,6 @@ def run_batched_prompt_file(
                 gamma=gamma
             )
         )
-
-    # We'll keep track of partial output tokens for each session
-    # For a real batch approach, you'd do a single call to draft_model for all prompts.
-    # Then do a single verifyBatchTokens call, etc. We'll show a simplified approach here.
 
     final_texts = [prompts[i] for i in range(len(prompts))]
     finished_mask = [False]*len(prompts)

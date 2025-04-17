@@ -77,7 +77,6 @@ def main():
                 sequence_length=args.sequence_length,
                 gamma=args.gamma,
                 profile=args.profile,
-                no_target=args.no_target,
                 top_p=args.top_p,
                 temperature=args.temperature
             )
