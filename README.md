@@ -80,13 +80,6 @@ pip install --upgrade transformers-neuronx
 
 ## **Usage:**
 
-export compiler flag
-
-```
-export NEURON_CC_FLAGS="--model-type transformer"
-export NEURON_RT_NUM_CORES=2
-```
-
 ### **Optional:**
 
 Clean cache before compile:
