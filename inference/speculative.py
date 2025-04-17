@@ -63,8 +63,8 @@ def speculative_decode(
                 input_ids = last_token_id
 
             outputs = draft_model(input_ids=input_ids, use_cache=True, past_key_values=past)
-            if (outputs is None) or (not hasattr(outputs, "logits")):
-                logger.error("Draft model outputs are None or do not have logits.")
+            if not hasattr(outputs, "past_key_values"):
+                logger.error("Draft model output does not have 'past_key_values'.")
             try:
                 logits = outputs.logits[0, -1, :]
             except AttributeError:
