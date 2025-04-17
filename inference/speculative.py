@@ -49,6 +49,7 @@ def speculative_decode(
 
         for i in range(gamma):
             if past is None:
+                logger.error("Draft model past state is None, using prompt_ids.")
                 if output_tokens:
                     logger.error("Draft model past state is None, but output_tokens is not empty.")
                     input_ids = torch.tensor([output_tokens], dtype=torch.long)
@@ -62,7 +63,8 @@ def speculative_decode(
                 input_ids = last_token_id
 
             outputs = draft_model(input_ids=input_ids, use_cache=True, past_key_values=past)
-
+            if (outputs is None) or (not hasattr(outputs, "logits")):
+                logger.error("Draft model outputs are None or do not have logits.")
             try:
                 logits = outputs.logits[0, -1, :]
             except AttributeError:
