@@ -7,7 +7,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from transformers_neuronx import LlamaForSampling
 from transformers_neuronx.module import save_pretrained_split
 # Hugging Face‑style wrapper that exposes logits + past_key_values
-from transformers_neuronx.huggingface import HuggingFaceGenerationModelAdapter
+from transformers_neuronx import HuggingFaceGenerationModelAdapter
 
 logger = logging.getLogger(__name__)
 
