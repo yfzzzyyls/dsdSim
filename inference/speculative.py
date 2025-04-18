@@ -24,6 +24,8 @@ def speculative_decode(
     Extended to handle a session_id so multiple prompts can run concurrently on the server.
     """
     output_tokens = []
+    cache_id = None          # pointer returned by Neuron adapter
+    past_states = [None]     # list of cache pointers for rollback (index 0 = prompt state)
     tokens_generated = 0
     finished = False
 
@@ -32,9 +34,6 @@ def speculative_decode(
 
     # Tokenize the user prompt for the first pass
     prompt_ids = tokenizer(prompt, return_tensors='pt').input_ids
-
-    # We'll keep 'past' for the draft model so it can incrementally generate
-    past = None
 
     import time
     start_t = time.time()
@@ -45,35 +44,50 @@ def speculative_decode(
         draft_probs = []
 
         # We also store a list of 'past' states, so we can rollback
-        past_states = [past]
+        past_states = [cache_id]
 
         for i in range(gamma):
-            if past is None:
-                logger.error("Draft model past state is None, using prompt_ids.")
-                if output_tokens:
-                    logger.error("Draft model past state is None, but output_tokens is not empty.")
-                    input_ids = torch.tensor([output_tokens], dtype=torch.long)
-                else:
-                    input_ids = prompt_ids
+            if cache_id is None:
+                input_ids = prompt_ids
             else:
-                if output_tokens:
-                    last_token_id = torch.tensor([[output_tokens[-1]]], dtype=torch.long)
-                else:
-                    last_token_id = prompt_ids
-                input_ids = last_token_id
+                input_ids = torch.tensor([[output_tokens[-1]]], dtype=torch.long)
 
-            outputs = draft_model(input_ids=input_ids, use_cache=True, past_key_values=past)
-            print("PRINTING OUTPUTS: ", outputs)
-            if not hasattr(outputs, "past_key_values"):
-                logger.error("Draft model output does not have 'past_key_values'.")
-            try:
-                logits = outputs.logits[0, -1, :]
-            except AttributeError:
-                logger.error("Draft model output does not have 'logits'.")
-                logits = outputs[0]  # compiled neuron shape
+            # save pointer BEFORE calling model
+            past_states.append(cache_id)
+
+            # Call Neuron adapter: returns logits and cache pointer
+            out = draft_model(input_ids=input_ids, cache_ids=cache_id)
+
+            # Extract logits and cache pointer
+            if isinstance(out, (tuple, list)):
+                # Tuple path: first=logits, second=cache_id
+                logits = out[0]
+                new_cache_id = out[1] if len(out) > 1 else None
+            elif hasattr(out, "logits"):
+                # ModelOutput path
+                logits = out.logits
+                # Adapter may use 'cache_ids' or 'past_key_values'
+                new_cache_id = getattr(out, "cache_ids", None) or getattr(out, "past_key_values", None)
+            else:
+                # Fallback: output is logits only
+                logits = out
+                new_cache_id = None
+
+            # Normalize logits to 1D tensor
+            if hasattr(logits, "dim"):
+                if logits.dim() == 3:
+                    logits = logits[0, -1, :]
+                elif logits.dim() == 2:
+                    logits = logits[0]
+
+            # Ensure logits is a tensor (unwrap nested tuples)
+            while isinstance(logits, (tuple, list)):
+                logits = logits[0]
+
+            # Update cache pointer
+            cache_id = new_cache_id
 
             # ---- Our improved numeric stability start ----
-            # 4) temperature + clamp
             logits = logits / temperature
             logits = torch.clamp(logits, min=-1e10, max=1e10)
 
@@ -113,10 +127,6 @@ def speculative_decode(
             output_tokens.append(token_id)
             tokens_generated += 1
 
-            new_past = getattr(outputs, "past_key_values", None)
-            past_states.append(new_past)
-            past = new_past
-
             # EOS checks...
             if tokenizer.eos_token_id is not None and token_id == tokenizer.eos_token_id:
                 finished = True
@@ -149,7 +159,6 @@ def speculative_decode(
         # 9) Accept or reject
         accept_count = 0
         break_point = False
-        import random
         for idx, token_id in enumerate(draft_tokens):
             p_target = float(target_probs[idx]) if idx < len(target_probs) else 0.0
             p_draft = float(draft_probs[idx]) if idx < len(draft_probs) else 1e-9
@@ -169,12 +178,16 @@ def speculative_decode(
                 break
 
         if break_point and accept_count < len(draft_tokens):
+            # rollback token count
             unaccepted = len(draft_tokens) - accept_count
             while unaccepted > 0:
                 output_tokens.pop()
                 tokens_generated -= 1
                 unaccepted -= 1
-            past = past_states[accept_count]
+            # restore cache pointer to the last accepted state
+            cache_id = past_states[accept_count]
+            # trim any saved pointers beyond this point
+            past_states = past_states[:accept_count+1]
 
         final_token_id, finalize_finished = grpc_client.finalize_tokens(
             stub, accept_count, len(draft_tokens), session_id=session_id

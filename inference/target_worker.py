@@ -238,9 +238,12 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
 
 
 def _extract_logits(outputs):
-    if hasattr(outputs, "logits"):
-        return outputs.logits[:, -1, :].float()
-    out_t = outputs
+    if isinstance(outputs, (tuple, list)):
+        out_t = outputs[0]
+    elif hasattr(outputs, "logits"):
+        out_t = outputs.logits[:, -1, :]
+    else:
+        out_t = outputs
     if len(out_t.shape) == 3:
         return out_t[:, -1, :].float()
     elif len(out_t.shape) == 2:
@@ -252,9 +255,12 @@ def _extract_logits(outputs):
 
 
 def _extract_logits_all(outputs):
-    if hasattr(outputs, "logits"):
+    if isinstance(outputs, (tuple, list)):
+        out_t = outputs[0]
+    elif hasattr(outputs, "logits"):
         return outputs.logits.float()
-    out_t = outputs
+    else:
+        out_t = outputs
     if len(out_t.shape) == 3:
         return out_t.float()
     elif len(out_t.shape) == 2:
