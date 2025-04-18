@@ -3,7 +3,7 @@ import logging
 import shutil
 import re
 import json
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig   # ← add AutoConfig
 from transformers_neuronx import LlamaForSampling
 from transformers_neuronx.module import save_pretrained_split
 # Hugging Face‑style wrapper that exposes logits + past_key_values
@@ -61,9 +61,9 @@ def compile_model(model_path: str, sequence_length: int = DEFAULT_SEQUENCE_LENGT
         # Compile the model
         model.config.use_cache = True
         model.to_neuron()
-
+        hf_config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
         # Wrap with HF generation adapter so forward returns logits + past_key_values
-        adapter = HuggingFaceGenerationModelAdapter(model.config, model)
+        adapter = HuggingFaceGenerationModelAdapter(hf_config, model)
         return adapter
     else:
         # Fallback: load the model weights and save them (no Neuron compilation performed)
