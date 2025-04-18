@@ -6,6 +6,8 @@ import json
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from transformers_neuronx import LlamaForSampling
 from transformers_neuronx.module import save_pretrained_split
+# Hugging Face‑style wrapper that exposes logits + past_key_values
+from transformers_neuronx.huggingface import HuggingFaceGenerationModelAdapter
 
 logger = logging.getLogger(__name__)
 
@@ -56,9 +58,13 @@ def compile_model(model_path: str, sequence_length: int = DEFAULT_SEQUENCE_LENGT
         logger.info(f"Compiling model using optimized LLaMA for Neuron ...")
         model = LlamaForSampling.from_pretrained(model_path, batch_size=1, amp='bf16',
                                                  n_positions=sequence_length, tp_degree=tp_degree)
+        # Compile the model
         model.config.use_cache = True
-        model.to_neuron()  # This triggers the Neuron compilation
-        return model
+        model.to_neuron()
+
+        # Wrap with HF generation adapter so forward returns logits + past_key_values
+        adapter = HuggingFaceGenerationModelAdapter(model.config, model)
+        return adapter
     else:
         # Fallback: load the model weights and save them (no Neuron compilation performed)
         model = AutoModelForCausalLM.from_pretrained(model_path)
