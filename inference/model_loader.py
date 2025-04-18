@@ -28,7 +28,7 @@ class NeuronHFAdapterWrap(torch.nn.Module):
         else:
             logger.info(f"forward() called with cache_ids={cache_ids}  ➜  incremental step")
 
-        out = self.adapter(input_ids=input_ids, cache_ids=cache_ids)
+        out = self.adapter(input_ids=input_ids, cache_ids=cache_ids, return_dict=False)
 
         # Handle different output formats
         if isinstance(out, (tuple, list)) and len(out) == 2:
@@ -91,6 +91,8 @@ def compile_model(model_path: str, sequence_length: int = DEFAULT_SEQUENCE_LENGT
         logger.info(f"Compiling model using optimized LLaMA for Neuron ...")
         model = LlamaForSampling.from_pretrained(model_path, batch_size=1, amp='bf16',
                                                  n_positions=sequence_length, tp_degree=tp_degree)
+        # Compile so the Neuron graph returns (logits, cache_id)
+        model.enable_speculative_decoder(4)
         model.to_neuron()
         hf_config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
         adapter = HuggingFaceGenerationModelAdapter(hf_config, model)
