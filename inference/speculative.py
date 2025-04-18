@@ -62,15 +62,32 @@ def speculative_decode(
                     last_token_id = prompt_ids
                 input_ids = last_token_id
 
-            outputs = draft_model(input_ids=input_ids, use_cache=True, past_key_values=past)
-            print("PRINTING OUTPUTS: ", outputs)
+            # outputs = draft_model(input_ids=input_ids, use_cache=True, past_key_values=past)
+            if past is None:
+                outputs = draft_model(input_ids=input_ids)
+            else:
+                outputs = draft_model(input_ids=input_ids, prev_hidden=past)
+
+            # print("PRINTING OUTPUTS: ", outputs) # print result shows only logits tensor
             if not hasattr(outputs, "past_key_values"):
                 logger.error("Draft model output does not have 'past_key_values'.")
-            try:
-                logits = outputs.logits[0, -1, :]
-            except AttributeError:
-                logger.error("Draft model output does not have 'logits'.")
-                logits = outputs[0]  # compiled neuron shape
+
+            # try:
+            #     logits = outputs.logits[0, -1, :]
+            # except AttributeError:
+            #     logger.error("Draft model output does not have 'logits'.")
+            #     logits = outputs[0]  # compiled neuron shape
+            # Neuron adapter returns a tuple: (logits, new_hidden). Handle both possibilities.
+            if isinstance(outputs, (tuple, list)):
+                logits = outputs[0]                # tensor [1, seq_len, vocab] or [1, vocab] depending on adapter
+                new_past = outputs[1] if len(outputs) > 1 else None
+            else:
+                # Some builds may return only logits (no hidden state)
+                logger.error("Should not produce only logits using Adapter.")
+                logits = outputs
+                new_past = None
+
+
 
             # ---- Our improved numeric stability start ----
             # 4) temperature + clamp
@@ -113,7 +130,7 @@ def speculative_decode(
             output_tokens.append(token_id)
             tokens_generated += 1
 
-            new_past = getattr(outputs, "past_key_values", None)
+            # new_past = getattr(outputs, "past_key_values", None)
             past_states.append(new_past)
             past = new_past
 
