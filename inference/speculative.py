@@ -86,6 +86,7 @@ def speculative_decode(
 
             # Update cache pointer
             cache_id = new_cache_id
+            logger.info(f"[draft] step {tokens_generated:>3}  cache_id -> {cache_id}")
 
             # ---- Our improved numeric stability start ----
             logits = logits / temperature
@@ -186,6 +187,7 @@ def speculative_decode(
                 unaccepted -= 1
             # restore cache pointer to the last accepted state
             cache_id = past_states[accept_count]
+            logger.info(f"[rollback] restored cache_id = {cache_id}")
             # trim any saved pointers beyond this point
             past_states = past_states[:accept_count+1]
 

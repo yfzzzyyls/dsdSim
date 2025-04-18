@@ -23,6 +23,11 @@ class NeuronHFAdapterWrap(torch.nn.Module):
         self.config = adapter.config
 
     def forward(self, input_ids, cache_ids=None, **kwargs):
+        if cache_ids is None:
+            logger.error(f"forward() called with cache_ids=None  ➜  full context recompute")
+        else:
+            logger.info(f"forward() called with cache_ids={cache_ids}  ➜  incremental step")
+
         out = self.adapter(input_ids=input_ids, cache_ids=cache_ids)
 
         # Handle different output formats
@@ -45,6 +50,7 @@ class NeuronHFAdapterWrap(torch.nn.Module):
         while isinstance(logits, (tuple, list)):
             logits = logits[0]
 
+        logger.info(f"adapter returned new_cache={new_cache}")
         return (logits, new_cache)
 
 # Default sequence length (can be overridden by function arguments)
