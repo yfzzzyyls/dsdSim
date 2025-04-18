@@ -48,17 +48,46 @@ def speculative_decode(
         past_states = [past]
 
         for i in range(gamma):
-            if output_tokens:
-                last_token_id = torch.tensor([[output_tokens[-1]]], dtype=torch.long)
+            if past is None:
+                logger.error("Draft model past state is None, using prompt_ids.")
+                if output_tokens:
+                    logger.error("Draft model past state is None, but output_tokens is not empty.")
+                    input_ids = torch.tensor([output_tokens], dtype=torch.long)
+                else:
+                    input_ids = prompt_ids
             else:
-                last_token_id = prompt_ids
-            input_ids = last_token_id
+                if output_tokens:
+                    last_token_id = torch.tensor([[output_tokens[-1]]], dtype=torch.long)
+                else:
+                    last_token_id = prompt_ids
+                input_ids = last_token_id
 
-            outputs = draft_model(input_ids=input_ids, prev_hidden=past if past is not None else None)
+            # outputs = draft_model(input_ids=input_ids, use_cache=True, past_key_values=past)
+            if past is None:
+                outputs = draft_model(input_ids=input_ids)
+            else:
+                outputs = draft_model(input_ids=input_ids, prev_hidden=past)
 
-            # outputs is CausalLMOutputWithPast
-            logits = outputs.logits[0, -1, :]
-            new_past = outputs.past_key_values
+            # print("PRINTING OUTPUTS: ", outputs) # print result shows only logits tensor
+            if not hasattr(outputs, "past_key_values"):
+                logger.error("Draft model output does not have 'past_key_values'.")
+
+            # try:
+            #     logits = outputs.logits[0, -1, :]
+            # except AttributeError:
+            #     logger.error("Draft model output does not have 'logits'.")
+            #     logits = outputs[0]  # compiled neuron shape
+            # Neuron adapter returns a tuple: (logits, new_hidden). Handle both possibilities.
+            if isinstance(outputs, (tuple, list)):
+                logits = outputs[0]                # tensor [1, seq_len, vocab] or [1, vocab] depending on adapter
+                new_past = outputs[1] if len(outputs) > 1 else None
+            else:
+                # Some builds may return only logits (no hidden state)
+                logger.error("Should not produce only logits using Adapter.")
+                logits = outputs
+                new_past = None
+
+
 
             # ---- Our improved numeric stability start ----
             # 4) temperature + clamp
@@ -101,6 +130,7 @@ def speculative_decode(
             output_tokens.append(token_id)
             tokens_generated += 1
 
+            # new_past = getattr(outputs, "past_key_values", None)
             past_states.append(new_past)
             past = new_past
 

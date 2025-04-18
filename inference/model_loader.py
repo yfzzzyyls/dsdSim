@@ -3,38 +3,25 @@ import logging
 import shutil
 import re
 import json
-import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig   # ← add AutoConfig
 from transformers_neuronx import LlamaForSampling
 from transformers_neuronx.module import save_pretrained_split
+# Hugging Face‑style wrapper that exposes logits + past_key_values
+from transformers_neuronx import HuggingFaceGenerationModelAdapter
+from transformers_neuronx.generation_utils import HuggingFaceGenerationModelAdapter
 
 logger = logging.getLogger(__name__)
 
 # Default sequence length (can be overridden by function arguments)
 DEFAULT_SEQUENCE_LENGTH = 128
 
-class LlamaSamplingWithPast(torch.nn.Module):
-    """
-    Wrap a Neuron‑compiled LlamaForSampling so .forward returns
-    logits and past_key_values (hidden state) in Hugging Face format.
-    """
-    def __init__(self, neuron_llama):
-        super().__init__()
-        self.llama = neuron_llama
-        self.config = neuron_llama.config  # needed by downstream code
-
-    def forward(self, input_ids, prev_hidden=None):
-        extra = {"prev_hidden": prev_hidden} if prev_hidden is not None else {}
-        logits, new_hidden = self.llama(input_ids, **extra)
-        return CausalLMOutputWithPast(
-            logits=logits,
-            past_key_values=new_hidden,
-        )
-
 def load_model(model_path: str, sequence_length: int = DEFAULT_SEQUENCE_LENGTH):
     """
     Load or compile a model for inference.
     """
+    # Check for local directory with config
+    # config_file = os.path.join(model_path, "config.json")
+    # if os.path.isdir(model_path) and os.path.isfile(config_file):
     logger.info(f"Attempting to download/compile from source.")
     model = compile_model(model_path, sequence_length=sequence_length)
     return model
@@ -48,6 +35,7 @@ def compile_model(model_path: str, sequence_length: int = DEFAULT_SEQUENCE_LENGT
     """
     base_name = os.path.basename(os.path.normpath(model_path))
     compiled_dir = f"{base_name}-compiled-{sequence_length}"
+    # os.makedirs(compiled_dir, exist_ok=True)
     logger.info(f"Compiling model '{model_path}' to Neuron (sequence_length={sequence_length})...")
 
     model_type = ""
@@ -74,7 +62,10 @@ def compile_model(model_path: str, sequence_length: int = DEFAULT_SEQUENCE_LENGT
         # Compile the model
         model.config.use_cache = True
         model.to_neuron()
-        return LlamaSamplingWithPast(model)
+        hf_config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+        # Wrap with HF generation adapter so forward returns logits + past_key_values
+        adapter = HuggingFaceGenerationModelAdapter(hf_config, model)
+        return adapter
     else:
         # Fallback: load the model weights and save them (no Neuron compilation performed)
         model = AutoModelForCausalLM.from_pretrained(model_path)

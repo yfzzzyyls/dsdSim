@@ -67,6 +67,7 @@ def main():
         if args.prompt_text:
             # Batch mode: multiple prompts from file, each in a separate gRPC session
             from inference import draft_worker
+            # draft_worker.run_concurrent_clients(
             draft_worker.run_batched_prompt_file(
                 draft_model_name=draft_model,
                 target_host=args.target_host,
