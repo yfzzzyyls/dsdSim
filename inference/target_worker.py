@@ -186,24 +186,31 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
     
     def _verify_single_step(self, sess: TargetSession, draft_tokens):
         """Incrementally verify each draft token using the KV cache."""
+        # Save original pointer so the session state does NOT advance
+        orig_cache = sess.cache_ids.clone()
+        orig_next_pos = int(orig_cache.item())
+
         probs = []
-        self._sync_kv_pointer(sess)
+        self._sync_kv_pointer(sess)  # copy orig into self.model
+
         for t in draft_tokens:
             logits, new_cache = self.model.forward(
                 input_ids=torch.tensor([[t]], dtype=sess.current_ids.dtype),
                 cache_ids=self.model.cache_ids,
             )
             # logits may be 1‑D ([vocab]) or 2‑D ([1, vocab])
-            if logits.dim() == 2:
-                logits_row = logits[0]
-            else:
-                logits_row = logits
+            logits_row = logits[0] if logits.dim() == 2 else logits
             p = float(torch.softmax(logits_row, dim=-1)[t].item())
             probs.append(p)
-            # advance pointer for subsequent token
+            # advance pointer **temporarily**
             self.model.cache_ids = new_cache.clone()
-        # restore session pointer (nothing committed yet)
-        sess.cache_ids = self.model.cache_ids.clone()
+
+        # ---- Restore model & session pointer (no tokens committed yet) ----
+        self.model.cache_ids = orig_cache.clone()
+        if hasattr(self.model, "_next_pos"):
+            self.model._next_pos = orig_next_pos
+        sess.cache_ids = orig_cache  # session remains unchanged
+
         return probs
 
     # =============================

@@ -182,38 +182,41 @@ def speculative_decode(
             )
 
         if break_point and accept_count < len(speculative_tokens):
-            # rollback token count (only if we actually pushed tokens)
-            unaccepted = len(speculative_tokens) - accept_count
-            while unaccepted > 0 and output_tokens:
-                output_tokens.pop()
-                unaccepted -= 1
-            # If nothing was in output_tokens, just correct tokens_generated
-            tokens_generated = max(tokens_generated, 0)
-            # restore cache pointer to the last accepted state
-            # Roll back draft model to last accepted token's cache state
+            # The unaccepted tokens were *not* appended to output_tokens,
+            # so we should NOT pop anything here.  Simply rewind the draft
+            # model’s KV pointer.
             draft_model.cache_ids = past_states[accept_count]
             logger.info(f"[session={session_id}] Rollback: unaccepted={len(speculative_tokens) - accept_count}, cache_ids_restored={draft_model.cache_ids.tolist()}")
-            # trim any saved pointers beyond this point
             past_states = past_states[:accept_count+1]
 
         final_token_id, finalize_finished = grpc_client.finalize_tokens(
             stub, accept_count, len(speculative_tokens), session_id=session_id
         )
         if final_token_id != 0:
-            _, new_cache = draft_model.forward(
-                input_ids=torch.tensor([[final_token_id]], dtype=torch.int64),
-                cache_ids=draft_model.cache_ids
-            )
-            draft_model.cache_ids = new_cache.clone()
-            prev_token_id = final_token_id  # update for next iteration
-            output_tokens.append(final_token_id)
-            tokens_generated += 1
-            target_tokens_total += 1
-            logger.info(
-                f"[session={session_id}] Fallback token committed: {final_token_id}"
-            )
-            if tokenizer.eos_token_id is not None and final_token_id == tokenizer.eos_token_id:
-                finished = True
+            # Avoid duplicating the last token (e.g. repeating 323 "and")
+            if not output_tokens or final_token_id != output_tokens[-1]:
+                _, new_cache = draft_model.forward(
+                    input_ids=torch.tensor([[final_token_id]], dtype=torch.int64),
+                    cache_ids=draft_model.cache_ids
+                )
+                draft_model.cache_ids = new_cache.clone()
+                prev_token_id = final_token_id
+                output_tokens.append(final_token_id)
+                tokens_generated += 1
+                target_tokens_total += 1
+                logger.info(
+                    f"[session={session_id}] Fallback token committed: {final_token_id}"
+                )
+                if tokenizer.eos_token_id is not None and final_token_id == tokenizer.eos_token_id:
+                    finished = True
+            else:
+                # Update draft cache even if duplicate skipped
+                _, new_cache = draft_model.forward(
+                    input_ids=torch.tensor([[final_token_id]], dtype=torch.int64),
+                    cache_ids=draft_model.cache_ids
+                )
+                draft_model.cache_ids = new_cache.clone()
+                prev_token_id = final_token_id
 
         if finalize_finished or tokens_generated >= max_new_tokens:
             finished = True
