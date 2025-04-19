@@ -1,6 +1,7 @@
 import argparse
 import logging
 import os
+from inference.model_loader import load_model
 # Enable Transformer optimizations *and* expose past_key_values to Python
 os.environ["NEURON_CC_FLAGS"] = "--model-type=transformer"
 os.environ["NEURON_RT_NUM_CORES"] = "2"
