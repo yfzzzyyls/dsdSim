@@ -195,9 +195,12 @@ def speculative_decode(
         if final_token_id != 0:
             # Avoid duplicating the last token (e.g. repeating 323 "and")
             if not output_tokens or final_token_id != output_tokens[-1]:
+                # _, new_cache = draft_model.forward(
+                #     input_ids=torch.tensor([[final_token_id]], dtype=torch.int64),
+                #     cache_ids=draft_model.cache_ids
+                # )
                 _, new_cache = draft_model.forward(
-                    input_ids=torch.tensor([[final_token_id]], dtype=torch.int64),
-                    cache_ids=draft_model.cache_ids
+                    input_ids=torch.tensor([[final_token_id]], dtype=torch.int64)
                 )
                 draft_model.cache_ids = new_cache.clone()
                 prev_token_id = final_token_id
@@ -246,4 +249,7 @@ def speculative_decode(
     logger.info(
         f"[session={session_id}] Finished: generated_text='{generated_text[:120]}...'"
     )
+    # Make these counters available to callers even when profiling is off
+    perf_stats["accepted_tokens_total"] = accepted_tokens_total
+    perf_stats["target_tokens_total"] = target_tokens_total
     return generated_text, perf_stats

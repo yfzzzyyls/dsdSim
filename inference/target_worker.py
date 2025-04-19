@@ -185,31 +185,51 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
     #     return probs
     
     def _verify_single_step(self, sess: TargetSession, draft_tokens):
-        """Incrementally verify each draft token using the KV cache."""
-        # Save original pointer so the session state does NOT advance
+        """
+        Sequentially verify each draft token d₁…dₖ.
+
+        For each token dᵢ we:
+          1. Feed the previous token (context’s last token) to get logits for
+             the *next* position and read P_target(dᵢ).
+          2. Feed dᵢ itself to advance the KV cache, so the context for dᵢ₊₁
+             is correct.
+
+        The session KV pointer is snapshotted and fully restored at the end,
+        so verification never mutates session state.
+        """
+        # --- snapshot current pointer ---
         orig_cache = sess.cache_ids.clone()
         orig_next_pos = int(orig_cache.item())
 
         probs = []
-        self._sync_kv_pointer(sess)  # copy orig into self.model
+        prev_token = int(sess.current_ids[0, -1].item())      # last context token
 
-        for t in draft_tokens:
-            logits, new_cache = self.model.forward(
-                input_ids=torch.tensor([[t]], dtype=sess.current_ids.dtype),
+        # align model pointer with session
+        self._sync_kv_pointer(sess)
+
+        for tok in draft_tokens:
+            # 1) probability of `tok`
+            logits, cache_after_prev = self.model.forward(
+                input_ids=torch.tensor([[prev_token]], dtype=sess.current_ids.dtype),
                 cache_ids=self.model.cache_ids,
             )
-            # logits may be 1‑D ([vocab]) or 2‑D ([1, vocab])
             logits_row = logits[0] if logits.dim() == 2 else logits
-            p = float(torch.softmax(logits_row, dim=-1)[t].item())
+            p = float(torch.softmax(logits_row, dim=-1)[tok].item())
             probs.append(p)
-            # advance pointer **temporarily**
-            self.model.cache_ids = new_cache.clone()
 
-        # ---- Restore model & session pointer (no tokens committed yet) ----
+            # 2) advance cache by actually consuming `tok`
+            _, cache_after_tok = self.model.forward(
+                input_ids=torch.tensor([[tok]], dtype=sess.current_ids.dtype),
+                cache_ids=cache_after_prev.clone(),
+            )
+            self.model.cache_ids = cache_after_tok.clone()
+            prev_token = tok
+
+        # --- restore pointer ---
         self.model.cache_ids = orig_cache.clone()
         if hasattr(self.model, "_next_pos"):
             self.model._next_pos = orig_next_pos
-        sess.cache_ids = orig_cache  # session remains unchanged
+        sess.cache_ids = orig_cache
 
         return probs
 
