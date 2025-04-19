@@ -98,11 +98,8 @@ def speculative_decode(
             choice_index = torch.multinomial(top_probs, 1).item()
             next_token = torch.tensor([top_indices[choice_index]])
             token_id = int(next_token.item())
-            # True draft probability under the *full* softmax (not the renormalized top‑p)
-            if probs.dim() == 2:
-                token_prob = float(probs[0, token_id].item())
-            else:
-                token_prob = float(probs[token_id].item())
+            # Probability under the **top‑p renormalised** distribution
+            token_prob = float(top_probs[choice_index].item())
             # ---- End numeric stability patch ----
             speculative_tokens.append(token_id)
             speculative_probs.append(token_prob)
