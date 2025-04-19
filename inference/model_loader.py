@@ -62,6 +62,10 @@ class NeuronHFAdapterWrap(torch.nn.Module):
             pos_tensor = cache_ids
             next_pos_after = int(cache_ids.max().item()) + 1
 
+        # If we are generating exactly one token (B==1, L==1), Neuron expects
+        # cache_ids to be 1‑D → torch.Size([1]); squeeze the batch dim.
+        if pos_tensor is not None and pos_tensor.ndim == 2 and pos_tensor.size(0) == 1 and pos_tensor.size(1) == 1:
+            pos_tensor = pos_tensor.squeeze(0)   # shape (1,)  – compatible with Neuron
         # ------------------------------------------------------------------
         # Run Neuron adapter
         # ------------------------------------------------------------------
@@ -76,8 +80,11 @@ class NeuronHFAdapterWrap(torch.nn.Module):
         self._next_pos = next_pos_after
         if pos_tensor is None:
             # Reconstruct positions 0…L‑1 for the prompt stage
+            # For prompt (B==1, L>1) keep 2‑D; for B==1, L==1 we can squeeze
             pos_tensor = self._build_pos(0, L, B)
-        self.cache_ids = pos_tensor          # expose pointer to caller
+            if pos_tensor.ndim == 2 and pos_tensor.size(0) == 1 and pos_tensor.size(1) == 1:
+                pos_tensor = pos_tensor.squeeze(0)
+        self.cache_ids = pos_tensor if pos_tensor.ndim == 1 else pos_tensor.squeeze(0)
 
         # ------------------------------------------------------------------
         # Unpack logits to 1‑D tensor

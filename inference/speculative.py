@@ -34,14 +34,12 @@ def speculative_decode(
     if prompt_ids.shape[-1] > 0:
        _ = draft_model.forward(input_ids=prompt_ids)          # fills 0…L‑1
        prompt_len = prompt_ids.shape[-1]
-       # Overwrite cache pointer with a single‑index tensor [[L]]
-       draft_model.cache_ids = torch.tensor(
-           [[prompt_len]], dtype=torch.int32
-       )
+       # Overwrite cache pointer with a single‑index tensor [L]
+       draft_model.cache_ids = torch.tensor([prompt_len], dtype=torch.int32)
        draft_model._next_pos = prompt_len
     else:
        prompt_len = 0
-       draft_model.cache_ids = torch.tensor([[0]], dtype=torch.int32)
+       draft_model.cache_ids = torch.tensor([0], dtype=torch.int32)
        draft_model._next_pos = 0
 
     tokens_generated = 0
@@ -160,7 +158,8 @@ def speculative_decode(
             stub, accept_count, len(speculative_tokens), session_id=session_id
         )
         if final_token_id != 0:
-            _ = draft_model.forward(input_ids=torch.tensor([[final_token_id]], dtype=torch.int64))
+            _ = draft_model.forward(input_ids=torch.tensor([[final_token_id]], dtype=torch.int64),
+                                   cache_ids=draft_model.cache_ids)
             output_tokens.append(final_token_id)
             tokens_generated += 1
             target_tokens_total += 1
