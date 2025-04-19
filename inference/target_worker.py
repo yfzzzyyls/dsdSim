@@ -271,22 +271,29 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
         sid = request.session_id
         accepted_count = request.accepted_count
         draft_chunk_size = request.draft_chunk_size
-        # logger.info(f"[session={sid}] FinalizeTokens: accepted_count={accepted_count}, chunk_size={draft_chunk_size}")
+
         with self.lock:
             if sid not in self.sessions:
                 logger.warning(f"Session {sid} not found.")
                 return inference_pb2.FinalizeResponse(final_token=0, finished=True)
+
             sess = self.sessions[sid]
             if sess.finished:
-                logger.info(f"Session {sid} is already finished.")
                 return inference_pb2.FinalizeResponse(final_token=0, finished=True)
 
-            if sess.last_draft_chunk:
+            # ------------------------------------------------------------
+            # Handle the last draft chunk (if any)
+            # ------------------------------------------------------------
+            if sess.last_draft_chunk is not None:
                 chunk = sess.last_draft_chunk
                 accepted = chunk[:accepted_count]
-                # accept them
+
+                # 1) Commit accepted tokens
                 for t in accepted:
-                    sess.current_ids = torch.cat([sess.current_ids, torch.tensor([[t]], dtype=sess.current_ids.dtype)], dim=1)
+                    sess.current_ids = torch.cat(
+                        [sess.current_ids,
+                         torch.tensor([[t]], dtype=sess.current_ids.dtype)],
+                        dim=1)
                     self._sync_kv_pointer(sess)
                     logits_row, _ = self.model.forward(
                         input_ids=torch.tensor([[t]], dtype=sess.current_ids.dtype),
@@ -296,26 +303,28 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
                     sess.cache_ids = torch.tensor([self.model._next_pos], dtype=torch.int32)
                     if self.eos_token_id is not None and t == self.eos_token_id:
                         sess.finished = True
-            # Decide whether to generate a token from the target model
-            #  • partial acceptance (accepted_count < draft_chunk_size)
-            #      → generate fallback at the rejection point
-            #  • full acceptance (accepted_count == draft_chunk_size)
-            #      → STILL generate one extra token so distribution
-            #        matches target‑only decoding.
-            if accepted_count < draft_chunk_size:
-                # Rejected inside the chunk → fallback token
+
+                # 2) Always generate one token from the target model
+                #    – fallback if partial accept, extra token if full accept
                 fallback_token = self._generate_one_token(sess)
+                sess.last_draft_chunk = None  # reset for next round
+
             else:
-                # All draft tokens accepted → advance with one target token
+                # No draft chunk stored: just generate one token
                 fallback_token = self._generate_one_token(sess)
-                sess.last_draft_chunk = None
-                if fallback_token != 0 and self.eos_token_id is not None and fallback_token == self.eos_token_id:
-                    sess.finished = True
-                return inference_pb2.FinalizeResponse(final_token=fallback_token, finished=sess.finished)
-            else:
-                # no chunk stored => nothing accepted => just generate one token
-                fallback_token = self._generate_one_token(sess)
-                return inference_pb2.FinalizeResponse(final_token=fallback_token, finished=sess.finished)
+
+            # EOS handling
+            if (
+                fallback_token != 0
+                and self.eos_token_id is not None
+                and fallback_token == self.eos_token_id
+            ):
+                sess.finished = True
+
+            return inference_pb2.FinalizeResponse(
+                final_token=fallback_token,
+                finished=sess.finished,
+            )
 
     def GenerateFull(self, request, context):
         # baseline target-only decoding, optional
