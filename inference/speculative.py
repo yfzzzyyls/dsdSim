@@ -186,6 +186,10 @@ def speculative_decode(
             # so we should NOT pop anything here.  Simply rewind the draft
             # model’s KV pointer.
             draft_model.cache_ids = past_states[accept_count]
+            # --- keep _next_pos consistent with the restored pointer ---
+            if hasattr(draft_model, "_next_pos"):
+                draft_model._next_pos = int(draft_model.cache_ids.item())
+            prev_token_id = output_tokens[-1] if output_tokens else prompt_ids[0, -1].item()
             logger.info(f"[session={session_id}] Rollback: unaccepted={len(speculative_tokens) - accept_count}, cache_ids_restored={draft_model.cache_ids.tolist()}")
             past_states = past_states[:accept_count+1]
 
@@ -215,8 +219,7 @@ def speculative_decode(
             else:
                 # Update draft cache even if duplicate skipped
                 _, new_cache = draft_model.forward(
-                    input_ids=torch.tensor([[final_token_id]], dtype=torch.int64),
-                    cache_ids=draft_model.cache_ids
+                    input_ids=torch.tensor([[final_token_id]], dtype=torch.int64)
                 )
                 draft_model.cache_ids = new_cache.clone()
                 prev_token_id = final_token_id
