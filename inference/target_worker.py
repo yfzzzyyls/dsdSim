@@ -307,24 +307,56 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
         # baseline target-only decoding, optional
         return super().GenerateFull(request, context)
 
-    def _generate_one_token(self, sess: TargetSession):
-        # outputs = self.model(sess.current_ids)
+    def _generate_one_token(self, sess: TargetSession, temperature: float = 1.0, top_p: float = 0.9):
+        """
+        Sample one token from the target model’s distribution (temperature +
+        nucleus/top‑p).  This replaces the old greedy argmax, which caused the
+        same fallback tokens (e.g. “and”, token‑ID 323) to repeat and poison
+        the context.
+
+        Parameters
+        ----------
+        sess        : TargetSession
+        temperature : float  (default = 1.0)
+        top_p       : float  (default = 0.9)
+        """
+        # --- make model KV pointer match the session ---
         self._sync_kv_pointer(sess)
-        # feed dummy token (prev token) to get logits for next generation
+
+        # 1) get logits for the *next* position
         last_tok = sess.current_ids[0, -1]
         logits, new_cache = self.model.forward(
             input_ids=torch.tensor([[last_tok]], dtype=sess.current_ids.dtype),
             cache_ids=self.model.cache_ids,
         )
-        # logits may be 2‑D ([1, vocab]) or 1‑D ([vocab]); handle both
-        if logits.dim() == 2:
-            logits_row = logits[0]
-        else:
-            logits_row = logits
-        token_id = int(torch.argmax(logits_row, dim=-1).item())
-        sess.cache_ids = new_cache.clone()
-        appended_tok = torch.tensor([[token_id]], dtype=sess.current_ids.dtype)
-        sess.current_ids = torch.cat([sess.current_ids, appended_tok], dim=1)
+        logits_row = logits[0] if logits.dim() == 2 else logits
+        logits_row = logits_row / max(temperature, 1e-6)
+
+        # 2) nucleus / top‑p filter
+        probs = torch.softmax(logits_row, dim=-1)
+        sorted_probs, sorted_idx = torch.sort(probs, descending=True)
+        cumprobs = torch.cumsum(sorted_probs, dim=0)
+        cutoff = torch.where(cumprobs >= top_p)[0][0].item()
+        keep_idx = sorted_idx[:cutoff + 1]
+        keep_probs = sorted_probs[:cutoff + 1]
+        keep_probs = keep_probs / keep_probs.sum()
+
+        # 3) sample
+        choice = torch.multinomial(keep_probs, 1).item()
+        token_id = int(keep_idx[choice].item())
+
+        # 4) advance cache with the sampled token
+        _, new_cache2 = self.model.forward(
+            input_ids=torch.tensor([[token_id]], dtype=sess.current_ids.dtype),
+            cache_ids=new_cache.clone(),
+        )
+        sess.cache_ids = new_cache2.clone()
+
+        # 5) append token to context & handle EOS
+        sess.current_ids = torch.cat(
+            [sess.current_ids, torch.tensor([[token_id]], dtype=sess.current_ids.dtype)],
+            dim=1,
+        )
         if self.eos_token_id is not None and token_id == self.eos_token_id:
             sess.finished = True
         sess.tokens_generated += 1
