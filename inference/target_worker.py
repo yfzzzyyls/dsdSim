@@ -215,21 +215,9 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
                 logits_row = logits[0] if logits.dim() == 2 else logits
             else:
                 logits_row = current_logits[0] if current_logits.dim() == 2 else current_logits
-            # ----- top‑p nucleus prob of `tok` -----
-            logits_row = logits_row / max(1.0, 1e-6)      # already temperature‑scaled
+            # ----- full soft‑max probability of `tok` -----
             probs_row = torch.softmax(logits_row, dim=-1)
-            sorted_probs, sorted_idx = torch.sort(probs_row, descending=True)
-            cumprobs = torch.cumsum(sorted_probs, dim=0)
-            cutoff = torch.where(cumprobs >= 0.9)[0][0].item()
-            keep_idx = sorted_idx[:cutoff + 1]
-            keep_probs = sorted_probs[:cutoff + 1]
-            keep_probs = keep_probs / keep_probs.sum()
-
-            if tok in keep_idx:
-                rel_idx = (keep_idx == tok).nonzero(as_tuple=False)[0].item()
-                p = float(keep_probs[rel_idx].item())
-            else:
-                p = 0.0     # token would never be sampled by target
+            p = float(probs_row[tok].item())
             probs.append(p)
 
             # 2) advance cache by consuming `tok` and capture logits for the
