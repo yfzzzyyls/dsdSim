@@ -62,12 +62,31 @@ def run_batched_prompt_file(
         return
 
     logger.info(f"Loading draft model '{draft_model_name}' (sequence_length={sequence_length}) for batched decoding...")
-    draft_model = load_model(
-        draft_model_name,
-        sequence_length=sequence_length,
-        spec_length=gamma
-    )
-    tokenizer_source = target_tokenizer or draft_model_name
+    # Support passing in a draft model instance directly
+    if isinstance(draft_model_name, str):
+        # draft_model_name is a path → load the model
+        draft_model = load_model(
+            draft_model_name,
+            sequence_length=sequence_length,
+            spec_length=gamma
+        )
+        model_path_str = draft_model_name
+    else:
+        # already a model instance
+        draft_model = draft_model_name
+        # try to recover a path for tokenizer fallback
+        model_path_str = getattr(getattr(draft_model, "config", None), "_name_or_path", None)
+
+    # Decide which tokenizer to load
+    if target_tokenizer:
+        tokenizer_source = target_tokenizer
+    elif isinstance(model_path_str, str):
+        tokenizer_source = model_path_str
+    else:
+        raise ValueError(
+            "Cannot determine tokenizer_source: provide --target_tokenizer when "
+            "passing a pre‑loaded draft model."
+        )
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_source, use_fast=False)
     
     address = f"{target_host}:{port}"

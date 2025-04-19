@@ -186,7 +186,12 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
                 input_ids=torch.tensor([[t]], dtype=sess.current_ids.dtype),
                 cache_ids=self.model.cache_ids,
             )
-            p = float(torch.softmax(logits, dim=-1)[0, t].item())
+            # logits may be 1‑D ([vocab]) or 2‑D ([1, vocab])
+            if logits.dim() == 2:
+                logits_row = logits[0]
+            else:
+                logits_row = logits
+            p = float(torch.softmax(logits_row, dim=-1)[t].item())
             probs.append(p)
             # advance pointer for subsequent token
             self.model.cache_ids = new_cache.clone()
