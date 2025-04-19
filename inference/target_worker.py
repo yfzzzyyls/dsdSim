@@ -261,6 +261,7 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
             if sess.finished:
                 logger.info(f"Session {sid} is finished.")
                 return inference_pb2.VerifyResponse(target_probs=[], finished=True)
+            self._sync_kv_pointer(sess)
             if not draft_tokens:
                 target_probs = self._verify_single_step(sess, draft_tokens)
                 sess.last_draft_chunk = draft_tokens
