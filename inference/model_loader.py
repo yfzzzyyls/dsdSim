@@ -9,6 +9,12 @@ from transformers_neuronx.module import save_pretrained_split
 from transformers_neuronx.generation_utils import HuggingFaceGenerationModelAdapter
 import torch
 from transformers.modeling_outputs import CausalLMOutputWithPast
+from transformers_neuronx.fused_speculation import FusedSpeculativeDecoder
+# Fused Speculative Decoding is supported.
+# fsd = FusedSpeculativeDecoder(draft_model, target_model, spec_length)
+# fsd.to_neuron()  # Compile the fused speculative model
+
+
 
 logger = logging.getLogger(__name__)
 
@@ -20,38 +26,54 @@ class NeuronHFAdapterWrap(torch.nn.Module):
     def __init__(self, adapter):
         super().__init__()
         self.adapter = adapter
+        self.cache_ids = None  # Initialize KV cache pointer storage
         self.config = adapter.config
 
     def forward(self, input_ids, cache_ids=None, **kwargs):
+        """
+        Runs a forward pass on the Neuron-compiled draft model with KV cache reuse.
+        Accepts a cache_ids pointer to reuse past KV state, and returns logits and new cache_id.
+        """
+        # Use provided cache_ids or fall back to stored state
         if cache_ids is None:
-            logger.error(f"forward() called with cache_ids=None  ➜  full context recompute")
+            cache_ids = self.cache_ids
+        logger.info(f"forward() called with cache_ids={cache_ids}")
+        # Pass cache_ids to the underlying adapter to reuse KV cache
+        if cache_ids is not None:
+            out = self.adapter(input_ids=input_ids, cache_ids=cache_ids, return_dict=False)
         else:
-            logger.info(f"forward() called with cache_ids={cache_ids}  ➜  incremental step")
-
-        out = self.adapter(input_ids=input_ids, cache_ids=cache_ids, return_dict=False)
-
-        # Handle different output formats
-        if isinstance(out, (tuple, list)) and len(out) == 2:
-            logits, new_cache = out
-        elif hasattr(out, "logits"):
-            logits = out.logits
+            out = self.adapter(input_ids=input_ids, return_dict=False)
+        # Unpack logits and new_cache
+        if isinstance(out, (tuple, list)):
+            logits, new_cache = out[0], (out[1] if len(out) > 1 else None)
+        else:
+            logits = out.logits if hasattr(out, "logits") else out
             new_cache = getattr(out, "cache_ids", None) or getattr(out, "past_key_values", None)
-        else:
-            logits, new_cache = out, None
-
-        # Normalize logits to 1D tensor
+        # Normalize logits to 1D for sampling
         if hasattr(logits, "dim"):
             if logits.dim() == 3:
                 logits = logits[0, -1, :]
             elif logits.dim() == 2:
                 logits = logits[0]
-
-        # Ensure logits is a tensor (unwrap nested tuples)
         while isinstance(logits, (tuple, list)):
             logits = logits[0]
-
+        # If adapter did not return a new_cache, compute it based on token positions
+        if new_cache is None:
+            # Determine starting index for new tokens
+            if cache_ids is None:
+                start_idx = 0
+            elif isinstance(cache_ids, torch.Tensor):
+                start_idx = int(cache_ids.max().item()) + 1
+            else:
+                start_idx = int(cache_ids) + 1
+            seq_len = input_ids.shape[-1]
+            new_cache = torch.arange(start_idx, start_idx + seq_len, dtype=torch.int32)
+            if input_ids.dim() == 2:
+                new_cache = new_cache.unsqueeze(0)
+        # Store the updated cache state
+        self.cache_ids = new_cache
         logger.info(f"adapter returned new_cache={new_cache}")
-        return (logits, new_cache)
+        return logits, new_cache
 
 # Default sequence length (can be overridden by function arguments)
 DEFAULT_SEQUENCE_LENGTH = 128

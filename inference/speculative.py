@@ -23,146 +23,96 @@ def speculative_decode(
     with full rollback of the draft model's past states.
     Extended to handle a session_id so multiple prompts can run concurrently on the server.
     """
+    # Initial setup: process prompt through draft model to initialize cache
     output_tokens = []
-    cache_id = None          # pointer returned by Neuron adapter
-    past_states = [None]     # list of cache pointers for rollback (index 0 = prompt state)
+    draft_model.cache_ids = None
+    prompt_ids = tokenizer(prompt, return_tensors='pt').input_ids
+    if prompt_ids.shape[-1] > 0:
+        _ = draft_model.forward(input_ids=prompt_ids)[0]
+    prev_token = prompt_ids[0, -1] if prompt_ids.shape[-1] > 0 else None
+
     tokens_generated = 0
     finished = False
-
     accepted_tokens_total = 0
     target_tokens_total = 0
-
-    # Tokenize the user prompt for the first pass
-    prompt_ids = tokenizer(prompt, return_tensors='pt').input_ids
 
     import time
     start_t = time.time()
 
     while not finished and tokens_generated < max_new_tokens:
         # The draft model proposes up to 'gamma' tokens
-        draft_tokens = []
-        draft_probs = []
-
-        # We also store a list of 'past' states, so we can rollback
-        past_states = [cache_id]
-
-        for i in range(gamma):
-            if cache_id is None:
-                input_ids = prompt_ids
-            else:
-                input_ids = torch.tensor([[output_tokens[-1]]], dtype=torch.long)
-
-            # save pointer BEFORE calling model
-            past_states.append(cache_id)
-
-            # Call Neuron adapter: returns logits and cache pointer
-            out = draft_model(input_ids=input_ids, cache_ids=cache_id)
-
-            # Extract logits and cache pointer
-            if isinstance(out, (tuple, list)):
-                # Tuple path: first=logits, second=cache_id
-                logits = out[0]
-                new_cache_id = out[1] if len(out) > 1 else None
-            elif hasattr(out, "logits"):
-                # ModelOutput path
-                logits = out.logits
-                # Adapter may use 'cache_ids' or 'past_key_values'
-                new_cache_id = getattr(out, "cache_ids", None) or getattr(out, "past_key_values", None)
-            else:
-                # Fallback: output is logits only
-                logits = out
-                new_cache_id = None
-
-            # Normalize logits to 1D tensor
-            if hasattr(logits, "dim"):
-                if logits.dim() == 3:
-                    logits = logits[0, -1, :]
-                elif logits.dim() == 2:
-                    logits = logits[0]
-
-            # Ensure logits is a tensor (unwrap nested tuples)
-            while isinstance(logits, (tuple, list)):
-                logits = logits[0]
-
-            # Update cache pointer
-            cache_id = new_cache_id
-            logger.info(f"[draft] step {tokens_generated:>3}  cache_id -> {cache_id}")
-
+        speculative_tokens = []
+        speculative_probs = []
+        past_states = [draft_model.cache_ids]
+        for _ in range(gamma):
+            # Generate next token using KV cache
+            logits, new_cache = draft_model.forward(input_ids=prev_token.unsqueeze(0))
             # ---- Our improved numeric stability start ----
             logits = logits / temperature
             logits = torch.clamp(logits, min=-1e10, max=1e10)
-
             probs = torch.softmax(logits, dim=-1)
             if not torch.isfinite(probs).all():
-                # fallback if we have NaN/Inf
                 probs = torch.ones_like(probs)
                 probs /= probs.sum()
-
             sorted_probs, sorted_indices = torch.sort(probs, descending=True)
             cumulative_probs = torch.cumsum(sorted_probs, dim=0)
             if torch.any(cumulative_probs >= top_p):
                 cutoff_index = torch.where(cumulative_probs >= top_p)[0][0].item()
             else:
                 cutoff_index = len(sorted_probs) - 1
-
             top_probs = sorted_probs[:cutoff_index+1]
             top_indices = sorted_indices[:cutoff_index+1]
-
-            # Check sum
             top_sum = top_probs.sum()
             if not torch.isfinite(top_sum) or top_sum <= 1e-9:
-                # fallback
                 top_probs = torch.ones_like(top_probs)
                 top_sum = top_probs.sum()
-
             top_probs = top_probs / top_sum
             top_probs = torch.clamp(top_probs, min=0.0, max=1.0)
-
             choice_index = torch.multinomial(top_probs, 1).item()
-            token_id = int(top_indices[choice_index].item())
+            next_token = torch.tensor([top_indices[choice_index]])
+            token_id = int(next_token.item())
             token_prob = float(top_probs[choice_index].item())
             # ---- End numeric stability patch ----
-
-            draft_tokens.append(token_id)
-            draft_probs.append(token_prob)
-            output_tokens.append(token_id)
-            tokens_generated += 1
-
-            # EOS checks...
+            speculative_tokens.append(token_id)
+            speculative_probs.append(token_prob)
+            prev_token = next_token
+            past_states.append(new_cache)
+            # Stop if end-of-sequence or max_new_tokens reached
             if tokenizer.eos_token_id is not None and token_id == tokenizer.eos_token_id:
                 finished = True
                 break
-            if tokens_generated >= max_new_tokens:
+            if tokens_generated + len(speculative_tokens) >= max_new_tokens:
                 break
+        tokens_generated += len(speculative_tokens)
 
         # If overshoot
-        if len(draft_tokens) > 0 and tokens_generated > max_new_tokens:
+        if len(speculative_tokens) > 0 and tokens_generated > max_new_tokens:
             overshoot = tokens_generated - max_new_tokens
-            draft_tokens = draft_tokens[:-overshoot]
-            draft_probs = draft_probs[:-overshoot]
+            speculative_tokens = speculative_tokens[:-overshoot]
+            speculative_probs = speculative_probs[:-overshoot]
             output_tokens = output_tokens[:-overshoot]
             tokens_generated = max_new_tokens
             finished = True
 
-        if not draft_tokens:
+        if not speculative_tokens:
             break
 
         # 8) Verify tokens with target model
         target_probs, target_finished = grpc_client.verify_draft_tokens(
-            stub, draft_tokens, session_id=session_id
+            stub, speculative_tokens, session_id=session_id
         )
-        if target_finished and len(target_probs) < len(draft_tokens):
+        if target_finished and len(target_probs) < len(speculative_tokens):
             # partial consumption => treat rest as rejected
-            draft_tokens = draft_tokens[:len(target_probs)]
-            draft_probs = draft_probs[:len(target_probs)]
+            speculative_tokens = speculative_tokens[:len(target_probs)]
+            speculative_probs = speculative_probs[:len(target_probs)]
             finished = True
 
         # 9) Accept or reject
         accept_count = 0
         break_point = False
-        for idx, token_id in enumerate(draft_tokens):
+        for idx, token_id in enumerate(speculative_tokens):
             p_target = float(target_probs[idx]) if idx < len(target_probs) else 0.0
-            p_draft = float(draft_probs[idx]) if idx < len(draft_probs) else 1e-9
+            p_draft = float(speculative_probs[idx]) if idx < len(speculative_probs) else 1e-9
             ratio = p_target / p_draft if p_draft > 0 else 0.0
             if ratio > 1.0:
                 ratio = 1.0
@@ -178,23 +128,25 @@ def speculative_decode(
                 break_point = True
                 break
 
-        if break_point and accept_count < len(draft_tokens):
+        if break_point and accept_count < len(speculative_tokens):
             # rollback token count
-            unaccepted = len(draft_tokens) - accept_count
+            unaccepted = len(speculative_tokens) - accept_count
             while unaccepted > 0:
                 output_tokens.pop()
                 tokens_generated -= 1
                 unaccepted -= 1
             # restore cache pointer to the last accepted state
-            cache_id = past_states[accept_count]
-            logger.info(f"[rollback] restored cache_id = {cache_id}")
+            # Roll back draft model to last accepted token's cache state
+            draft_model.cache_ids = past_states[accept_count]
+            logger.info(f"[rollback] restored cache_ids = {draft_model.cache_ids}")
             # trim any saved pointers beyond this point
             past_states = past_states[:accept_count+1]
 
         final_token_id, finalize_finished = grpc_client.finalize_tokens(
-            stub, accept_count, len(draft_tokens), session_id=session_id
+            stub, accept_count, len(speculative_tokens), session_id=session_id
         )
         if final_token_id != 0:
+            _ = draft_model.forward(input_ids=torch.tensor([[final_token_id]], dtype=torch.int32))
             output_tokens.append(final_token_id)
             tokens_generated += 1
             target_tokens_total += 1

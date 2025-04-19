@@ -50,7 +50,7 @@ pip install --upgrade transformers-neuronx
 1. **Clone Repo & Install**:
 
    ```
-   git clone https://github.com/yfzzzyyls/Choral-Spec
+   git clone https://github.com/yfzzzyyls/choral-spec
    ```
 2. **Download Models** (1B draft, 3B target) from Hugging Face. For example:
 
