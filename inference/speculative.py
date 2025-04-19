@@ -30,8 +30,19 @@ def speculative_decode(
     prompt_ids = tokenizer(prompt, return_tensors='pt').input_ids
     prev_token_id = int(prompt_ids[0, -1].item()) if prompt_ids.shape[-1] > 0 else tokenizer.bos_token_id
     # Feed the entire prompt once so the draft model builds its KV cache
+    # Feed the prompt so Neuron caches 0…L‑1, then set pointer to NEXT index (=L)
     if prompt_ids.shape[-1] > 0:
-        _ = draft_model.forward(input_ids=prompt_ids)
+       _ = draft_model.forward(input_ids=prompt_ids)          # fills 0…L‑1
+       prompt_len = prompt_ids.shape[-1]
+       # Overwrite cache pointer with a single‑index tensor [[L]]
+       draft_model.cache_ids = torch.tensor(
+           [[prompt_len]], dtype=torch.int32
+       )
+       draft_model._next_pos = prompt_len
+    else:
+       prompt_len = 0
+       draft_model.cache_ids = torch.tensor([[0]], dtype=torch.int32)
+       draft_model._next_pos = 0
 
     tokens_generated = 0
     finished = False
