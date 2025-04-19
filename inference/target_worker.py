@@ -8,6 +8,13 @@ from transformers import AutoTokenizer
 from grpc_comm import inference_pb2, inference_pb2_grpc
 
 logger = logging.getLogger(__name__)
+if not logger.hasHandlers():
+    h = logging.StreamHandler()
+    h.setLevel(logging.INFO)
+    fmt = logging.Formatter('%(asctime)s %(levelname)s %(name)s: %(message)s')
+    h.setFormatter(fmt)
+    logger.addHandler(h)
+    logger.setLevel(logging.INFO)
 
 class TargetSession:
     def __init__(self, input_ids):

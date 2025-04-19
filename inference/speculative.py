@@ -5,6 +5,13 @@ import logging
 from grpc_comm import grpc_client
 
 logger = logging.getLogger(__name__)
+if not logger.hasHandlers():
+    h = logging.StreamHandler()
+    h.setLevel(logging.INFO)
+    fmt = logging.Formatter('%(asctime)s %(levelname)s %(name)s: %(message)s')
+    h.setFormatter(fmt)
+    logger.addHandler(h)
+    logger.setLevel(logging.INFO)
 
 def speculative_decode(
     draft_model,
