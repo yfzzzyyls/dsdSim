@@ -15,6 +15,8 @@ class TargetSession:
         self.finished = False
         self.tokens_generated = 0
         self.last_draft_chunk = None
+        # pointer to the *next* KV slot
+        self.cache_ids = torch.tensor([input_ids.shape[1]], dtype=torch.int32)
 
 class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
     def __init__(self, model_path, sequence_length=128):
@@ -25,22 +27,12 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
         self.sessions = {}  # session_id -> TargetSession
         self.lock = torch.multiprocessing.Lock()
 
-    def _pad_ids(self, ids: torch.Tensor) -> torch.Tensor:
-        """
-        Pad a 1×n tensor `ids` with the tokenizer pad_token_id (or 0) so that
-        len(ids) >= self._ctx_estimate.  Returns the padded tensor.
-        """
-        cur_len = ids.size(1)
-        if cur_len >= self._ctx_estimate:
-            return ids
-        pad_id = (
-            self.tokenizer.pad_token_id
-            if self.tokenizer.pad_token_id is not None
-            else 0
-        )
-        pad_len = self._ctx_estimate - cur_len
-        pad_tensor = torch.full((1, pad_len), pad_id, dtype=ids.dtype)
-        return torch.cat([ids, pad_tensor], dim=1)
+    
+    def _sync_kv_pointer(self, sess: TargetSession):
+        self.model.cache_ids = sess.cache_ids.clone()
+        if hasattr(self.model, "_next_pos"):
+            self.model._next_pos = int(sess.cache_ids.item())
+
 
     def StartGeneration(self, request, context):
         session_id = request.session_id
@@ -57,75 +49,91 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
             else:
                 current_ids = torch.zeros((1,0), dtype=torch.long)
             self.sessions[session_id] = TargetSession(current_ids)
+            # --- prime Neuron KV cache on the prompt ---
+            self.model.cache_ids = None
+            self.model._next_pos = 0
+            if current_ids.shape[1] > 0:
+                _ = self.model.forward(current_ids)
+            # store pointer (next index) inside the session
+            self.sessions[session_id].cache_ids = torch.tensor(
+                [current_ids.shape[1]], dtype=torch.int32
+            )
         return inference_pb2.StartResponse(acknowledged=True)
 
     # =============================
-    # BATCH calls for multi-seq
+    # BATCH calls for multi‑seq
     # =============================
     def VerifyBatchTokens(self, request, context):
+        """
+        Verify several session‑specific draft token chunks in one RPC.
+        Each element of request.sequences carries:
+            • session_id   - int
+            • draft_tokens - repeated int32
+        For every sequence we compute P_target(draft_token | context) **incrementally**
+        using the target KV cache (one forward per token).  No concat / pad.
+        """
         results = []
         with self.lock:
             for seq in request.sequences:
                 sid = seq.session_id
                 draft_tokens = list(seq.draft_tokens)
+
+                # 1) Session validation
                 if sid not in self.sessions:
-                    logger.warning(f"Session {sid} not found in VerifyBatchTokens.")
-                    # Return something: accepted=0, finished?
-                    results.append(inference_pb2.VerifyResult(session_id=sid, tokens_accepted=0, target_token=0, finished=True))
+                    logger.warning(f"[VerifyBatchTokens] Session {sid} not found.")
+                    results.append(
+                        inference_pb2.VerifyResult(
+                            session_id=sid,
+                            tokens_accepted=0,
+                            target_token=0,
+                            finished=True,            # treat as finished / invalid
+                        )
+                    )
                     continue
 
                 sess = self.sessions[sid]
                 if sess.finished:
-                    logger.info(f"Session {sid} is already finished.")
-                    results.append(inference_pb2.VerifyResult(session_id=sid, tokens_accepted=0, target_token=0, finished=True))
-                    continue
-                if not draft_tokens:
-                    # no tokens => accept none
-                    results.append(inference_pb2.VerifyResult(session_id=sid, tokens_accepted=0, target_token=0, finished=False))
-                    continue
-
-                # Expand input_ids
-                # expanded_ids = torch.cat([sess.current_ids, torch.tensor([draft_tokens], dtype=sess.current_ids.dtype)], dim=1)
-                expanded_ids = torch.cat(
-                    [sess.current_ids, torch.tensor([draft_tokens], dtype=sess.current_ids.dtype)],
-                    dim=1,
-                )
-                expanded_ids = self._pad_ids(expanded_ids)
-                outputs = self.model(expanded_ids)
-                all_logits = _extract_logits_all(outputs)  # shape [1, expanded_len, vocab]
-                expanded_len = expanded_ids.size(1)
-                actual_time_dim = all_logits.shape[1]
-
-                if actual_time_dim >= expanded_len:
-                    num_new = len(draft_tokens)
-                    logits_slice = all_logits[:, -num_new:, :]
-                    target_probs = []
-                    for i, token_id in enumerate(draft_tokens):
-                        row_logits = logits_slice[0, i, :]
-                        row_probs = torch.softmax(row_logits, dim=-1)
-                        p = float(row_probs[token_id].item())
-                        target_probs.append(p)
-
-                    # store chunk in the session for finalizing
-                    sess.last_draft_chunk = draft_tokens
-                    # we do not set finished here. We'll set finished if we see EOS in finalize.
-                    # or if we wanted to check right now.
-                    # we can do that if we want:
-                    finished_flag = False
-                    results.append(inference_pb2.VerifyResult(
-                        session_id=sid,
-                        tokens_accepted=0,  # we'll finalize acceptance in the finalize call
-                        target_token=0,
-                        finished=finished_flag
-                    ))
-                else:
-                    # fallback single-step loop
-                    fallback_probs = self._verify_single_step(sess, draft_tokens)
-                    sess.last_draft_chunk = draft_tokens
                     results.append(
-                        inference_pb2.VerifyResult(session_id=sid, tokens_accepted=0, target_token=0, finished=False)
+                        inference_pb2.VerifyResult(
+                            session_id=sid,
+                            tokens_accepted=0,
+                            target_token=0,
+                            finished=True,
+                        )
                     )
+                    continue
+
+                if not draft_tokens:
+                    # Empty chunk – nothing to verify
+                    results.append(
+                        inference_pb2.VerifyResult(
+                            session_id=sid,
+                            tokens_accepted=0,
+                            target_token=0,
+                            finished=False,
+                        )
+                    )
+                    continue
+
+                # 2) Incremental verify using the session’s KV cache
+                target_probs = self._verify_single_step(sess, draft_tokens)
+
+                # 3) Remember this chunk so FinalizeTokens can accept/rollback
+                sess.last_draft_chunk = draft_tokens
+
+                # 4) Return a VerifyResult (no tokens accepted yet;
+                #    acceptance happens in FinalizeTokens)
+                results.append(
+                    inference_pb2.VerifyResult(
+                        session_id=sid,
+                        tokens_accepted=0,
+                        target_token=0,
+                        finished=False,
+                    )
+                )
+
         return inference_pb2.VerifyBatchResponse(results=results)
+
 
     def FinalizeBatchTokens(self, request, context):
         results = []
@@ -151,22 +159,39 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
                 results.append(inference_pb2.FinalizeBatchResult(session_id=sid, finished=sess.finished))
         return inference_pb2.FinalizeBatchResponse(results=results)
 
-    def _verify_single_step(self, sess, draft_tokens):
-        # fallback approach, calls model per token
+    # def _verify_single_step(self, sess, draft_tokens):
+    #     # fallback approach, calls model per token
+    #     probs = []
+    #     # temp_ids = sess.current_ids.clone()
+    #     temp_ids = self._pad_ids(sess.current_ids.clone())
+    #     for t in draft_tokens:
+    #         out = self.model(temp_ids)
+    #         logits = _extract_logits(out)
+    #         row_probs = torch.softmax(logits, dim=-1)
+    #         p = float(row_probs[0, t].item())
+    #         probs.append(p)
+    #         # appended_tok = torch.tensor([[t]], dtype=temp_ids.dtype)
+    #         # temp_ids = torch.cat([temp_ids, appended_tok], dim=1)
+    #         appended_tok = torch.tensor([[t]], dtype=temp_ids.dtype)
+    #         temp_ids = torch.cat([temp_ids, appended_tok], dim=1)
+    #         temp_ids = self._pad_ids(temp_ids)
+    #     return probs
+    
+    def _verify_single_step(self, sess: TargetSession, draft_tokens):
+        """Incrementally verify each draft token using the KV cache."""
         probs = []
-        # temp_ids = sess.current_ids.clone()
-        temp_ids = self._pad_ids(sess.current_ids.clone())
+        self._sync_kv_pointer(sess)
         for t in draft_tokens:
-            out = self.model(temp_ids)
-            logits = _extract_logits(out)
-            row_probs = torch.softmax(logits, dim=-1)
-            p = float(row_probs[0, t].item())
+            logits, new_cache = self.model.forward(
+                input_ids=torch.tensor([[t]], dtype=sess.current_ids.dtype),
+                cache_ids=self.model.cache_ids,
+            )
+            p = float(torch.softmax(logits, dim=-1)[0, t].item())
             probs.append(p)
-            # appended_tok = torch.tensor([[t]], dtype=temp_ids.dtype)
-            # temp_ids = torch.cat([temp_ids, appended_tok], dim=1)
-            appended_tok = torch.tensor([[t]], dtype=temp_ids.dtype)
-            temp_ids = torch.cat([temp_ids, appended_tok], dim=1)
-            temp_ids = self._pad_ids(temp_ids)
+            # advance pointer for subsequent token
+            self.model.cache_ids = new_cache.clone()
+        # restore session pointer (nothing committed yet)
+        sess.cache_ids = self.model.cache_ids.clone()
         return probs
 
     # =============================
@@ -186,34 +211,17 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
                 logger.info(f"Session {sid} is finished.")
                 return inference_pb2.VerifyResponse(target_probs=[], finished=True)
             if not draft_tokens:
-                return inference_pb2.VerifyResponse(target_probs=[], finished=False)
+                target_probs = self._verify_single_step(sess, draft_tokens)
+                sess.last_draft_chunk = draft_tokens
+                return inference_pb2.VerifyResponse(target_probs=target_probs, finished=False)
             # expanded_ids = torch.cat([sess.current_ids, torch.tensor([draft_tokens], dtype=sess.current_ids.dtype)], dim=1)
-            expanded_ids = torch.cat(
-                [sess.current_ids, torch.tensor([draft_tokens], dtype=sess.current_ids.dtype)],
-                dim=1,
-            )
-            expanded_ids = self._pad_ids(expanded_ids)
-            outputs = self.model(expanded_ids)
-            all_logits = _extract_logits_all(outputs)
-            expanded_len = expanded_ids.size(1)
-            actual_time_dim = all_logits.shape[1]
-            target_probs = []
-            finished_flag = False
-            if actual_time_dim >= expanded_len:
-                num_new = len(draft_tokens)
-                logits_slice = all_logits[:, -num_new:, :]
-                for i, token_id in enumerate(draft_tokens):
-                    row_logits = logits_slice[0, i, :]
-                    row_probs = torch.softmax(row_logits, dim=-1)
-                    p = float(row_probs[token_id].item())
-                    target_probs.append(p)
-            else:
-                # fallback single-step loop
-                fallback = self._verify_single_step(sess, draft_tokens)
-                target_probs = fallback
-
+            # expanded_ids = torch.cat(
+            #     [sess.current_ids, torch.tensor([draft_tokens], dtype=sess.current_ids.dtype)],
+            #     dim=1,
+            # )
+            target_probs = self._verify_single_step(sess, draft_tokens)
             sess.last_draft_chunk = draft_tokens
-            return inference_pb2.VerifyResponse(target_probs=target_probs, finished=finished_flag)
+            return inference_pb2.VerifyResponse(target_probs=target_probs, finished=False)
 
     def FinalizeTokens(self, request, context):
         sid = request.session_id
@@ -235,6 +243,12 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
                 # accept them
                 for t in accepted:
                     sess.current_ids = torch.cat([sess.current_ids, torch.tensor([[t]], dtype=sess.current_ids.dtype)], dim=1)
+                    self._sync_kv_pointer(sess)
+                    _, new_cache = self.model.forward(
+                        input_ids=torch.tensor([[t]], dtype=sess.current_ids.dtype),
+                        cache_ids=self.model.cache_ids,
+                    )
+                    sess.cache_ids = new_cache.clone()
                     if self.eos_token_id is not None and t == self.eos_token_id:
                         sess.finished = True
                 # if partial acceptance:
@@ -256,9 +270,15 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
 
     def _generate_one_token(self, sess: TargetSession):
         # outputs = self.model(sess.current_ids)
-        outputs = self.model(self._pad_ids(sess.current_ids))
-        logits = _extract_logits(outputs)
+        self._sync_kv_pointer(sess)
+        # feed dummy token (prev token) to get logits for next generation
+        last_tok = sess.current_ids[0, -1]
+        logits, new_cache = self.model.forward(
+            input_ids=torch.tensor([[last_tok]], dtype=sess.current_ids.dtype),
+            cache_ids=self.model.cache_ids,
+        )
         token_id = int(torch.argmax(logits, dim=-1)[0].item())
+        sess.cache_ids = new_cache.clone()
         appended_tok = torch.tensor([[token_id]], dtype=sess.current_ids.dtype)
         sess.current_ids = torch.cat([sess.current_ids, appended_tok], dim=1)
         if self.eos_token_id is not None and token_id == self.eos_token_id:
