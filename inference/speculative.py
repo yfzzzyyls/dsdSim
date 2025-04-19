@@ -92,7 +92,11 @@ def speculative_decode(
             token_id = int(nucleus_idx[sample_idx].item())
  
             # Probability of token_id under the **full** soft‑max (p_draft)
-            token_prob = float(probs[0, token_id].item())
+            # probability under the FULL soft‑max (handle 1‑D vs 2‑D)
+            if probs.dim() == 2:
+                token_prob = float(probs[0, token_id].item())
+            else:
+                token_prob = float(probs[token_id].item())
             # ---- End numeric stability patch ----
             speculative_tokens.append(token_id)
             speculative_probs.append(token_prob)
