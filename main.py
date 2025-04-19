@@ -6,8 +6,17 @@ from inference.model_loader import load_model
 os.environ["NEURON_CC_FLAGS"] = "--model-type=transformer"
 os.environ["NEURON_RT_NUM_CORES"] = "2"
 
-# Configure logging globally
-logging.basicConfig(level=logging.INFO)
+# -----------------------------------------------------------------------------
+# Configure root logging BEFORE importing heavy libraries that may configure
+# logging first.  Use `force=True` so our settings override any prior config
+# that third‑party packages may have installed (e.g. transformers, neuronx).
+# -----------------------------------------------------------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    handlers=[logging.StreamHandler()],
+    force=True,         # override any existing handlers
+)
 logger = logging.getLogger(__name__)
 
 def main():
@@ -45,6 +54,11 @@ def main():
     parser.add_argument("--temperature", type=float, default=1.0,
                         help="Temperature for draft sampling (default 1.0)")
     args = parser.parse_args()
+
+    logger.info("Choral-Spec main launcher started - logger")
+    logger.info(f"Choral-Spec main launcher started - logger - f")
+    print("Choral-Spec main launcher started- print")
+
 
     if args.role == "target":
         model_name = args.model or args.target_model
