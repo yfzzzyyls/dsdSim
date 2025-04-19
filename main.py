@@ -52,9 +52,13 @@ def main():
             return
         # Launch the target model gRPC server
         from inference import target_worker
-        target_worker.run_server(model_name, port=args.port,
-                                    sequence_length=args.sequence_length,
-                                    profile=args.profile)
+        target_worker.run_server(
+            model_name,
+            port=args.port,
+            sequence_length=args.sequence_length,
+            spec_length=args.gamma,
+            profile=args.profile
+        )
 
     elif args.role == "draft":
         # Running the draft side
@@ -67,7 +71,11 @@ def main():
         if args.prompt_text:
             # Batch mode: multiple prompts from file, each in a separate gRPC session
             from inference import draft_worker
-            # draft_worker.run_concurrent_clients(
+            draft_model = load_model(
+                draft_model_name,
+                sequence_length=args.sequence_length,
+                spec_length=args.gamma
+            )
             draft_worker.run_batched_prompt_file(
                 draft_model_name=draft_model,
                 target_host=args.target_host,

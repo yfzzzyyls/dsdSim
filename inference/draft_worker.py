@@ -62,7 +62,11 @@ def run_batched_prompt_file(
         return
 
     logger.info(f"Loading draft model '{draft_model_name}' (sequence_length={sequence_length}) for batched decoding...")
-    draft_model = load_model(draft_model_name, sequence_length=sequence_length)
+    draft_model = load_model(
+        draft_model_name,
+        sequence_length=sequence_length,
+        spec_length=gamma
+    )
     tokenizer_source = target_tokenizer or draft_model_name
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_source, use_fast=False)
     
@@ -137,7 +141,11 @@ def run_client(draft_model_name: str,
                temperature: float = 1.0):
     # same as existing
     logger.info(f"Loading draft model '{draft_model_name}' (sequence_length={sequence_length})...")
-    draft_model = load_model(draft_model_name, sequence_length=sequence_length)
+    draft_model = load_model(
+        draft_model_name,
+        sequence_length=sequence_length,
+        spec_length=gamma
+    )
     tokenizer_source = target_tokenizer or draft_model_name
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_source, use_fast=False)
     if not prompt:
@@ -224,7 +232,11 @@ def run_concurrent_clients(draft_model_name: str,
         logger.error("No valid lines in prompt file.")
         return
     logger.info(f"Loading draft model '{draft_model_name}' (sequence_length={sequence_length}) for concurrency...")
-    draft_model = load_model(draft_model_name, sequence_length=sequence_length)
+    draft_model = load_model(
+        draft_model_name,
+        sequence_length=sequence_length,
+        spec_length=gamma
+    )
     tokenizer_source = target_tokenizer or draft_model_name
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_source, use_fast=False)
     address = f"{target_host}:{port}"

@@ -106,15 +106,15 @@ class NeuronHFAdapterWrap(torch.nn.Module):
 # Default sequence length (can be overridden by function arguments)
 DEFAULT_SEQUENCE_LENGTH = 128
 
-def load_model(model_path: str, sequence_length: int = DEFAULT_SEQUENCE_LENGTH):
+def load_model(model_path: str, sequence_length: int = DEFAULT_SEQUENCE_LENGTH, spec_length: int = None):
     """
     Load or compile a model for inference.
     """
     logger.info(f"Attempting to download/compile from source.")
-    model = compile_model(model_path, sequence_length=sequence_length)
+    model = compile_model(model_path, sequence_length=sequence_length, spec_length=spec_length)
     return model
 
-def compile_model(model_path: str, sequence_length: int = DEFAULT_SEQUENCE_LENGTH):
+def compile_model(model_path: str, sequence_length: int = DEFAULT_SEQUENCE_LENGTH, spec_length: int = None):
     """
     Compile a model for AWS Neuron. Loads the model (from HF Hub or local checkpoint),
     compiles it to a TorchScript that can run on NeuronCores, and saves the compiled model
@@ -139,12 +139,17 @@ def compile_model(model_path: str, sequence_length: int = DEFAULT_SEQUENCE_LENGT
     tp_degree = int(os.environ.get("NEURON_RT_NUM_CORES", "2"))
     if model_type.lower() == "llama" or "llama" in model_path.lower():
         logger.info(f"Compiling model using optimized LLaMA for Neuron ...")
-        model = LlamaForSampling.from_pretrained(model_path, batch_size=1, amp='bf16',
-                                                 n_positions=sequence_length, 
-                                                 context_length_estimate=sequence_length,
-                                                 tp_degree=tp_degree)
-        # Compile so the Neuron graph returns (logits, cache_id)
-        model.enable_speculative_decoder(4)
+        model = LlamaForSampling.from_pretrained(
+            model_path,
+            batch_size=1,
+            amp='bf16',
+            n_positions=sequence_length,
+            context_length_estimate=sequence_length,
+            tp_degree=tp_degree
+        )
+        # If a speculative length is provided, enable that many-token speculative decoder
+        if spec_length is not None:
+            model.enable_speculative_decoder(spec_length)
         model.to_neuron()
         hf_config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
         adapter = HuggingFaceGenerationModelAdapter(hf_config, model)
