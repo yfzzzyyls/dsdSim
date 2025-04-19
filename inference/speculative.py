@@ -27,9 +27,10 @@ def speculative_decode(
     output_tokens = []
     draft_model.cache_ids = None
     prompt_ids = tokenizer(prompt, return_tensors='pt').input_ids
+    prev_token_id = int(prompt_ids[0, -1].item()) if prompt_ids.shape[-1] > 0 else tokenizer.bos_token_id
+    # Feed the entire prompt once so the draft model builds its KV cache
     if prompt_ids.shape[-1] > 0:
-        _ = draft_model.forward(input_ids=prompt_ids)[0]
-    prev_token = prompt_ids[0, -1] if prompt_ids.shape[-1] > 0 else None
+        _ = draft_model.forward(input_ids=prompt_ids)
 
     tokens_generated = 0
     finished = False
@@ -45,8 +46,9 @@ def speculative_decode(
         speculative_probs = []
         past_states = [draft_model.cache_ids]
         for _ in range(gamma):
-            # Generate next token using KV cache
-            logits, new_cache = draft_model.forward(input_ids=prev_token.unsqueeze(0))
+            # Prepare a 2‑D input_ids tensor [[token_id]]
+            input_ids = torch.tensor([[prev_token_id]], dtype=torch.int64)
+            logits, new_cache = draft_model.forward(input_ids=input_ids)
             # ---- Our improved numeric stability start ----
             logits = logits / temperature
             logits = torch.clamp(logits, min=-1e10, max=1e10)
@@ -75,7 +77,7 @@ def speculative_decode(
             # ---- End numeric stability patch ----
             speculative_tokens.append(token_id)
             speculative_probs.append(token_prob)
-            prev_token = next_token
+            prev_token_id = token_id
             past_states.append(new_cache)
             # Stop if end-of-sequence or max_new_tokens reached
             if tokenizer.eos_token_id is not None and token_id == tokenizer.eos_token_id:
@@ -146,7 +148,7 @@ def speculative_decode(
             stub, accept_count, len(speculative_tokens), session_id=session_id
         )
         if final_token_id != 0:
-            _ = draft_model.forward(input_ids=torch.tensor([[final_token_id]], dtype=torch.int32))
+            _ = draft_model.forward(input_ids=torch.tensor([[final_token_id]], dtype=torch.int64))
             output_tokens.append(final_token_id)
             tokens_generated += 1
             target_tokens_total += 1

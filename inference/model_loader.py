@@ -38,11 +38,8 @@ class NeuronHFAdapterWrap(torch.nn.Module):
         if cache_ids is None:
             cache_ids = self.cache_ids
         logger.info(f"forward() called with cache_ids={cache_ids}")
-        # Pass cache_ids to the underlying adapter to reuse KV cache
-        if cache_ids is not None:
-            out = self.adapter(input_ids=input_ids, cache_ids=cache_ids, return_dict=False)
-        else:
-            out = self.adapter(input_ids=input_ids, return_dict=False)
+        # Always pass cache_ids to the underlying adapter (it requires the argument)
+        out = self.adapter(input_ids=input_ids, cache_ids=cache_ids, return_dict=False)
         # Unpack logits and new_cache
         if isinstance(out, (tuple, list)):
             logits, new_cache = out[0], (out[1] if len(out) > 1 else None)
