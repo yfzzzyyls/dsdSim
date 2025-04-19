@@ -91,10 +91,12 @@ def speculative_decode(
             sample_idx = torch.multinomial(nucleus_probs, 1).item()
             token_id = int(nucleus_idx[sample_idx].item())
  
-            # Probability of token_id under the **full** soft‑max (p_draft)
-            # Probability of token_id under the *proposal* distribution q
-            # (renormalised top‑p nucleus).
-            token_prob = float(nucleus_probs[sample_idx].item())
+            # probability under the **FULL** soft‑max (proposal q),
+            # dimension‑safe for 1‑D or 2‑D tensors
+            if probs.dim() == 2:
+                token_prob = float(probs[0, token_id].item())
+            else:
+                token_prob = float(probs[token_id].item())
             # ---- End numeric stability patch ----
             speculative_tokens.append(token_id)
             speculative_probs.append(token_prob)
