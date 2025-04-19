@@ -192,6 +192,8 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
         the *next‑free KV slot* (pointer).  After verification we restore it.
         """
         # --- snapshot pointer ---
+        current_logits = sess.pending_logits
+        sess.pending_logits = None  # consume cached logits
         orig_cache = sess.cache_ids.clone()
         orig_next_pos = int(orig_cache.item())
 
@@ -205,23 +207,28 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
 
         for tok in draft_tokens:
             # 1) probability of tok
-            logits, _ = self.model.forward(
-                input_ids=torch.tensor([[prev_token]], dtype=sess.current_ids.dtype),
-                cache_ids=torch.tensor([prev_pos], dtype=torch.int32),
-            )
-            logits_row = logits[0] if logits.dim() == 2 else logits
+            if current_logits is None:
+                logits, _ = self.model.forward(
+                    input_ids=torch.tensor([[prev_token]], dtype=sess.current_ids.dtype),
+                    cache_ids=torch.tensor([prev_pos], dtype=torch.int32),
+                )
+                logits_row = logits[0] if logits.dim() == 2 else logits
+            else:
+                logits_row = current_logits[0] if current_logits.dim() == 2 else current_logits
             p = float(torch.softmax(logits_row, dim=-1)[tok].item())
             probs.append(p)
 
-            # 2) advance cache by consuming tok
-            _, _ = self.model.forward(
+            # 2) advance cache by consuming `tok` and capture logits for the
+            #    next position in one call
+            logits2, _ = self.model.forward(
                 input_ids=torch.tensor([[tok]], dtype=sess.current_ids.dtype),
                 cache_ids=torch.tensor([next_pos], dtype=torch.int32),
             )
+            current_logits = logits2[0] if logits2.dim() == 2 else logits2
             prev_token = tok
             prev_pos = next_pos
             next_pos += 1
-
+        sess.pending_logits = current_logits.clone()
         # --- restore snapshot ---
         self.model.cache_ids = orig_cache.clone()
         if hasattr(self.model, "_next_pos"):
@@ -279,11 +286,11 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
                 for t in accepted:
                     sess.current_ids = torch.cat([sess.current_ids, torch.tensor([[t]], dtype=sess.current_ids.dtype)], dim=1)
                     self._sync_kv_pointer(sess)
-                    _, new_cache = self.model.forward(
+                    logits_row, _ = self.model.forward(
                         input_ids=torch.tensor([[t]], dtype=sess.current_ids.dtype),
-                        cache_ids=self.model.cache_ids,
+                        cache_ids=torch.tensor([self.model._next_pos], dtype=torch.int32),
                     )
-                    # sess.cache_ids = new_cache.clone()
+                    sess.pending_logits = logits_row.clone()
                     sess.cache_ids = torch.tensor([self.model._next_pos], dtype=torch.int32)
                     if self.eos_token_id is not None and t == self.eos_token_id:
                         sess.finished = True
@@ -327,6 +334,7 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
             cache_ids=self.model.cache_ids,
         )
         logits_row = logits[0] if logits.dim() == 2 else logits
+        sess.pending_logits = logits_row.clone()      # <── add this
         logits_row = logits_row / max(temperature, 1e-6)
 
         # 2) nucleus / top‑p filter
