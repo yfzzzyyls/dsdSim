@@ -98,8 +98,8 @@ def speculative_decode(
             choice_index = torch.multinomial(top_probs, 1).item()
             next_token = torch.tensor([top_indices[choice_index]])
             token_id = int(next_token.item())
-            # Probability under the **top‑p renormalised** distribution
-            token_prob = float(top_probs[choice_index].item())
+            # Probability under the **full soft‑max** (matches p_target)
+            token_prob = float(probs[next_token].item()) if probs.dim() == 1 else float(probs[0, next_token].item())
             # ---- End numeric stability patch ----
             speculative_tokens.append(token_id)
             speculative_probs.append(token_prob)

@@ -296,10 +296,18 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
                     sess.cache_ids = torch.tensor([self.model._next_pos], dtype=torch.int32)
                     if self.eos_token_id is not None and t == self.eos_token_id:
                         sess.finished = True
-                # if partial acceptance:
-                fallback_token = 0
-                if accepted_count < draft_chunk_size:
-                    fallback_token = self._generate_one_token(sess)
+            # Decide whether to generate a token from the target model
+            #  • partial acceptance (accepted_count < draft_chunk_size)
+            #      → generate fallback at the rejection point
+            #  • full acceptance (accepted_count == draft_chunk_size)
+            #      → STILL generate one extra token so distribution
+            #        matches target‑only decoding.
+            if accepted_count < draft_chunk_size:
+                # Rejected inside the chunk → fallback token
+                fallback_token = self._generate_one_token(sess)
+            else:
+                # All draft tokens accepted → advance with one target token
+                fallback_token = self._generate_one_token(sess)
                 sess.last_draft_chunk = None
                 if fallback_token != 0 and self.eos_token_id is not None and fallback_token == self.eos_token_id:
                     sess.finished = True
