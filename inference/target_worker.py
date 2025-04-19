@@ -21,8 +21,26 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
         self.model = model_loader.load_model(model_path, sequence_length=sequence_length)
         self.tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=False)
         self.eos_token_id = self.tokenizer.eos_token_id
+        self._ctx_estimate = 64
         self.sessions = {}  # session_id -> TargetSession
         self.lock = torch.multiprocessing.Lock()
+
+    def _pad_ids(self, ids: torch.Tensor) -> torch.Tensor:
+        """
+        Pad a 1×n tensor `ids` with the tokenizer pad_token_id (or 0) so that
+        len(ids) >= self._ctx_estimate.  Returns the padded tensor.
+        """
+        cur_len = ids.size(1)
+        if cur_len >= self._ctx_estimate:
+            return ids
+        pad_id = (
+            self.tokenizer.pad_token_id
+            if self.tokenizer.pad_token_id is not None
+            else 0
+        )
+        pad_len = self._ctx_estimate - cur_len
+        pad_tensor = torch.full((1, pad_len), pad_id, dtype=ids.dtype)
+        return torch.cat([ids, pad_tensor], dim=1)
 
     def StartGeneration(self, request, context):
         session_id = request.session_id
@@ -67,7 +85,12 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
                     continue
 
                 # Expand input_ids
-                expanded_ids = torch.cat([sess.current_ids, torch.tensor([draft_tokens], dtype=sess.current_ids.dtype)], dim=1)
+                # expanded_ids = torch.cat([sess.current_ids, torch.tensor([draft_tokens], dtype=sess.current_ids.dtype)], dim=1)
+                expanded_ids = torch.cat(
+                    [sess.current_ids, torch.tensor([draft_tokens], dtype=sess.current_ids.dtype)],
+                    dim=1,
+                )
+                expanded_ids = self._pad_ids(expanded_ids)
                 outputs = self.model(expanded_ids)
                 all_logits = _extract_logits_all(outputs)  # shape [1, expanded_len, vocab]
                 expanded_len = expanded_ids.size(1)
@@ -131,15 +154,19 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
     def _verify_single_step(self, sess, draft_tokens):
         # fallback approach, calls model per token
         probs = []
-        temp_ids = sess.current_ids.clone()
+        # temp_ids = sess.current_ids.clone()
+        temp_ids = self._pad_ids(sess.current_ids.clone())
         for t in draft_tokens:
             out = self.model(temp_ids)
             logits = _extract_logits(out)
             row_probs = torch.softmax(logits, dim=-1)
             p = float(row_probs[0, t].item())
             probs.append(p)
+            # appended_tok = torch.tensor([[t]], dtype=temp_ids.dtype)
+            # temp_ids = torch.cat([temp_ids, appended_tok], dim=1)
             appended_tok = torch.tensor([[t]], dtype=temp_ids.dtype)
             temp_ids = torch.cat([temp_ids, appended_tok], dim=1)
+            temp_ids = self._pad_ids(temp_ids)
         return probs
 
     # =============================
@@ -160,7 +187,12 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
                 return inference_pb2.VerifyResponse(target_probs=[], finished=True)
             if not draft_tokens:
                 return inference_pb2.VerifyResponse(target_probs=[], finished=False)
-            expanded_ids = torch.cat([sess.current_ids, torch.tensor([draft_tokens], dtype=sess.current_ids.dtype)], dim=1)
+            # expanded_ids = torch.cat([sess.current_ids, torch.tensor([draft_tokens], dtype=sess.current_ids.dtype)], dim=1)
+            expanded_ids = torch.cat(
+                [sess.current_ids, torch.tensor([draft_tokens], dtype=sess.current_ids.dtype)],
+                dim=1,
+            )
+            expanded_ids = self._pad_ids(expanded_ids)
             outputs = self.model(expanded_ids)
             all_logits = _extract_logits_all(outputs)
             expanded_len = expanded_ids.size(1)
@@ -223,7 +255,8 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
         return super().GenerateFull(request, context)
 
     def _generate_one_token(self, sess: TargetSession):
-        outputs = self.model(sess.current_ids)
+        # outputs = self.model(sess.current_ids)
+        outputs = self.model(self._pad_ids(sess.current_ids))
         logits = _extract_logits(outputs)
         token_id = int(torch.argmax(logits, dim=-1)[0].item())
         appended_tok = torch.tensor([[token_id]], dtype=sess.current_ids.dtype)
