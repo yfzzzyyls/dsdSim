@@ -282,7 +282,12 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
             input_ids=torch.tensor([[last_tok]], dtype=sess.current_ids.dtype),
             cache_ids=self.model.cache_ids,
         )
-        token_id = int(torch.argmax(logits, dim=-1)[0].item())
+        # logits may be 2‑D ([1, vocab]) or 1‑D ([vocab]); handle both
+        if logits.dim() == 2:
+            logits_row = logits[0]
+        else:
+            logits_row = logits
+        token_id = int(torch.argmax(logits_row, dim=-1).item())
         sess.cache_ids = new_cache.clone()
         appended_tok = torch.tensor([[token_id]], dtype=sess.current_ids.dtype)
         sess.current_ids = torch.cat([sess.current_ids, appended_tok], dim=1)
