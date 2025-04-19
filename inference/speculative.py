@@ -141,12 +141,14 @@ def speculative_decode(
                 break
 
         if break_point and accept_count < len(speculative_tokens):
-            # rollback token count
+            # rollback token count (only if we actually pushed tokens)
             unaccepted = len(speculative_tokens) - accept_count
-            while unaccepted > 0:
+            while unaccepted > 0 and output_tokens:
                 output_tokens.pop()
                 tokens_generated -= 1
                 unaccepted -= 1
+            # If nothing was in output_tokens, just correct tokens_generated
+            tokens_generated = max(tokens_generated, 0)
             # restore cache pointer to the last accepted state
             # Roll back draft model to last accepted token's cache state
             draft_model.cache_ids = past_states[accept_count]
