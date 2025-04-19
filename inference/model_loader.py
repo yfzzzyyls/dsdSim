@@ -84,7 +84,8 @@ class NeuronHFAdapterWrap(torch.nn.Module):
             pos_tensor = self._build_pos(0, L, B)
             if pos_tensor.ndim == 2 and pos_tensor.size(0) == 1 and pos_tensor.size(1) == 1:
                 pos_tensor = pos_tensor.squeeze(0)
-        self.cache_ids = pos_tensor if pos_tensor.ndim == 1 else pos_tensor.squeeze(0)
+        # self.cache_ids = pos_tensor if pos_tensor.ndim == 1 else pos_tensor.squeeze(0)
+        self.cache_ids = torch.tensor([self._next_pos], dtype=torch.int32)
 
         # ------------------------------------------------------------------
         # Unpack logits to 1‑D tensor

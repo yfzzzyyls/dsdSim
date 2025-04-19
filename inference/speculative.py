@@ -107,7 +107,8 @@ def speculative_decode(
             speculative_tokens.append(token_id)
             speculative_probs.append(token_prob)
             prev_token_id = token_id
-            past_states.append(new_cache)
+            # past_states.append(new_cache)
+            past_states.append(draft_model.cache_ids.clone())   # pointer to next slot
             # Stop if end-of-sequence or max_new_tokens reached
             if tokenizer.eos_token_id is not None and token_id == tokenizer.eos_token_id:
                 finished = True
@@ -185,8 +186,7 @@ def speculative_decode(
             # The unaccepted tokens were *not* appended to output_tokens,
             # so we should NOT pop anything here.  Simply rewind the draft
             # model’s KV pointer.
-            draft_model.cache_ids = past_states[accept_count]
-            # --- keep _next_pos consistent with the restored pointer ---
+            draft_model.cache_ids = past_states[accept_count].clone()
             if hasattr(draft_model, "_next_pos"):
                 draft_model._next_pos = int(draft_model.cache_ids.item())
             prev_token_id = output_tokens[-1] if output_tokens else prompt_ids[0, -1].item()
@@ -206,7 +206,8 @@ def speculative_decode(
                 _, new_cache = draft_model.forward(
                     input_ids=torch.tensor([[final_token_id]], dtype=torch.int64)
                 )
-                draft_model.cache_ids = new_cache.clone()
+                # draft_model.cache_ids = new_cache.clone()
+                draft_model.cache_ids = torch.tensor([draft_model._next_pos], dtype=torch.int32)
                 prev_token_id = final_token_id
                 output_tokens.append(final_token_id)
                 tokens_generated += 1
@@ -221,7 +222,8 @@ def speculative_decode(
                 _, new_cache = draft_model.forward(
                     input_ids=torch.tensor([[final_token_id]], dtype=torch.int64)
                 )
-                draft_model.cache_ids = new_cache.clone()
+                # draft_model.cache_ids = new_cache.clone()
+                draft_model.cache_ids = torch.tensor([draft_model._next_pos], dtype=torch.int32)
                 prev_token_id = final_token_id
 
         if finalize_finished or tokens_generated >= max_new_tokens:

@@ -24,6 +24,7 @@ class TargetSession:
         self.last_draft_chunk = None
         # pointer to the *next* KV slot
         self.cache_ids = torch.tensor([input_ids.shape[1]], dtype=torch.int32)
+        self.pending_logits = None
 
 class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
     def __init__(self, model_path, sequence_length=128, spec_length=None):
@@ -186,51 +187,46 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
     
     def _verify_single_step(self, sess: TargetSession, draft_tokens):
         """
-        Sequentially verify each draft token d₁…dₖ.
-
-        For each token dᵢ we:
-          1. Feed the previous token (context’s last token) to get logits for
-             the *next* position and read P_target(dᵢ).
-          2. Feed dᵢ itself to advance the KV cache, so the context for dᵢ₊₁
-             is correct.
-
-        The session KV pointer is snapshotted and fully restored at the end,
-        so verification never mutates session state.
+        Compute P_target(dᵢ | context) for every draft token d₁…dₖ without
+        mutating the permanent session cache.  We assume sess.cache_ids holds
+        the *next‑free KV slot* (pointer).  After verification we restore it.
         """
-        # --- snapshot current pointer ---
+        # --- snapshot pointer ---
         orig_cache = sess.cache_ids.clone()
         orig_next_pos = int(orig_cache.item())
 
         probs = []
-        prev_token = int(sess.current_ids[0, -1].item())      # last context token
+        next_pos = orig_next_pos                    # first draft token position
+        prev_token = int(sess.current_ids[0, -1].item())
+        prev_pos = next_pos - 1                     # position of prev_token
 
-        # align model pointer with session
+        # make model pointer align with session
         self._sync_kv_pointer(sess)
 
         for tok in draft_tokens:
-            # 1) probability of `tok`
-            logits, cache_after_prev = self.model.forward(
+            # 1) probability of tok
+            logits, _ = self.model.forward(
                 input_ids=torch.tensor([[prev_token]], dtype=sess.current_ids.dtype),
-                cache_ids=self.model.cache_ids,
+                cache_ids=torch.tensor([prev_pos], dtype=torch.int32),
             )
             logits_row = logits[0] if logits.dim() == 2 else logits
             p = float(torch.softmax(logits_row, dim=-1)[tok].item())
             probs.append(p)
 
-            # 2) advance cache by actually consuming `tok`
-            _, cache_after_tok = self.model.forward(
+            # 2) advance cache by consuming tok
+            _, _ = self.model.forward(
                 input_ids=torch.tensor([[tok]], dtype=sess.current_ids.dtype),
-                cache_ids=cache_after_prev.clone(),
+                cache_ids=torch.tensor([next_pos], dtype=torch.int32),
             )
-            self.model.cache_ids = cache_after_tok.clone()
             prev_token = tok
+            prev_pos = next_pos
+            next_pos += 1
 
-        # --- restore pointer ---
+        # --- restore snapshot ---
         self.model.cache_ids = orig_cache.clone()
         if hasattr(self.model, "_next_pos"):
             self.model._next_pos = orig_next_pos
         sess.cache_ids = orig_cache
-
         return probs
 
     # =============================
@@ -287,7 +283,8 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
                         input_ids=torch.tensor([[t]], dtype=sess.current_ids.dtype),
                         cache_ids=self.model.cache_ids,
                     )
-                    sess.cache_ids = new_cache.clone()
+                    # sess.cache_ids = new_cache.clone()
+                    sess.cache_ids = torch.tensor([self.model._next_pos], dtype=torch.int32)
                     if self.eos_token_id is not None and t == self.eos_token_id:
                         sess.finished = True
                 # if partial acceptance:
@@ -348,9 +345,10 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
         # 4) advance cache with the sampled token
         _, new_cache2 = self.model.forward(
             input_ids=torch.tensor([[token_id]], dtype=sess.current_ids.dtype),
-            cache_ids=new_cache.clone(),
+            cache_ids=torch.tensor([self.model._next_pos], dtype=torch.int32)
         )
-        sess.cache_ids = new_cache2.clone()
+        # sess.cache_ids = new_cache2.clone()
+        sess.cache_ids = torch.tensor([self.model._next_pos], dtype=torch.int32)
 
         # 5) append token to context & handle EOS
         sess.current_ids = torch.cat(
