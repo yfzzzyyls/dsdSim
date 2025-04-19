@@ -14,8 +14,6 @@ from transformers_neuronx.fused_speculation import FusedSpeculativeDecoder
 # fsd = FusedSpeculativeDecoder(draft_model, target_model, spec_length)
 # fsd.to_neuron()  # Compile the fused speculative model
 
-
-
 logger = logging.getLogger(__name__)
 
 class NeuronHFAdapterWrap(torch.nn.Module):
@@ -27,50 +25,76 @@ class NeuronHFAdapterWrap(torch.nn.Module):
         super().__init__()
         self.adapter = adapter
         self.cache_ids = None  # Initialize KV cache pointer storage
+        self._next_pos = 0  # next position index in the KV cache
         self.config = adapter.config
+
+    # ------------------------------------------------------------------  
+    # helper: build a (batch, length) int32 tensor [start, …, start+L‑1]  
+    # ------------------------------------------------------------------
+    def _build_pos(self, start: int, length: int, batch: int = 1):
+        return (torch.arange(start, start + length, dtype=torch.int32)
+                       .unsqueeze(0)            # -> (1, L)
+                       .repeat(batch, 1))       # -> (B, L)
 
     def forward(self, input_ids, cache_ids=None, **kwargs):
         """
-        Runs a forward pass on the Neuron-compiled draft model with KV cache reuse.
-        Accepts a cache_ids pointer to reuse past KV state, and returns logits and new cache_id.
+        Neuron draft forward with explicit per‑call KV‑cache positions.
+        We maintain a cursor `_next_pos` so each incremental step passes
+        ONLY the positions of the *new* tokens.  This avoids the
+        “Tensor with N elements cannot be converted to Scalar” error.
         """
-        # Use provided cache_ids or fall back to stored state
+        B, L = input_ids.shape  # batch, new‑token count
+
+        # ------------------------------------------------------------------
+        # Decide which position tensor to pass for these L new tokens
+        # ------------------------------------------------------------------
         if cache_ids is None:
-            cache_ids = self.cache_ids
-        logger.info(f"forward() called with cache_ids={cache_ids}")
-        # Always pass cache_ids to the underlying adapter (it requires the argument)
-        out = self.adapter(input_ids=input_ids, cache_ids=cache_ids, return_dict=False)
-        # Unpack logits and new_cache
+            if self._next_pos == 0:
+                # First (prompt‑priming) call – let Neuron allocate 0…L‑1
+                pos_tensor = None                    # Neuron fills it
+                next_pos_after = L
+            else:
+                # Incremental call – build positions [_next_pos, …]
+                pos_tensor = self._build_pos(self._next_pos, L, B)
+                next_pos_after = self._next_pos + L
+        else:
+            # Caller supplied explicit positions (e.g. during rollback)
+            pos_tensor = cache_ids
+            next_pos_after = int(cache_ids.max().item()) + 1
+
+        # ------------------------------------------------------------------
+        # Run Neuron adapter
+        # ------------------------------------------------------------------
+        out = self.adapter(input_ids=input_ids,
+                           cache_ids=pos_tensor,
+                           return_dict=False,
+                           **kwargs)
+
+        # ------------------------------------------------------------------
+        # Update internal cursor & cache pointer
+        # ------------------------------------------------------------------
+        self._next_pos = next_pos_after
+        if pos_tensor is None:
+            # Reconstruct positions 0…L‑1 for the prompt stage
+            pos_tensor = self._build_pos(0, L, B)
+        self.cache_ids = pos_tensor          # expose pointer to caller
+
+        # ------------------------------------------------------------------
+        # Unpack logits to 1‑D tensor
+        # ------------------------------------------------------------------
         if isinstance(out, (tuple, list)):
-            logits, new_cache = out[0], (out[1] if len(out) > 1 else None)
+            logits = out[0]
         else:
             logits = out.logits if hasattr(out, "logits") else out
-            new_cache = getattr(out, "cache_ids", None) or getattr(out, "past_key_values", None)
-        # Normalize logits to 1D for sampling
-        if hasattr(logits, "dim"):
-            if logits.dim() == 3:
-                logits = logits[0, -1, :]
-            elif logits.dim() == 2:
-                logits = logits[0]
+
+        if logits.dim() == 3:
+            logits = logits[0, -1, :]
+        elif logits.dim() == 2:
+            logits = logits[0]
         while isinstance(logits, (tuple, list)):
             logits = logits[0]
-        # If adapter did not return a new_cache, compute it based on token positions
-        if new_cache is None:
-            # Determine starting index for new tokens
-            if cache_ids is None:
-                start_idx = 0
-            elif isinstance(cache_ids, torch.Tensor):
-                start_idx = int(cache_ids.max().item()) + 1
-            else:
-                start_idx = int(cache_ids) + 1
-            seq_len = input_ids.shape[-1]
-            new_cache = torch.arange(start_idx, start_idx + seq_len, dtype=torch.int32)
-            if input_ids.dim() == 2:
-                new_cache = new_cache.unsqueeze(0)
-        # Store the updated cache state
-        self.cache_ids = new_cache
-        logger.info(f"adapter returned new_cache={new_cache}")
-        return logits, new_cache
+
+        return logits, pos_tensor
 
 # Default sequence length (can be overridden by function arguments)
 DEFAULT_SEQUENCE_LENGTH = 128

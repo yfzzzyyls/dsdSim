@@ -26,6 +26,7 @@ def speculative_decode(
     # Initial setup: process prompt through draft model to initialize cache
     output_tokens = []
     draft_model.cache_ids = None
+    draft_model._next_pos = 0  # next position index in the KV cache
     prompt_ids = tokenizer(prompt, return_tensors='pt').input_ids
     prev_token_id = int(prompt_ids[0, -1].item()) if prompt_ids.shape[-1] > 0 else tokenizer.bos_token_id
     # Feed the entire prompt once so the draft model builds its KV cache

@@ -1,6 +1,3 @@
-# ==========================
-# 4) draft_worker.py
-# ==========================
 import logging
 import grpc
 import os
