@@ -187,57 +187,64 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
     
     def _verify_single_step(self, sess: TargetSession, draft_tokens):
         """
-        Compute P_target(dᵢ | context) for every draft token d₁…dₖ without
-        mutating the permanent session cache.  We assume sess.cache_ids holds
-        the *next‑free KV slot* (pointer).  After verification we restore it.
+        Compute p_target(d₁…dₖ | context) **without mutating** permanent state.
+
+        We assume:
+          • sess.cache_ids holds the *next‑free* KV slot index.
+          • sess.pending_logits (if not None) already contains logits for the
+            next position (temperature‑scaled).
+
+        Returns
+        -------
+        probs : List[float] ‑ probability for each draft token under the
+                target model’s *temperature‑scaled* soft‑max.
         """
-        # --- snapshot pointer ---
-        current_logits = sess.pending_logits
-        sess.pending_logits = None  # consume cached logits
-        orig_cache = sess.cache_ids.clone()
-        orig_next_pos = int(orig_cache.item())
+        # ---------- snapshot current pointer & logits ----------
+        orig_cache   = sess.cache_ids.clone()
+        orig_nextpos = int(orig_cache.item())
+        logits_next  = sess.pending_logits            # may be None
+        sess.pending_logits = None                    # consume
 
         probs = []
-        next_pos = orig_next_pos                    # first draft token position
-        prev_token = int(sess.current_ids[0, -1].item())
-        prev_pos = next_pos - 1                     # position of prev_token
+        prev_tok  = int(sess.current_ids[0, -1])
+        prev_pos  = orig_nextpos - 1                  # position of prev_tok
+        next_pos  = orig_nextpos                      # where d₁ will go
 
-        # make model pointer align with session
-        self._sync_kv_pointer(sess)
+        self._sync_kv_pointer(sess)                   # align model→session
 
         for tok in draft_tokens:
-            # 1) probability of tok
-            if current_logits is None:
-                logits, _ = self.model.forward(
-                    input_ids=torch.tensor([[prev_token]], dtype=sess.current_ids.dtype),
+            # --- P_target(tok | context) ---
+            if logits_next is None:
+                lgts, _ = self.model.forward(
+                    input_ids=torch.tensor([[prev_tok]], dtype=sess.current_ids.dtype),
                     cache_ids=torch.tensor([prev_pos], dtype=torch.int32),
                 )
-                logits_row = logits[0] if logits.dim() == 2 else logits
+                logits_row = lgts[0] if lgts.dim() == 2 else lgts
             else:
-                logits_row = current_logits[0] if current_logits.dim() == 2 else current_logits
-            # ----- full soft‑max probability of `tok` -----
-            probs_row = torch.softmax(logits_row, dim=-1)
-            p = float(probs_row[tok].item())
+                logits_row = logits_next[0] if logits_next.dim() == 2 else logits_next
+
+            logits_row = logits_row / max(1.0, 1e-6)          # temperature (T=1)
+            p = float(torch.softmax(logits_row, dim=-1)[tok].item())
             probs.append(p)
 
-            # 2) advance cache by consuming `tok` and capture logits for the
-            #    next position in one call
-            logits2, _ = self.model.forward(
+            # --- advance cache by *consuming* tok, capture logits for next ---
+            lgts2, _ = self.model.forward(
                 input_ids=torch.tensor([[tok]], dtype=sess.current_ids.dtype),
                 cache_ids=torch.tensor([next_pos], dtype=torch.int32),
             )
-            current_logits = logits2[0] if logits2.dim() == 2 else logits2
-            prev_token = tok
+            logits_next = lgts2[0] if lgts2.dim() == 2 else lgts2
+            prev_tok = tok
             prev_pos = next_pos
             next_pos += 1
-        sess.pending_logits = current_logits.clone()
-        # --- restore snapshot ---
+
+        sess.pending_logits = logits_next.clone()     # reuse next time
+
+        # ---------- restore snapshot ----------
         self.model.cache_ids = orig_cache.clone()
         if hasattr(self.model, "_next_pos"):
-            self.model._next_pos = orig_next_pos
+            self.model._next_pos = orig_nextpos
         sess.cache_ids = orig_cache
         return probs
-
     # =============================
     # SINGLE-SEQUENCE calls
     # =============================
@@ -268,11 +275,12 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
             return inference_pb2.VerifyResponse(target_probs=target_probs, finished=False)
 
     def FinalizeTokens(self, request, context):
-        sid = request.session_id
-        accepted_count = request.accepted_count
+        sid              = request.session_id
+        accepted_count   = request.accepted_count
         draft_chunk_size = request.draft_chunk_size
 
         with self.lock:
+            # ---------- session checks ----------
             if sid not in self.sessions:
                 logger.warning(f"Session {sid} not found.")
                 return inference_pb2.FinalizeResponse(final_token=0, finished=True)
@@ -281,39 +289,33 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
             if sess.finished:
                 return inference_pb2.FinalizeResponse(final_token=0, finished=True)
 
-            # ------------------------------------------------------------
-            # Handle the last draft chunk (if any)
-            # ------------------------------------------------------------
-            if sess.last_draft_chunk is not None:
-                chunk = sess.last_draft_chunk
-                accepted = chunk[:accepted_count]
+            # ---------- retrieve last draft chunk ----------
+            chunk = sess.last_draft_chunk or []
+            accepted = chunk[:accepted_count]
 
-                # 1) Commit accepted tokens
-                for t in accepted:
-                    sess.current_ids = torch.cat(
-                        [sess.current_ids,
-                         torch.tensor([[t]], dtype=sess.current_ids.dtype)],
-                        dim=1)
-                    self._sync_kv_pointer(sess)
-                    logits_row, _ = self.model.forward(
-                        input_ids=torch.tensor([[t]], dtype=sess.current_ids.dtype),
-                        cache_ids=torch.tensor([self.model._next_pos], dtype=torch.int32),
-                    )
-                    sess.pending_logits = logits_row.clone()
-                    sess.cache_ids = torch.tensor([self.model._next_pos], dtype=torch.int32)
-                    if self.eos_token_id is not None and t == self.eos_token_id:
-                        sess.finished = True
+            # ---------- 1) commit accepted tokens ----------
+            for t in accepted:
+                sess.current_ids = torch.cat(
+                    [sess.current_ids,
+                     torch.tensor([[t]], dtype=sess.current_ids.dtype)],
+                    dim=1)
+                self._sync_kv_pointer(sess)
+                lgts, _ = self.model.forward(
+                    input_ids=torch.tensor([[t]], dtype=sess.current_ids.dtype),
+                    cache_ids=torch.tensor([self.model._next_pos], dtype=torch.int32),
+                )
+                sess.pending_logits = lgts[0] if lgts.dim()==2 else lgts
+                sess.cache_ids = torch.tensor([self.model._next_pos], dtype=torch.int32)
+                if self.eos_token_id is not None and t == self.eos_token_id:
+                    sess.finished = True
 
-                # 2) Always generate one token from the target model
-                #    – fallback if partial accept, extra token if full accept
-                fallback_token = self._generate_one_token(sess)
-                sess.last_draft_chunk = None  # reset for next round
+            # ---------- 2) always generate ONE token from target ----------
+            fallback_token = self._generate_one_token(sess)
 
-            else:
-                # No draft chunk stored: just generate one token
-                fallback_token = self._generate_one_token(sess)
+            # clear chunk for next round
+            sess.last_draft_chunk = None
 
-            # EOS handling
+            # ---------- EOS handling ----------
             if (
                 fallback_token != 0
                 and self.eos_token_id is not None

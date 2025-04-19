@@ -75,34 +75,28 @@ def speculative_decode(
             input_ids = torch.tensor([[prev_token_id]], dtype=torch.int64)
             logits, new_cache = draft_model.forward(input_ids=input_ids)
             # ---- Our improved numeric stability start ----
+            # Temperature‑scale logits then apply classic nucleus (top‑p) filter
             logits = logits / temperature
-            logits = torch.clamp(logits, min=-1e10, max=1e10)
             probs = torch.softmax(logits, dim=-1)
-            if not torch.isfinite(probs).all():
-                probs = torch.ones_like(probs)
-                probs /= probs.sum()
-            sorted_probs, sorted_indices = torch.sort(probs, descending=True)
-            cumulative_probs = torch.cumsum(sorted_probs, dim=0)
-            if torch.any(cumulative_probs >= top_p):
-                cutoff_index = torch.where(cumulative_probs >= top_p)[0][0].item()
-            else:
-                cutoff_index = len(sorted_probs) - 1
-            top_probs = sorted_probs[:cutoff_index+1]
-            top_indices = sorted_indices[:cutoff_index+1]
-            top_sum = top_probs.sum()
-            if not torch.isfinite(top_sum) or top_sum <= 1e-9:
-                top_probs = torch.ones_like(top_probs)
-                top_sum = top_probs.sum()
-            top_probs = top_probs / top_sum
-            top_probs = torch.clamp(top_probs, min=0.0, max=1.0)
-            choice_index = torch.multinomial(top_probs, 1).item()
-            next_token = torch.tensor([top_indices[choice_index]])
-            token_id = int(next_token.item())
-            # Probability under the **full soft‑max** (matches p_target)
-            token_prob = float(probs[next_token].item()) if probs.dim() == 1 else float(probs[0, next_token].item())
+ 
+            # nucleus filter
+            sorted_p, sorted_idx = torch.sort(probs, descending=True)
+            cum_p = torch.cumsum(sorted_p, dim=0)
+            cut_idx = torch.where(cum_p >= top_p)[0][0].item()
+            nucleus_idx = sorted_idx[:cut_idx + 1]
+            nucleus_probs = sorted_p[:cut_idx + 1]
+            nucleus_probs = nucleus_probs / nucleus_probs.sum()
+ 
+            # sample a token from the renormalised nucleus
+            sample_idx = torch.multinomial(nucleus_probs, 1).item()
+            token_id = int(nucleus_idx[sample_idx].item())
+ 
+            # Probability of token_id under the **full** soft‑max (p_draft)
+            token_prob = float(probs[0, token_id].item())
             # ---- End numeric stability patch ----
             speculative_tokens.append(token_id)
             speculative_probs.append(token_prob)
+            
             prev_token_id = token_id
             # past_states.append(new_cache)
             past_states.append(draft_model.cache_ids.clone())   # pointer to next slot
