@@ -23,6 +23,10 @@ def speculative_decode(
     with full rollback of the draft model's past states.
     Extended to handle a session_id so multiple prompts can run concurrently on the server.
     """
+    logger.info(
+        f"[session={session_id}] Starting speculative_decode: "
+        f"prompt='{prompt[:60]}...' max_new_tokens={max_new_tokens} gamma={gamma}"
+    )
     # Initial setup: process prompt through draft model to initialize cache
     output_tokens = []
     draft_model.cache_ids = None
@@ -54,6 +58,10 @@ def speculative_decode(
         # The draft model proposes up to 'gamma' tokens
         speculative_tokens = []
         speculative_probs = []
+        logger.info(
+            f"[session={session_id}] Entering speculative inner loop: "
+            f"tokens_generated={tokens_generated}"
+        )
         past_states = [draft_model.cache_ids]
         for _ in range(gamma):
             # Prepare a 2‑D input_ids tensor [[token_id]]
@@ -83,7 +91,11 @@ def speculative_decode(
             choice_index = torch.multinomial(top_probs, 1).item()
             next_token = torch.tensor([top_indices[choice_index]])
             token_id = int(next_token.item())
-            token_prob = float(top_probs[choice_index].item())
+            # True draft probability under the *full* softmax (not the renormalized top‑p)
+            if probs.dim() == 2:
+                token_prob = float(probs[0, token_id].item())
+            else:
+                token_prob = float(probs[token_id].item())
             # ---- End numeric stability patch ----
             speculative_tokens.append(token_id)
             speculative_probs.append(token_prob)
@@ -95,7 +107,10 @@ def speculative_decode(
                 break
             if tokens_generated + len(speculative_tokens) >= max_new_tokens:
                 break
-        tokens_generated += len(speculative_tokens)
+ 
+        logger.info(
+            f"[session={session_id}] Proposed tokens: {speculative_tokens}"
+        )
 
         # If overshoot
         if len(speculative_tokens) > 0 and tokens_generated > max_new_tokens:
@@ -112,6 +127,9 @@ def speculative_decode(
         # 8) Verify tokens with target model
         target_probs, target_finished = grpc_client.verify_draft_tokens(
             stub, speculative_tokens, session_id=session_id
+        )
+        logger.info(
+            f"[session={session_id}] Target probs len={len(target_probs)}, finished={target_finished}"
         )
         if target_finished and len(target_probs) < len(speculative_tokens):
             # partial consumption => treat rest as rejected
@@ -139,20 +157,35 @@ def speculative_decode(
             else:
                 break_point = True
                 break
+        logger.info(
+            f"[session={session_id}] accept_count={accept_count} break_point={break_point}"
+        )
+
+        # ----------------------------------------------------------
+        # After accept/reject: commit accepted draft tokens
+        # ----------------------------------------------------------
+        if accept_count > 0:
+            output_tokens.extend(speculative_tokens[:accept_count])
+            tokens_generated += accept_count
+            # advance prev_token_id so the next chunk starts correctly
+            prev_token_id = speculative_tokens[accept_count - 1]
+            logger.info(
+                f"[session={session_id}] Committed tokens → "
+                f"tokens_generated={tokens_generated} prev_token_id={prev_token_id}"
+            )
 
         if break_point and accept_count < len(speculative_tokens):
             # rollback token count (only if we actually pushed tokens)
             unaccepted = len(speculative_tokens) - accept_count
             while unaccepted > 0 and output_tokens:
                 output_tokens.pop()
-                tokens_generated -= 1
                 unaccepted -= 1
             # If nothing was in output_tokens, just correct tokens_generated
             tokens_generated = max(tokens_generated, 0)
             # restore cache pointer to the last accepted state
             # Roll back draft model to last accepted token's cache state
             draft_model.cache_ids = past_states[accept_count]
-            logger.info(f"[rollback] restored cache_ids = {draft_model.cache_ids}")
+            logger.info(f"[session={session_id}] Rollback: unaccepted={len(speculative_tokens) - accept_count}, cache_ids_restored={draft_model.cache_ids.tolist()}")
             # trim any saved pointers beyond this point
             past_states = past_states[:accept_count+1]
 
@@ -160,11 +193,18 @@ def speculative_decode(
             stub, accept_count, len(speculative_tokens), session_id=session_id
         )
         if final_token_id != 0:
-            _ = draft_model.forward(input_ids=torch.tensor([[final_token_id]], dtype=torch.int64),
-                                   cache_ids=draft_model.cache_ids)
+            _, new_cache = draft_model.forward(
+                input_ids=torch.tensor([[final_token_id]], dtype=torch.int64),
+                cache_ids=draft_model.cache_ids
+            )
+            draft_model.cache_ids = new_cache.clone()
+            prev_token_id = final_token_id  # update for next iteration
             output_tokens.append(final_token_id)
             tokens_generated += 1
             target_tokens_total += 1
+            logger.info(
+                f"[session={session_id}] Fallback token committed: {final_token_id}"
+            )
             if tokenizer.eos_token_id is not None and final_token_id == tokenizer.eos_token_id:
                 finished = True
 
@@ -193,4 +233,7 @@ def speculative_decode(
         logger.info(f"Speculative decoding match rate: {match_rate:.2%} (Draft accepted: {accepted_tokens_total}, Target generated: {target_tokens_total})")
         perf_stats["token_match_rate"] = match_rate
 
+    logger.info(
+        f"[session={session_id}] Finished: generated_text='{generated_text[:120]}...'"
+    )
     return generated_text, perf_stats
