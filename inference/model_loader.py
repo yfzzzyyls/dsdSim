@@ -140,7 +140,9 @@ def compile_model(model_path: str, sequence_length: int = DEFAULT_SEQUENCE_LENGT
     if model_type.lower() == "llama" or "llama" in model_path.lower():
         logger.info(f"Compiling model using optimized LLaMA for Neuron ...")
         model = LlamaForSampling.from_pretrained(model_path, batch_size=1, amp='bf16',
-                                                 n_positions=sequence_length, tp_degree=tp_degree)
+                                                 n_positions=sequence_length, 
+                                                 context_length_estimate=sequence_length,
+                                                 tp_degree=tp_degree)
         # Compile so the Neuron graph returns (logits, cache_id)
         model.enable_speculative_decoder(4)
         model.to_neuron()
