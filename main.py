@@ -72,7 +72,7 @@ def main():
             # Batch mode: multiple prompts from file, each in a separate gRPC session
             from inference import draft_worker
             draft_model = load_model(
-                draft_model_name,
+                draft_model,
                 sequence_length=args.sequence_length,
                 spec_length=args.gamma
             )
