@@ -22,6 +22,7 @@ class TargetSession:
         self.finished = False
         self.tokens_generated = 0
         self.verification_time = 0.0   # cumulative time spent verifying draft tokens (seconds)
+        self.finalize_calls    = 0     # count of FinalizeTokens invocations
         self.last_draft_chunk = None
         # pointer to the *next* KV slot
         self.cache_ids = torch.tensor([input_ids.shape[1]], dtype=torch.int32)
@@ -333,7 +334,7 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
                 temperature=self.temperature,
                 top_p=self.top_p,
             )
-            sess.verification_time += time.perf_counter() - start_t   # add +1 timing
+            
 
             # clear chunk for next round
             sess.last_draft_chunk = None
@@ -349,6 +350,14 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
             if sess.finished:
                 logger.info("[session=%s] total verification latency: %.3f s",
                             sid, sess.verification_time)
+
+            # ---------- periodic verification‑time log ----------
+            sess.finalize_calls += 1
+            if sess.finished or sess.finalize_calls % 16 == 0:
+                logger.info(
+                    "[session=%s] cumulative verification latency: %.3f s  calls=%d",
+                    sid, sess.verification_time, sess.finalize_calls
+                )
 
             token_text = self.tokenizer.decode([fallback_token]).strip() if fallback_token != 0 else "<none>"
             logger.debug(f"[Finalize] returning token_id={fallback_token} ‹{token_text}› to draft model")
