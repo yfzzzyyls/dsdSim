@@ -24,6 +24,15 @@ def save_perf_stats(perf_stats: dict, file_prefix: str):
     csv_path  = f"{file_prefix}.csv"
     json_path = f"{file_prefix}.json"
     try:
+        total_time_val = perf_stats.get("total_time", 0.0)
+        
+        def fmt(t):
+            if total_time_val > 0:
+                pct = (t / total_time_val) * 100.0
+                return f"{pct:.1f}%({t:.3f})"
+            else:
+                return f"0.0%({t:.3f})"
+        
         # Append CSV row; write header if file does not exist
         header = ["total_time", "tokens_generated", "tokens_per_second",
                   "avg_token_time", "token_match_rate",
@@ -35,15 +44,15 @@ def save_perf_stats(perf_stats: dict, file_prefix: str):
             if write_header:
                 cf.write(",".join(header) + "\n")
             row = [
-                perf_stats.get("total_time", ""),
+                f"{total_time_val:.3f}",
                 perf_stats.get("tokens_generated", ""),
-                perf_stats.get("throughput", ""),  # throughput == tokens_per_second
+                perf_stats.get("throughput", ""),
                 perf_stats.get("avg_token_time", ""),
                 perf_stats.get("token_match_rate", ""),
-                perf_stats.get("draft_forward_time", ""),
-                perf_stats.get("grpc_server_time", ""),
-                perf_stats.get("target_verification_time", ""),
-                perf_stats.get("rollback_time", ""),
+                fmt(perf_stats.get("draft_forward_time", 0.0)),
+                fmt(perf_stats.get("grpc_server_time", 0.0)),
+                fmt(perf_stats.get("target_verification_time", 0.0)),
+                fmt(perf_stats.get("rollback_time", 0.0)),
             ]
             cf.write(",".join(str(x) for x in row) + "\n")
 
