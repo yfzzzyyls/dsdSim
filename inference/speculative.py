@@ -30,7 +30,7 @@ def speculative_decode(
     with full rollback of the draft model's past states.
     Extended to handle a session_id so multiple prompts can run concurrently on the server.
     """
-    logger.info(
+    logger.debug(
         f"[session={session_id}] Starting speculative_decode: "
         f"prompt='{prompt[:60]}...' max_new_tokens={max_new_tokens} gamma={gamma}"
     )
@@ -242,7 +242,7 @@ def speculative_decode(
         logger.info(f"Speculative decoding match rate: {match_rate:.2%} (Draft accepted: {accepted_tokens_total}, Target generated: {target_tokens_total})")
         perf_stats["token_match_rate"] = match_rate
 
-    logger.info(
+    logger.debug(
         f"[session={session_id}] Finished: generated_text='{generated_text[:120]}...'"
     )
     # Make these counters available to callers even when profiling is off
