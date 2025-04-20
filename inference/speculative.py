@@ -65,7 +65,7 @@ def speculative_decode(
         # The draft model proposes up to 'gamma' tokens
         speculative_tokens = []
         speculative_probs = []
-        logger.info(
+        logger.debug(
             f"[session={session_id}] Entering speculative inner loop: "
             f"tokens_generated={tokens_generated}"
         )
@@ -115,7 +115,7 @@ def speculative_decode(
             if tokens_generated + len(speculative_tokens) >= max_new_tokens:
                 break
  
-        logger.info(
+        logger.debug(
             f"[session={session_id}] Proposed tokens: {speculative_tokens}"
         )
 
@@ -135,7 +135,7 @@ def speculative_decode(
         target_probs, target_finished = grpc_client.verify_draft_tokens(
             stub, speculative_tokens, session_id=session_id
         )
-        logger.info(
+        logger.debug(
             f"[session={session_id}] Target probs len={len(target_probs)}, finished={target_finished}"
         )
         if target_finished and len(target_probs) < len(speculative_tokens):
@@ -164,7 +164,7 @@ def speculative_decode(
             else:
                 break_point = True
                 break
-        logger.info(
+        logger.debug(
             f"[session={session_id}] accept_count={accept_count} break_point={break_point}"
         )
 
@@ -192,7 +192,7 @@ def speculative_decode(
             assert int(draft_model.cache_ids.item()) == draft_model._next_pos, \
                 "Draft KV pointer mismatch after rollback"
             prev_token_id = output_tokens[-1] if output_tokens else prompt_ids[0, -1].item()
-            logger.info(f"[session={session_id}] Rollback: unaccepted={len(speculative_tokens) - accept_count}, cache_ids_restored={draft_model.cache_ids.tolist()}")
+            logger.debug(f"[session={session_id}] Rollback: unaccepted={len(speculative_tokens) - accept_count}, cache_ids_restored={draft_model.cache_ids.tolist()}")
             past_states = past_states[:accept_count+1]
 
         final_token_id, finalize_finished = grpc_client.finalize_tokens(
@@ -211,7 +211,7 @@ def speculative_decode(
             output_tokens.append(final_token_id)
             tokens_generated += 1
             target_tokens_total += 1
-            logger.info(
+            logger.debug(
                 f"[session={session_id}] Target token committed: {final_token_id}"
             )
             if tokenizer.eos_token_id is not None and final_token_id == tokenizer.eos_token_id:
