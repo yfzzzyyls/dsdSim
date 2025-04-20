@@ -97,7 +97,7 @@ python main.py --role target --model /home/ubuntu/models/llama-3.1-8b/ --port 50
 ### **Compile & Run the Draft Model server**
 
 ```
-python main.py --role draft --model /home/ubuntu/models/llama-3.2-1b/ --target_host 18.190.157.61 --port 50051 --prompt_text prompt.txt --max_new_tokens 64 --gamma 4 --sequence_length 128 --top_p 0.8 --temperature 0.9
+python main.py --role draft --model /home/ubuntu/models/llama-3.2-1b/ --target_host 18.188.214.41 --port 50051 --prompt_text prompt.txt --max_new_tokens 64 --gamma 4 --sequence_length 128 --profile --top_p 0.8 --temperature 0.9
 ```
 
 ### **Example Output**
@@ -136,10 +136,10 @@ You can also run either the draft or target model **standalone** (without specul
 To run the **target model** by itself on a prompt:
 
 ```
-python main.py --role verify_target --model /home/ubuntu/models/llama-3.2-3b --prompt "Hi, how are you? Tell me about the difference between llama and alpaca." --sequence_length 640 --max_new_tokens 128 --profile
+python main.py --role verify_target --model /home/ubuntu/models/llama-3.1-8b --prompt "What is the difference between llama and alpaca?" --sequence_length 128 --max_new_tokens 64 --profile
 ```
 
-This will load the 3B target model and generate 100 tokens continuing the prompt, printing each generated token as it arrives, followed by the full output text.
+This will load the 8B target model and generate 64 tokens continuing the prompt, printing each generated token as it arrives, followed by the full output text.
 
 Similarly, to run the **draft model** by itself:
 

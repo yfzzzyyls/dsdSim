@@ -31,7 +31,6 @@ def speculative_decode(
     with full rollback of the draft model's past states.
     Extended to handle a session_id so multiple prompts can run concurrently on the server.
     """
-    # --- adaptive control (PID‑style, but only P‑term for now) ---
     current_gamma = max(1, gamma)          # start with user‑given gamma
     gamma_max     = 8                      # hard ceiling
     current_temp  = temperature            # draft temperature we can tweak
@@ -45,17 +44,21 @@ def speculative_decode(
     output_tokens = []
     draft_model.cache_ids = None
     draft_model._next_pos = 0  # next position index in the KV cache
+
+    # pre-filling: Feed the entire prompt once so the draft model builds its KV cache
     prompt_ids = tokenizer(prompt, return_tensors='pt').input_ids
     prev_token_id = int(prompt_ids[0, -1].item()) if prompt_ids.shape[-1] > 0 else tokenizer.bos_token_id
-    # Feed the entire prompt once so the draft model builds its KV cache
+    
     # Feed the prompt so Neuron caches 0…L‑1, then set pointer to NEXT index (=L)
     if prompt_ids.shape[-1] > 0:
+       # build the KV cache for the prompt
        _ = draft_model.forward(input_ids=prompt_ids)          # fills 0…L‑1
        prompt_len = prompt_ids.shape[-1]
        # Overwrite cache pointer with a single‑index tensor [L]
        draft_model.cache_ids = torch.tensor([prompt_len], dtype=torch.int32)
        draft_model._next_pos = prompt_len
     else:
+       # no prompt given
        prompt_len = 0
        draft_model.cache_ids = torch.tensor([0], dtype=torch.int32)
        draft_model._next_pos = 0
@@ -70,7 +73,7 @@ def speculative_decode(
     target_tokens_total = 0
 
     import time
-    # detailed timing buckets
+    # detailed timing metrics
     timing = {
         "draft_forward_time":       0.0,   # local draft forwards
         "grpc_server_time":         0.0,   # Verify + Finalize wait
@@ -107,14 +110,14 @@ def speculative_decode(
             nucleus_probs = top_vals[:cut + 1]
             nucleus_probs = nucleus_probs / nucleus_probs.sum()
 
-            # ---------- vectorised repetition penalty ----------
-            recent_combined = list(recent_deque) + speculative_tokens
-            if recent_combined:
-                recent_t = torch.tensor(recent_combined, device=nucleus_idx.device)
-                mask = (nucleus_idx.unsqueeze(1) == recent_t).any(dim=1)
-                if mask.any():
-                    nucleus_probs = torch.where(mask, nucleus_probs * 0.4, nucleus_probs)
-                    nucleus_probs = nucleus_probs / nucleus_probs.sum()
+            # # ---------- vectorised repetition penalty ----------
+            # recent_combined = list(recent_deque) + speculative_tokens
+            # if recent_combined:
+            #     recent_t = torch.tensor(recent_combined, device=nucleus_idx.device)
+            #     mask = (nucleus_idx.unsqueeze(1) == recent_t).any(dim=1)
+            #     if mask.any():
+            #         nucleus_probs = torch.where(mask, nucleus_probs * 0.4, nucleus_probs)
+            #         nucleus_probs = nucleus_probs / nucleus_probs.sum()
             
             # sample a token from the renormalised nucleus
             sample_idx = torch.multinomial(nucleus_probs, 1).item()
@@ -122,6 +125,8 @@ def speculative_decode(
  
             token_prob = float(nucleus_probs[sample_idx].item())  # probability under q_draft
             # ---- End numeric stability patch ----
+
+            # store the token and its probability for later verification
             speculative_tokens.append(token_id)
             speculative_probs.append(token_prob)
             

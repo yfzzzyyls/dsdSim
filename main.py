@@ -114,7 +114,7 @@ def main():
             return
         prompt_text = args.prompt or ""
         from inference.verify import run_model
-        output_text, perf_stats = run_model(
+        res = run_model(
             model_name,
             prompt=prompt_text,
             max_tokens=args.max_new_tokens,
@@ -124,6 +124,10 @@ def main():
             temperature=args.temperature,
             top_p=args.top_p,
         )
+        if isinstance(res, tuple) and len(res) == 2:
+            output_text, perf_stats = res
+        else:
+            output_text, perf_stats = res, None
         if args.profile and perf_stats:
             save_perf_stats(perf_stats, file_prefix="performance_verify_target")
 
@@ -134,12 +138,16 @@ def main():
             return
         prompt_text = args.prompt or ""
         from inference.verify import run_model
-        output_text, perf_stats = run_model(
+        res = run_model(
             model_name,
             prompt=prompt_text,
             max_tokens=args.max_new_tokens,
             sequence_length=args.sequence_length,
             role="draft", profile=args.profile)
+        if isinstance(res, tuple) and len(res) == 2:
+            output_text, perf_stats = res
+        else:
+            output_text, perf_stats = res, None
         if args.profile and perf_stats:
             save_perf_stats(perf_stats, file_prefix="performance_verify_draft")
     else:

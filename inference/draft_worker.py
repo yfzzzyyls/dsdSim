@@ -77,7 +77,6 @@ def run_batched_prompt_file(
     top_p: float = 0.9,
     temperature: float = 1.0
 ):
-    """Reads all prompts from a text file, processes them in a single batch on one thread."""
     if not os.path.exists(prompt_text_file):
         logger.error(f"Prompt text file not found: {prompt_text_file}")
         return
@@ -88,7 +87,6 @@ def run_batched_prompt_file(
         return
 
     logger.info(f"Loading draft model '{draft_model_name}' (sequence_length={sequence_length}) for batched decoding...")
-    # Support passing in a draft model instance directly
     if isinstance(draft_model_name, str):
         # draft_model_name is a path → load the model
         draft_model = load_model(
@@ -98,6 +96,7 @@ def run_batched_prompt_file(
         )
         model_path_str = draft_model_name
     else:
+        # never happens in Neuron
         # already a model instance
         draft_model = draft_model_name
         # try to recover a path for tokenizer fallback
@@ -142,14 +141,11 @@ def run_batched_prompt_file(
     accepted_counts = [0]*len(prompts)
     target_counts = [0]*len(prompts)
 
-    # naive loop for demonstration: do up to max_new_tokens steps in batch
+    # do up to max_new_tokens steps in batch
     import time
     start_time = time.time()
 
-    # This is a placeholder. Real batch decode means we combine the forward calls to the draft model.
-    # For now, let's do a loop in Python that calls speculative_decode for each prompt *in sequence.*
-    # That is not truly a single thread batch, but let's just show how you might unify them.
-
+    # a loop in Python that calls speculative_decode for each prompt in sequence
     for i, prompt in enumerate(prompts):
         logger.info(f"[BATCH] Decoding prompt {i}: {prompt}")
         gen_text, perf_stats = speculative_decode(
