@@ -145,8 +145,10 @@ def run_batched_prompt_file(
             accepted_counts[i] = perf_stats.get("accepted_tokens_total", 0)
             target_counts[i] = perf_stats.get("target_tokens_total", 0)
             if profile:
-                file_prefix = f"performance_speculative_prompt{i}"
-                save_perf_stats(perf_stats, file_prefix=file_prefix)
+                # Record prompt index so rows can be distinguished, but
+                # append all rows to a single CSV file.
+                perf_stats["prompt_id"] = i
+                save_perf_stats(perf_stats, file_prefix="performance_speculative")
 
     end_time = time.time()
     total_time = end_time - start_time
