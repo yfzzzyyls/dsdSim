@@ -72,11 +72,10 @@ def speculative_decode(
     import time
     # detailed timing buckets
     timing = {
-        "draft_forward": 0.0,
-        "verify_rpc": 0.0,
-        "finalize_rpc": 0.0,
-        "target_forward": 0.0,
-        "rollback": 0.0,
+        "draft_forward_time":       0.0,   # local draft forwards
+        "grpc_server_time":         0.0,   # Verify + Finalize wait
+        "target_verification_time": 0.0,   # placeholder
+        "rollback_time":            0.0,
     }
     start_t = time.time()
 
@@ -92,7 +91,7 @@ def speculative_decode(
                 _t0 = time.perf_counter()
             logits, _ = draft_model.forward(input_ids=scratch_token)
             if profile:
-                timing["draft_forward"] += time.perf_counter() - _t0
+                timing["draft_forward_time"] += time.perf_counter() - _t0
             logits = logits.float()
             # ---- Our improved numeric stability start ----
             # Temperature‑scale logits then apply classic nucleus (top‑p) filter
@@ -157,7 +156,7 @@ def speculative_decode(
             stub, speculative_tokens, session_id=session_id
         )
         if profile:
-            timing["verify_rpc"] += time.perf_counter() - _t0
+            timing["grpc_server_time"] += time.perf_counter() - _t0
         logger.debug(
             f"[session={session_id}] Target probs len={len(target_probs)}, finished={target_finished}"
         )
@@ -221,7 +220,7 @@ def speculative_decode(
             logger.debug(f"[session={session_id}] Rollback: unaccepted={len(speculative_tokens) - accept_count}, cache_ids_restored={draft_model.cache_ids.tolist()}")
             past_states = past_states[:accept_count+1]
             if profile:
-                timing["rollback"] += time.perf_counter() - _rt0
+                timing["rollback_time"] += time.perf_counter() - _rt0
 
         if profile:
             _t0 = time.perf_counter()
@@ -229,7 +228,7 @@ def speculative_decode(
             stub, accept_count, len(speculative_tokens), session_id=session_id
         )
         if profile:
-            timing["finalize_rpc"] += time.perf_counter() - _t0
+            timing["grpc_server_time"] += time.perf_counter() - _t0
         if final_token_id != 0:
             # Always commit the fallback / extra target token
             scratch_token[0, 0] = final_token_id
@@ -290,12 +289,10 @@ def speculative_decode(
         perf_stats["throughput"] = throughput
         perf_stats["avg_token_time"] = total_time / tokens_generated_total if tokens_generated_total>0 else 0.0
         perf_stats.update({
-            "draft_forward_time":  timing["draft_forward"],
-            "verify_rpc_time":     timing["verify_rpc"],
-            "finalize_rpc_time":   timing["finalize_rpc"],
-            "target_forward_time": timing["target_forward"],
-            "grpc_roundtrip_time": timing["verify_rpc"] + timing["finalize_rpc"],
-            "rollback_time":       timing["rollback"]
+            "draft_forward_time":       timing["draft_forward_time"],
+            "grpc_server_time":         timing["grpc_server_time"],
+            "target_verification_time": timing["target_verification_time"],
+            "rollback_time":            timing["rollback_time"],
         })
 
     total_output_tokens = accepted_tokens_total + target_tokens_total
