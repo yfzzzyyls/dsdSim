@@ -2,7 +2,7 @@ import logging
 import torch
 from concurrent import futures
 import grpc
-
+import time
 from inference import model_loader
 from transformers import AutoTokenizer
 from grpc_comm import inference_pb2, inference_pb2_grpc
@@ -21,6 +21,7 @@ class TargetSession:
         self.current_ids = input_ids  # Torch tensor [1, seq_len]
         self.finished = False
         self.tokens_generated = 0
+        self.verification_time = 0.0   # cumulative time spent verifying draft tokens (seconds)
         self.last_draft_chunk = None
         # pointer to the *next* KV slot
         self.cache_ids = torch.tensor([input_ids.shape[1]], dtype=torch.int32)
@@ -282,7 +283,10 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
             #     [sess.current_ids, torch.tensor([draft_tokens], dtype=sess.current_ids.dtype)],
             #     dim=1,
             # )
+            start_t = time.perf_counter()
             target_probs = self._verify_single_step(sess, draft_tokens)
+            verif_ms = (time.perf_counter() - start_t)
+            sess.verification_time += verif_ms
             sess.last_draft_chunk = draft_tokens
             return inference_pb2.VerifyResponse(target_probs=target_probs, finished=False)
 
@@ -323,11 +327,13 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
 
             # ---------- 2) always generate ONE token from target ----------
             # fallback_token = self._generate_one_token(sess)
+            start_t = time.perf_counter()
             fallback_token = self._generate_one_token(
                 sess,
                 temperature=self.temperature,
                 top_p=self.top_p,
             )
+            sess.verification_time += time.perf_counter() - start_t   # add +1 timing
 
             # clear chunk for next round
             sess.last_draft_chunk = None
@@ -339,6 +345,10 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
                 and fallback_token == self.eos_token_id
             ):
                 sess.finished = True
+            # If the session just finished, log total verification time
+            if sess.finished:
+                logger.info("[session=%s] total verification latency: %.3f s",
+                            sid, sess.verification_time)
 
             token_text = self.tokenizer.decode([fallback_token]).strip() if fallback_token != 0 else "<none>"
             logger.debug(f"[Finalize] returning token_id={fallback_token} ‹{token_text}› to draft model")
