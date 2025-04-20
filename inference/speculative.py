@@ -1,6 +1,7 @@
 import random
 import torch
 import logging
+import collections
 
 from grpc_comm import grpc_client
 
@@ -54,6 +55,10 @@ def speculative_decode(
        draft_model._next_pos = 0
 
     tokens_generated = 0
+    # reusable scratch tensor (1,1) for single-token forwards
+    scratch_token = torch.empty((1, 1), dtype=torch.int64)
+    # fixed-size deque for fast repetition penalty history
+    recent_deque  = collections.deque(maxlen=50)
     finished = False
     accepted_tokens_total = 0
     target_tokens_total = 0
@@ -68,9 +73,9 @@ def speculative_decode(
         logger.debug("[session=%s] Entering inner loop, tokens_generated=%d", session_id, tokens_generated)
         past_states = [draft_model.cache_ids]
         for _ in range(gamma):
-            # Prepare a 2‑D input_ids tensor [[token_id]]
-            input_ids = torch.tensor([[prev_token_id]], dtype=torch.int64)
-            logits, new_cache = draft_model.forward(input_ids=input_ids)
+            scratch_token[0, 0] = prev_token_id
+            logits, _ = draft_model.forward(input_ids=scratch_token)
+            logits = logits.float()
             # ---- Our improved numeric stability start ----
             # Temperature‑scale logits then apply classic nucleus (top‑p) filter
             logits = logits / temperature
@@ -86,9 +91,9 @@ def speculative_decode(
             nucleus_probs = nucleus_probs / nucleus_probs.sum()
 
             # ---------- vectorised repetition penalty ----------
-            recent = output_tokens[-50:] + speculative_tokens
-            if recent:
-                recent_t = torch.tensor(recent, device=nucleus_idx.device)
+            recent_combined = list(recent_deque) + speculative_tokens
+            if recent_combined:
+                recent_t = torch.tensor(recent_combined, device=nucleus_idx.device)
                 mask = (nucleus_idx.unsqueeze(1) == recent_t).any(dim=1)
                 if mask.any():
                     nucleus_probs = torch.where(mask, nucleus_probs * 0.4, nucleus_probs)
@@ -169,6 +174,7 @@ def speculative_decode(
         # ----------------------------------------------------------
         if accept_count > 0:
             output_tokens.extend(speculative_tokens[:accept_count])
+            recent_deque.extend(speculative_tokens[:accept_count])
             tokens_generated += accept_count
             # advance prev_token_id so the next chunk starts correctly
             prev_token_id = speculative_tokens[accept_count - 1]
@@ -196,15 +202,16 @@ def speculative_decode(
         )
         if final_token_id != 0:
             # Always commit the fallback / extra target token
-            _, _ = draft_model.forward(
-                input_ids=torch.tensor([[final_token_id]], dtype=torch.int64)
-            )
+            scratch_token[0, 0] = final_token_id
+            recent_deque.append(final_token_id)
+            _, _ = draft_model.forward(input_ids=scratch_token)
             draft_model.cache_ids = torch.tensor([draft_model._next_pos], dtype=torch.int32)
             # sanity: cursor and cache_ids agree
             assert int(draft_model.cache_ids.item()) == draft_model._next_pos, \
                 "Draft KV pointer mismatch after committing target token"
             prev_token_id = final_token_id
             output_tokens.append(final_token_id)
+            recent_deque.append(final_token_id)
             tokens_generated += 1
             target_tokens_total += 1
             logger.debug(
