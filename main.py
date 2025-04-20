@@ -113,7 +113,6 @@ def main():
             logger.error("Please specify --model for verify_target role")
             return
         prompt_text = args.prompt or ""
-        from inference.verify_standalone import run_model  # if you copied elsewhere
         output_text, perf_stats = run_model(
             model_name,
             prompt=prompt_text,
@@ -133,7 +132,6 @@ def main():
             logger.error("Please specify --model for verify_draft role")
             return
         prompt_text = args.prompt or ""
-        from inference.verify_standalone import run_model  # if you copied elsewhere
         output_text, perf_stats = run_model(
             model_name,
             prompt=prompt_text,
