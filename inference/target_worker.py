@@ -39,7 +39,31 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
         self.sessions = {}  # session_id -> TargetSession
         self.lock = torch.multiprocessing.Lock()
 
-    
+    # ------------------------------------------------------------------
+    # Utility: right‑pad an (1, L) tensor with zeros to ctx_estimate
+    # ------------------------------------------------------------------
+    def _pad_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+        """
+        Neuron‑compiled forward graphs expect the input length to be
+        >= the compile‑time estimate (self._ctx_estimate, defaults to the
+        --sequence_length used at compile time).  If the supplied tensor
+        is shorter we right‑pad with zeros so its shape is (1, ctx_estimate).
+ 
+        Parameters
+        ----------
+        input_ids : torch.Tensor   shape (1, L), dtype = same as model input
+ 
+        Returns
+        -------
+        torch.Tensor  shape (1, max(L, ctx_estimate))
+        """
+        seq_len = input_ids.shape[1]
+        if seq_len >= self._ctx_estimate:            # already long enough
+            return input_ids
+        pad_len = self._ctx_estimate - seq_len
+        pad = torch.zeros((1, pad_len), dtype=input_ids.dtype, device=input_ids.device)
+        return torch.cat([input_ids, pad], dim=1)
+
     def _sync_kv_pointer(self, sess: TargetSession):
         self.model.cache_ids = sess.cache_ids.clone()
         if hasattr(self.model, "_next_pos"):
