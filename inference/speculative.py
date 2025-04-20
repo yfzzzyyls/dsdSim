@@ -86,7 +86,16 @@ def speculative_decode(
             nucleus_idx = sorted_idx[:cut_idx + 1]
             nucleus_probs = sorted_p[:cut_idx + 1]
             nucleus_probs = nucleus_probs / nucleus_probs.sum()
- 
+            
+            # --- context‑level repetition penalty (last 50 tokens) ---
+            recent = output_tokens[-50:] + speculative_tokens   # tokens already in draft path
+            if recent:
+                recent_set = set(recent)
+                for i, tok in enumerate(nucleus_idx):
+                    if int(tok) in recent_set:
+                        nucleus_probs[i] *= 0.4   # down‑weight repeated tokens
+                nucleus_probs = nucleus_probs / nucleus_probs.sum()
+            
             # sample a token from the renormalised nucleus
             sample_idx = torch.multinomial(nucleus_probs, 1).item()
             token_id = int(nucleus_idx[sample_idx].item())
@@ -187,34 +196,20 @@ def speculative_decode(
             stub, accept_count, len(speculative_tokens), session_id=session_id
         )
         if final_token_id != 0:
-            # Avoid duplicating the last token (e.g. repeating 323 "and")
-            if not output_tokens or final_token_id != output_tokens[-1]:
-                # _, new_cache = draft_model.forward(
-                #     input_ids=torch.tensor([[final_token_id]], dtype=torch.int64),
-                #     cache_ids=draft_model.cache_ids
-                # )
-                _, new_cache = draft_model.forward(
-                    input_ids=torch.tensor([[final_token_id]], dtype=torch.int64)
-                )
-                # draft_model.cache_ids = new_cache.clone()
-                draft_model.cache_ids = torch.tensor([draft_model._next_pos], dtype=torch.int32)
-                prev_token_id = final_token_id
-                output_tokens.append(final_token_id)
-                tokens_generated += 1
-                target_tokens_total += 1
-                logger.info(
-                    f"[session={session_id}] Fallback token committed: {final_token_id}"
-                )
-                if tokenizer.eos_token_id is not None and final_token_id == tokenizer.eos_token_id:
-                    finished = True
-            else:
-                # Update draft cache even if duplicate skipped
-                _, new_cache = draft_model.forward(
-                    input_ids=torch.tensor([[final_token_id]], dtype=torch.int64)
-                )
-                # draft_model.cache_ids = new_cache.clone()
-                draft_model.cache_ids = torch.tensor([draft_model._next_pos], dtype=torch.int32)
-                prev_token_id = final_token_id
+            # Always commit the fallback / extra target token
+            _, _ = draft_model.forward(
+                input_ids=torch.tensor([[final_token_id]], dtype=torch.int64)
+            )
+            draft_model.cache_ids = torch.tensor([draft_model._next_pos], dtype=torch.int32)
+            prev_token_id = final_token_id
+            output_tokens.append(final_token_id)
+            tokens_generated += 1
+            target_tokens_total += 1
+            logger.info(
+                f"[session={session_id}] Target token committed: {final_token_id}"
+            )
+            if tokenizer.eos_token_id is not None and final_token_id == tokenizer.eos_token_id:
+                finished = True
 
         if finalize_finished or tokens_generated >= max_new_tokens:
             finished = True

@@ -187,18 +187,21 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
     
     def _verify_single_step(self, sess: TargetSession, draft_tokens):
         """
-        Compute p_target(d₁…dₖ | context) **without mutating** permanent state.
-
-        We assume:
-          • sess.cache_ids holds the *next‑free* KV slot index.
-          • sess.pending_logits (if not None) already contains logits for the
-            next position (temperature‑scaled).
-
-        Returns
-        -------
-        probs : List[float] ‑ probability for each draft token under the
-                target model’s *temperature‑scaled* soft‑max.
-        """
+         Compute p_target(d₁…dₖ | context) **without mutating** permanent state.
+ 
+         We assume:
+           • sess.cache_ids holds the *next‑free* KV slot index.
+           • sess.pending_logits (if not None) already contains logits for the
+             next position (temperature‑scaled).
+ 
+         Returns
+         -------
+         probs : List[float] ‑ probability for each draft token under the
+                 target model’s *temperature‑scaled* soft‑max.
+         """
+        # Early exit: no draft tokens – keep pending_logits intact
+        if not draft_tokens:
+            return []
         # ---------- snapshot current pointer & logits ----------
         orig_cache   = sess.cache_ids.clone()
         orig_nextpos = int(orig_cache.item())
