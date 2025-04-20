@@ -353,7 +353,12 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
 
             # ---------- periodic verification‑time log ----------
             sess.finalize_calls += 1
-            if sess.finished or sess.finalize_calls % 16 == 0:
+            should_log = (
+                sess.finished or
+                sess.finalize_calls % 16 == 0 or
+                (accepted_count == 0 and draft_chunk_size == 0)   # client flush / end
+            )
+            if should_log:
                 logger.info(
                     "[session=%s] cumulative verification latency: %.3f s  calls=%d",
                     sid, sess.verification_time, sess.finalize_calls
