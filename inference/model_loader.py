@@ -104,6 +104,45 @@ class NeuronHFAdapterWrap(torch.nn.Module):
 
         return logits, pos_tensor
 
+    # ------------------------------------------------------------------
+    # Convenience: greedy sampling so verify.py can run target model alone
+    # ------------------------------------------------------------------
+    def sample(
+        self,
+        input_ids,
+        sequence_length: int,
+        temperature: float = 1.0,
+        top_p: float = 0.9,
+    ):
+        """
+        Nucleus (top‑p) sampling until `sequence_length` tokens total.
+        Matches the sampling used by the target server so standalone runs
+        exhibit the same randomness.
+        """
+        while input_ids.shape[1] < sequence_length:
+            logits, _ = self.forward(input_ids=input_ids[:, -1:])
+            logits = logits / max(temperature, 1e-6)
+            probs = torch.softmax(logits, dim=-1)
+
+            # nucleus filter
+            sorted_probs, sorted_idx = torch.sort(probs, descending=True)
+            cumprobs = torch.cumsum(sorted_probs, dim=0)
+            cutoff = torch.where(cumprobs >= top_p)[0][0].item()
+            keep_idx = sorted_idx[: cutoff + 1]
+            keep_probs = sorted_probs[: cutoff + 1]
+            keep_probs = keep_probs / keep_probs.sum()
+
+            choice = torch.multinomial(keep_probs, 1).item()
+            next_id = int(keep_idx[choice].item())
+
+            next_tensor = torch.tensor([[next_id]], dtype=input_ids.dtype)
+            input_ids = torch.cat([input_ids, next_tensor], dim=1)
+
+            if self.config.eos_token_id is not None and next_id == self.config.eos_token_id:
+                break
+
+        return input_ids
+
 # Default sequence length (can be overridden by function arguments)
 DEFAULT_SEQUENCE_LENGTH = 128
 
