@@ -76,23 +76,23 @@ def speculative_decode(
             logits = logits / temperature
             probs = torch.softmax(logits, dim=-1)
  
-                # ---------- nucleus filter (fast top‑k) ----------
-                k = min(512, probs.shape[-1])          # limit sort to top‑512
-                top_vals, top_idx = torch.topk(probs, k)         # O(V) → O(k log k)
-                cum_p = torch.cumsum(top_vals, dim=0)
-                cut = torch.searchsorted(cum_p, top_p, right=True).item()
-                nucleus_idx   = top_idx[:cut + 1]
-                nucleus_probs = top_vals[:cut + 1]
-                nucleus_probs = nucleus_probs / nucleus_probs.sum()
+            # ---------- nucleus filter (fast top‑k) ----------
+            k = min(512, probs.shape[-1])          # limit sort to top‑512
+            top_vals, top_idx = torch.topk(probs, k)         # O(V) → O(k log k)
+            cum_p = torch.cumsum(top_vals, dim=0)
+            cut = torch.searchsorted(cum_p, top_p, right=True).item()
+            nucleus_idx   = top_idx[:cut + 1]
+            nucleus_probs = top_vals[:cut + 1]
+            nucleus_probs = nucleus_probs / nucleus_probs.sum()
 
-                # ---------- vectorised repetition penalty ----------
-                recent = output_tokens[-50:] + speculative_tokens
-                if recent:
-                    recent_t = torch.tensor(recent, device=nucleus_idx.device)
-                    mask = (nucleus_idx.unsqueeze(1) == recent_t).any(dim=1)
-                    if mask.any():
-                        nucleus_probs = torch.where(mask, nucleus_probs * 0.4, nucleus_probs)
-                        nucleus_probs = nucleus_probs / nucleus_probs.sum()
+            # ---------- vectorised repetition penalty ----------
+            recent = output_tokens[-50:] + speculative_tokens
+            if recent:
+                recent_t = torch.tensor(recent, device=nucleus_idx.device)
+                mask = (nucleus_idx.unsqueeze(1) == recent_t).any(dim=1)
+                if mask.any():
+                    nucleus_probs = torch.where(mask, nucleus_probs * 0.4, nucleus_probs)
+                    nucleus_probs = nucleus_probs / nucleus_probs.sum()
             
             # sample a token from the renormalised nucleus
             sample_idx = torch.multinomial(nucleus_probs, 1).item()
