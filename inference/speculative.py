@@ -176,7 +176,7 @@ def speculative_decode(
             tokens_generated += accept_count
             # advance prev_token_id so the next chunk starts correctly
             prev_token_id = speculative_tokens[accept_count - 1]
-            logger.info(
+            logger.debug(
                 f"[session={session_id}] Committed tokens → "
                 f"tokens_generated={tokens_generated} prev_token_id={prev_token_id}"
             )

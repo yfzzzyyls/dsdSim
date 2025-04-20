@@ -341,7 +341,7 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
                 sess.finished = True
 
             token_text = self.tokenizer.decode([fallback_token]).strip() if fallback_token != 0 else "<none>"
-            logger.info(f"[Finalize] returning token_id={fallback_token} ‹{token_text}› to draft model")
+            logger.debug(f"[Finalize] returning token_id={fallback_token} ‹{token_text}› to draft model")
             return inference_pb2.FinalizeResponse(
                 final_token=fallback_token,
                 finished=sess.finished,
