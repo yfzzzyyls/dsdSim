@@ -220,10 +220,15 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
 
         # ---------- ONE model.forward ----------
         # cache_ids tells Neuron this chunk starts at the next free slot
+        # pad to compile‑time length (128) so Neuron is happy
+        padded_input = self._pad_ids(draft_tensor)
         logits_all, _ = self.model.forward(
-            input_ids=draft_tensor,
+            input_ids=padded_input,
             cache_ids=sess.cache_ids.clone()
         )
+
+        # logits_all shape is (128, V); keep only the first N rows
+        logits_all = logits_all[: len(draft_tokens)]
 
         # temperature‑scale then soft‑max in fp32
         logits_all = logits_all.float() / max(self.temperature, 1e-6)
