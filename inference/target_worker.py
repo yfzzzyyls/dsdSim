@@ -355,7 +355,7 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
             sess.finalize_calls += 1
             should_log = (
                 sess.finished or
-                sess.finalize_calls % 16 == 0 or
+                sess.finalize_calls % 10 == 0 or
                 (accepted_count == 0 and draft_chunk_size == 0)   # client flush / end
             )
             if should_log:
