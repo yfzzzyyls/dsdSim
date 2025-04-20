@@ -55,10 +55,6 @@ def main():
                         help="Temperature for draft sampling (default 1.0)")
     args = parser.parse_args()
 
-    logger.info("Choral-Spec main launcher started - logger")
-    logger.info(f"Choral-Spec main launcher started - logger - f")
-    print("Choral-Spec main launcher started- print")
-
 
     if args.role == "target":
         model_name = args.model or args.target_model
