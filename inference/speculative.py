@@ -131,7 +131,6 @@ def speculative_decode(
             speculative_probs.append(token_prob)
             
             prev_token_id = token_id
-            # past_states.append(new_cache)
             past_states.append(draft_model.cache_ids.clone())   # pointer to next slot
             # Stop if end-of-sequence or max_new_tokens reached
             if tokenizer.eos_token_id is not None and token_id == tokenizer.eos_token_id:
@@ -142,14 +141,14 @@ def speculative_decode(
  
         logger.debug("[session=%s] Proposed tokens: %s", session_id, speculative_tokens)
 
-        # If overshoot
-        if len(speculative_tokens) > 0 and tokens_generated > max_new_tokens:
-            overshoot = tokens_generated - max_new_tokens
-            speculative_tokens = speculative_tokens[:-overshoot]
-            speculative_probs = speculative_probs[:-overshoot]
-            output_tokens = output_tokens[:-overshoot]
-            tokens_generated = max_new_tokens
-            finished = True
+        # # If overshoot
+        # if len(speculative_tokens) > 0 and tokens_generated > max_new_tokens:
+        #     overshoot = tokens_generated - max_new_tokens
+        #     speculative_tokens = speculative_tokens[:-overshoot]
+        #     speculative_probs = speculative_probs[:-overshoot]
+        #     output_tokens = output_tokens[:-overshoot]
+        #     tokens_generated = max_new_tokens
+        #     finished = True
 
         if not speculative_tokens:
             break
