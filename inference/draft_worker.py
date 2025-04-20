@@ -27,9 +27,8 @@ def save_perf_stats(perf_stats: dict, file_prefix: str):
         # Append CSV row; write header if file does not exist
         header = ["total_time", "tokens_generated", "tokens_per_second",
                   "avg_token_time", "token_match_rate",
-                  "draft_forward_time", "target_forward_time",
-                  "verify_rpc_time", "finalize_rpc_time",
-                  "grpc_roundtrip_time", "rollback_time"]
+                  "draft_forward_time", "grpc_server_time",
+                  "target_verification_time", "rollback_time"]
 
         write_header = not os.path.exists(csv_path)
         with open(csv_path, "a", newline='') as cf:
@@ -38,14 +37,12 @@ def save_perf_stats(perf_stats: dict, file_prefix: str):
             row = [
                 perf_stats.get("total_time", ""),
                 perf_stats.get("tokens_generated", ""),
-                perf_stats.get("throughput", ""),  # same value, new column name
+                perf_stats.get("throughput", ""),  # throughput == tokens_per_second
                 perf_stats.get("avg_token_time", ""),
                 perf_stats.get("token_match_rate", ""),
                 perf_stats.get("draft_forward_time", ""),
-                perf_stats.get("target_forward_time", ""),
-                perf_stats.get("verify_rpc_time", ""),
-                perf_stats.get("finalize_rpc_time", ""),
-                perf_stats.get("grpc_roundtrip_time", ""),
+                perf_stats.get("grpc_server_time", ""),
+                perf_stats.get("target_verification_time", ""),
                 perf_stats.get("rollback_time", ""),
             ]
             cf.write(",".join(str(x) for x in row) + "\n")
