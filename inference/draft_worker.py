@@ -25,7 +25,7 @@ def save_perf_stats(perf_stats: dict, file_prefix: str):
     json_path = f"{file_prefix}.json"
     try:
         # Append CSV row; write header if file does not exist
-        header = ["total_time", "tokens_generated", "throughput",
+        header = ["total_time", "tokens_generated", "tokens_per_second",
                   "avg_token_time", "token_match_rate",
                   "draft_forward_time", "target_forward_time",
                   "verify_rpc_time", "finalize_rpc_time",
@@ -35,7 +35,19 @@ def save_perf_stats(perf_stats: dict, file_prefix: str):
         with open(csv_path, "a", newline='') as cf:
             if write_header:
                 cf.write(",".join(header) + "\n")
-            row = [perf_stats.get(k, "") for k in header]
+            row = [
+                perf_stats.get("total_time", ""),
+                perf_stats.get("tokens_generated", ""),
+                perf_stats.get("throughput", ""),  # same value, new column name
+                perf_stats.get("avg_token_time", ""),
+                perf_stats.get("token_match_rate", ""),
+                perf_stats.get("draft_forward_time", ""),
+                perf_stats.get("target_forward_time", ""),
+                perf_stats.get("verify_rpc_time", ""),
+                perf_stats.get("finalize_rpc_time", ""),
+                perf_stats.get("grpc_roundtrip_time", ""),
+                perf_stats.get("rollback_time", ""),
+            ]
             cf.write(",".join(str(x) for x in row) + "\n")
 
         # Always dump latest JSON snapshot
