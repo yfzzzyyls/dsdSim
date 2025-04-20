@@ -188,6 +188,9 @@ def speculative_decode(
             draft_model.cache_ids = past_states[accept_count].clone()
             if hasattr(draft_model, "_next_pos"):
                 draft_model._next_pos = int(draft_model.cache_ids.item())
+            # sanity: cursor and cache_ids agree after rollback
+            assert int(draft_model.cache_ids.item()) == draft_model._next_pos, \
+                "Draft KV pointer mismatch after rollback"
             prev_token_id = output_tokens[-1] if output_tokens else prompt_ids[0, -1].item()
             logger.info(f"[session={session_id}] Rollback: unaccepted={len(speculative_tokens) - accept_count}, cache_ids_restored={draft_model.cache_ids.tolist()}")
             past_states = past_states[:accept_count+1]
@@ -201,6 +204,9 @@ def speculative_decode(
                 input_ids=torch.tensor([[final_token_id]], dtype=torch.int64)
             )
             draft_model.cache_ids = torch.tensor([draft_model._next_pos], dtype=torch.int32)
+            # sanity: cursor and cache_ids agree
+            assert int(draft_model.cache_ids.item()) == draft_model._next_pos, \
+                "Draft KV pointer mismatch after committing target token"
             prev_token_id = final_token_id
             output_tokens.append(final_token_id)
             tokens_generated += 1

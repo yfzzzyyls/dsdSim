@@ -40,6 +40,9 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
         self.model.cache_ids = sess.cache_ids.clone()
         if hasattr(self.model, "_next_pos"):
             self.model._next_pos = int(sess.cache_ids.item())
+        # ---- sanity check ----
+        assert int(self.model.cache_ids.item()) == int(sess.cache_ids.item()), \
+            "Target KV cache_ids desynchronised after sync"
 
 
     def StartGeneration(self, request, context):
@@ -247,6 +250,9 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
         if hasattr(self.model, "_next_pos"):
             self.model._next_pos = orig_nextpos
         sess.cache_ids = orig_cache
+        # final sanity: model and session pointers must match
+        assert int(self.model.cache_ids.item()) == int(sess.cache_ids.item()), \
+            "KV desync detected on verify exit"
         return probs
     # =============================
     # SINGLE-SEQUENCE calls
