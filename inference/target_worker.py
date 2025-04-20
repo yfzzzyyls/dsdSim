@@ -231,7 +231,7 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
             else:
                 logits_row = logits_next[0] if logits_next.dim() == 2 else logits_next
 
-            logits_row = logits_row / max(1.0, 1e-6)          # temperature (T=1)
+            logits_row = logits_row / max(self.temperature, 1e-6)
             p = float(torch.softmax(logits_row, dim=-1)[tok].item())
             probs.append(p)
 
@@ -374,8 +374,8 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
             cache_ids=self.model.cache_ids,
         )
         logits_row = logits[0] if logits.dim() == 2 else logits
-        sess.pending_logits = logits_row.clone()      # <── add this
-        logits_row = logits_row / max(temperature, 1e-6)
+        logits_row = logits_row / max(temperature, 1e-6)   # scale first
+        sess.pending_logits = logits_row.clone()           # cache *scaled* logits
 
         # 2) nucleus / top‑p filter
         probs = torch.softmax(logits_row, dim=-1)
