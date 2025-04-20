@@ -31,6 +31,12 @@ def speculative_decode(
     with full rollback of the draft model's past states.
     Extended to handle a session_id so multiple prompts can run concurrently on the server.
     """
+    # --- adaptive control (PID‑style, but only P‑term for now) ---
+    current_gamma = max(1, gamma)          # start with user‑given gamma
+    gamma_max     = 8                      # hard ceiling
+    current_temp  = temperature            # draft temperature we can tweak
+    target_accept = 0.4                    # desired per‑loop acceptance rate
+
     logger.debug(
         f"[session={session_id}] Starting speculative_decode: "
         f"prompt='{prompt[:60]}...' max_new_tokens={max_new_tokens} gamma={gamma}"
@@ -72,13 +78,13 @@ def speculative_decode(
         speculative_probs = []
         logger.debug("[session=%s] Entering inner loop, tokens_generated=%d", session_id, tokens_generated)
         past_states = [draft_model.cache_ids]
-        for _ in range(gamma):
+        for _ in range(current_gamma):
             scratch_token[0, 0] = prev_token_id
             logits, _ = draft_model.forward(input_ids=scratch_token)
             logits = logits.float()
             # ---- Our improved numeric stability start ----
             # Temperature‑scale logits then apply classic nucleus (top‑p) filter
-            logits = logits / temperature
+            logits = logits / current_temp
             probs = torch.softmax(logits, dim=-1)
  
             # ---------- nucleus filter (fast top‑k) ----------
@@ -219,6 +225,24 @@ def speculative_decode(
             )
             if tokenizer.eos_token_id is not None and final_token_id == tokenizer.eos_token_id:
                 finished = True
+
+        # ---------- adaptive γ and temperature (P‑controller) ----------
+        if current_gamma > 0:
+            loop_accept_rate = accept_count / current_gamma
+            error = target_accept - loop_accept_rate
+
+            # proportional update
+            new_gamma = int(max(1, min(gamma_max, current_gamma + 0.5 * error * current_gamma)))
+            if new_gamma != current_gamma:
+                logger.debug("[session=%s] Adjust gamma %d → %d (acc_rate=%.2f)",
+                             session_id, current_gamma, new_gamma, loop_accept_rate)
+            current_gamma = new_gamma
+
+            new_temp = max(0.3, min(2.0, current_temp * (1 + 0.2 * error)))
+            if abs(new_temp - current_temp) > 1e-3:
+                logger.debug("[session=%s] Adjust draft temperature %.3f → %.3f",
+                             session_id, current_temp, new_temp)
+            current_temp = new_temp
 
         if finalize_finished or tokens_generated >= max_new_tokens:
             finished = True
