@@ -79,13 +79,25 @@ def speculative_decode(
             logits = logits / temperature
             probs = torch.softmax(logits, dim=-1)
  
-            # nucleus filter
+            # nucleus filter — guarantee at least `min_keep` candidates
+            min_keep = 8                       # ← prevents 1‑token nuclei
             sorted_p, sorted_idx = torch.sort(probs, descending=True)
             cum_p = torch.cumsum(sorted_p, dim=0)
             cut_idx = torch.where(cum_p >= top_p)[0][0].item()
+            cut_idx = max(cut_idx, min_keep - 1)   # ensure ≥ min_keep kept
             nucleus_idx = sorted_idx[:cut_idx + 1]
             nucleus_probs = sorted_p[:cut_idx + 1]
             nucleus_probs = nucleus_probs / nucleus_probs.sum()
+ 
+            # OPTIONAL light repetition penalty on exact‑previous token
+            if speculative_tokens:
+                last_tok = speculative_tokens[-1]
+                try:
+                    rep_pos = (nucleus_idx == last_tok).nonzero(as_tuple=False)[0].item()
+                    nucleus_probs[rep_pos] = nucleus_probs[rep_pos] * 0.5
+                    nucleus_probs = nucleus_probs / nucleus_probs.sum()
+                except IndexError:
+                    pass  # last_tok not in nucleus; ignore
  
             # sample a token from the renormalised nucleus
             sample_idx = torch.multinomial(nucleus_probs, 1).item()
