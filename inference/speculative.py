@@ -70,6 +70,14 @@ def speculative_decode(
     target_tokens_total = 0
 
     import time
+    # detailed timing buckets
+    timing = {
+        "draft_forward": 0.0,
+        "verify_rpc": 0.0,
+        "finalize_rpc": 0.0,
+        "target_forward": 0.0,
+        "rollback": 0.0,
+    }
     start_t = time.time()
 
     while not finished and tokens_generated < max_new_tokens:
@@ -80,7 +88,11 @@ def speculative_decode(
         past_states = [draft_model.cache_ids]
         for _ in range(current_gamma):
             scratch_token[0, 0] = prev_token_id
+            if profile:
+                _t0 = time.perf_counter()
             logits, _ = draft_model.forward(input_ids=scratch_token)
+            if profile:
+                timing["draft_forward"] += time.perf_counter() - _t0
             logits = logits.float()
             # ---- Our improved numeric stability start ----
             # Temperature‑scale logits then apply classic nucleus (top‑p) filter
@@ -139,9 +151,13 @@ def speculative_decode(
             break
 
         # 8) Verify tokens with target model
+        if profile:
+            _t0 = time.perf_counter()
         target_probs, target_finished = grpc_client.verify_draft_tokens(
             stub, speculative_tokens, session_id=session_id
         )
+        if profile:
+            timing["verify_rpc"] += time.perf_counter() - _t0
         logger.debug(
             f"[session={session_id}] Target probs len={len(target_probs)}, finished={target_finished}"
         )
@@ -190,6 +206,8 @@ def speculative_decode(
             )
 
         if break_point and accept_count < len(speculative_tokens):
+            if profile:
+                _rt0 = time.perf_counter()
             # The unaccepted tokens were *not* appended to output_tokens,
             # so we should NOT pop anything here.  Simply rewind the draft
             # model’s KV pointer.
@@ -202,15 +220,25 @@ def speculative_decode(
             prev_token_id = output_tokens[-1] if output_tokens else prompt_ids[0, -1].item()
             logger.debug(f"[session={session_id}] Rollback: unaccepted={len(speculative_tokens) - accept_count}, cache_ids_restored={draft_model.cache_ids.tolist()}")
             past_states = past_states[:accept_count+1]
+            if profile:
+                timing["rollback"] += time.perf_counter() - _rt0
 
+        if profile:
+            _t0 = time.perf_counter()
         final_token_id, finalize_finished = grpc_client.finalize_tokens(
             stub, accept_count, len(speculative_tokens), session_id=session_id
         )
+        if profile:
+            timing["finalize_rpc"] += time.perf_counter() - _t0
         if final_token_id != 0:
             # Always commit the fallback / extra target token
             scratch_token[0, 0] = final_token_id
             recent_deque.append(final_token_id)
+            if profile:
+                _t0 = time.perf_counter()
             _, _ = draft_model.forward(input_ids=scratch_token)
+            if profile:
+                timing["target_forward"] += time.perf_counter() - _t0
             draft_model.cache_ids = torch.tensor([draft_model._next_pos], dtype=torch.int32)
             # sanity: cursor and cache_ids agree
             assert int(draft_model.cache_ids.item()) == draft_model._next_pos, \
@@ -261,6 +289,14 @@ def speculative_decode(
         perf_stats["tokens_generated"] = tokens_generated_total
         perf_stats["throughput"] = throughput
         perf_stats["avg_token_time"] = total_time / tokens_generated_total if tokens_generated_total>0 else 0.0
+        perf_stats.update({
+            "draft_forward_time":  timing["draft_forward"],
+            "verify_rpc_time":     timing["verify_rpc"],
+            "finalize_rpc_time":   timing["finalize_rpc"],
+            "target_forward_time": timing["target_forward"],
+            "grpc_roundtrip_time": timing["verify_rpc"] + timing["finalize_rpc"],
+            "rollback_time":       timing["rollback"]
+        })
 
     total_output_tokens = accepted_tokens_total + target_tokens_total
     if total_output_tokens > 0:

@@ -17,23 +17,31 @@ logger = logging.getLogger(__name__)
 
 
 def save_perf_stats(perf_stats: dict, file_prefix: str):
-    # same as existing
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    csv_path = f"{file_prefix}_{timestamp}.csv"
-    json_path = f"{file_prefix}_{timestamp}.json"
+    """
+    Save perf_stats to <file_prefix>.csv (append a row) and
+    <file_prefix>.json (overwrite latest snapshot).
+    """
+    csv_path  = f"{file_prefix}.csv"
+    json_path = f"{file_prefix}.json"
     try:
-        with open(csv_path, "w", newline='') as cf:
-            cf.write("total_time,tokens_generated,throughput,avg_token_time,token_match_rate\n")
-            total_time = perf_stats.get("total_time", 0.0)
-            tokens_generated = perf_stats.get("tokens_generated", 0)
-            throughput = perf_stats.get("throughput", 0.0)
-            avg_token_time = perf_stats.get("avg_token_time", 0.0)
-            token_match_rate = perf_stats.get("token_match_rate", None)
-            line = f"{total_time:.6f},{tokens_generated},{throughput:.6f},{avg_token_time:.6f},{token_match_rate}\n"
-            cf.write(line)
+        # Append CSV row; write header if file does not exist
+        header = ["total_time", "tokens_generated", "throughput",
+                  "avg_token_time", "token_match_rate",
+                  "draft_forward_time", "target_forward_time",
+                  "verify_rpc_time", "finalize_rpc_time",
+                  "grpc_roundtrip_time", "rollback_time"]
+
+        write_header = not os.path.exists(csv_path)
+        with open(csv_path, "a", newline='') as cf:
+            if write_header:
+                cf.write(",".join(header) + "\n")
+            row = [perf_stats.get(k, "") for k in header]
+            cf.write(",".join(str(x) for x in row) + "\n")
+
+        # Always dump latest JSON snapshot
         with open(json_path, "w") as jf:
             json.dump(perf_stats, jf, indent=2)
-        logger.info(f"Performance metrics saved to {csv_path} and {json_path}")
+        logger.info(f"Perf metrics appended to {csv_path} (snapshot {json_path})")
     except Exception as e:
         logger.error(f"Failed to save performance data: {e}")
 
@@ -136,6 +144,9 @@ def run_batched_prompt_file(
         if perf_stats:
             accepted_counts[i] = perf_stats.get("accepted_tokens_total", 0)
             target_counts[i] = perf_stats.get("target_tokens_total", 0)
+            if profile:
+                file_prefix = f"performance_speculative_prompt{i}"
+                save_perf_stats(perf_stats, file_prefix=file_prefix)
 
     end_time = time.time()
     total_time = end_time - start_time

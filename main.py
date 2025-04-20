@@ -2,6 +2,7 @@ import argparse
 import logging
 import os
 from inference.model_loader import load_model
+from inference.draft_worker import save_perf_stats
 # Enable Transformer optimizations *and* expose past_key_values to Python
 os.environ["NEURON_CC_FLAGS"] = "--model-type=transformer"
 os.environ["NEURON_RT_NUM_CORES"] = "2"
@@ -112,8 +113,8 @@ def main():
             logger.error("Please specify --model for verify_target role")
             return
         prompt_text = args.prompt or ""
-        from inference import verify
-        verify.run_model(
+        from inference.verify_standalone import run_model  # if you copied elsewhere
+        output_text, perf_stats = run_model(
             model_name,
             prompt=prompt_text,
             max_tokens=args.max_new_tokens,
@@ -123,6 +124,8 @@ def main():
             temperature=args.temperature,
             top_p=args.top_p,
         )
+        if args.profile and perf_stats:
+            save_perf_stats(perf_stats, file_prefix="performance_verify_target")
 
     elif args.role == "verify_draft":
         model_name = args.model
@@ -130,11 +133,15 @@ def main():
             logger.error("Please specify --model for verify_draft role")
             return
         prompt_text = args.prompt or ""
-        from inference import verify
-        verify.run_model(model_name, prompt=prompt_text,
-                         max_tokens=args.max_new_tokens,
-                         sequence_length=args.sequence_length,
-                         role="draft", profile=args.profile)
+        from inference.verify_standalone import run_model  # if you copied elsewhere
+        output_text, perf_stats = run_model(
+            model_name,
+            prompt=prompt_text,
+            max_tokens=args.max_new_tokens,
+            sequence_length=args.sequence_length,
+            role="draft", profile=args.profile)
+        if args.profile and perf_stats:
+            save_perf_stats(perf_stats, file_prefix="performance_verify_draft")
     else:
         logger.error("Unknown role. Use --role target|draft|verify_target|verify_draft.")
 
