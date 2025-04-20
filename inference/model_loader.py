@@ -99,8 +99,8 @@ class NeuronHFAdapterWrap(torch.nn.Module):
             logits = logits[0, -1, :]
         elif logits.dim() == 2:
             logits = logits[0]
-        while isinstance(logits, (tuple, list)):
-            logits = logits[0]
+        # while isinstance(logits, (tuple, list)):
+        #     logits = logits[0]
 
         return logits, pos_tensor
 
