@@ -8,7 +8,16 @@ from datetime import datetime
 
 logger = logging.getLogger(__name__)
 
-def run_model(model_name: str, prompt: str, max_tokens: int = 50, sequence_length: int = 128, role: str = "target", profile: bool = False):
+def run_model(
+    model_name: str,
+    prompt: str,
+    max_tokens: int = 50,
+    sequence_length: int = 128,
+    role: str = "target",
+    profile: bool = False,
+    temperature: float = 1.0,
+    top_p: float = 0.9,
+):
     logger.info(f"Loading {role} model '{model_name}' for standalone generation (sequence_length={sequence_length})...")
     model = load_model(model_name, sequence_length=sequence_length)
     tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=False)
@@ -26,7 +35,13 @@ def run_model(model_name: str, prompt: str, max_tokens: int = 50, sequence_lengt
     tokens_generated = 0
 
     for i in range(max_tokens):
-        output = model.sample(input_ids, sequence_length=input_ids.shape[1] + 1)
+        # output = model.sample(input_ids, sequence_length=input_ids.shape[1] + 1)
+        output = model.sample(
+            input_ids,
+            sequence_length=input_ids.shape[1] + 1,
+            temperature=temperature,
+            top_p=top_p,
+        )
         if isinstance(output, (list, tuple)):
             token_id = int(output[0][-1])
         else:
@@ -78,11 +93,21 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Verification for standalone model generation")
     parser.add_argument("--model", type=str, required=True, help="Path to the model (target or draft) for verification")
     parser.add_argument("--prompt", type=str, required=True, help="Prompt text for generation")
+    parser.add_argument("--temperature", type=float, default=1.0, help="Sampling temperature")
+    parser.add_argument("--top_p", type=float, default=0.9, help="Top‑p nucleus cutoff")
     parser.add_argument("--max_tokens", type=int, default=50, help="Maximum number of tokens to generate")
     parser.add_argument("--sequence_length", type=int, default=128, help="Sequence length for model inference")
     parser.add_argument("--profile", action="store_true", help="Enable total-time performance profiling")
     parser.add_argument("--role", type=str, default="target", choices=["target", "draft"],
                         help="Model role for logging (e.g. 'target' or 'draft')")
     args = parser.parse_args()
-    run_model(args.model, prompt=args.prompt, max_tokens=args.max_tokens,
-              sequence_length=args.sequence_length, role=args.role, profile=args.profile)
+    run_model(
+        args.model,
+        prompt=args.prompt,
+        max_tokens=args.max_tokens,
+        sequence_length=args.sequence_length,
+        role=args.role,
+        profile=args.profile,
+        temperature=args.temperature,
+        top_p=args.top_p,
+    )

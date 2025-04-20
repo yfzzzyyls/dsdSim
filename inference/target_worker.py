@@ -27,8 +27,10 @@ class TargetSession:
         self.pending_logits = None
 
 class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
-    def __init__(self, model_path, sequence_length=128, spec_length=None):
+    def __init__(self, model_path, sequence_length=128, spec_length=None, temperature: float = 1.0, top_p: float = 0.9):
         self.model = model_loader.load_model(model_path, sequence_length=sequence_length, spec_length=spec_length)
+        self.temperature = temperature
+        self.top_p = top_p
         self.tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=False)
         self.eos_token_id = self.tokenizer.eos_token_id
         self._ctx_estimate = sequence_length
@@ -320,7 +322,12 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
                     sess.finished = True
 
             # ---------- 2) always generate ONE token from target ----------
-            fallback_token = self._generate_one_token(sess)
+            # fallback_token = self._generate_one_token(sess)
+            fallback_token = self._generate_one_token(
+                sess,
+                temperature=self.temperature,
+                top_p=self.top_p,
+            )
 
             # clear chunk for next round
             sess.last_draft_chunk = None
@@ -436,11 +443,19 @@ def _extract_logits_all(outputs):
         raise ValueError(f"Unhandled shape for model output: {out_t.shape}")
 
 
-def run_server(model_path, port=50051, sequence_length=128, spec_length=None, profile=False):
+def run_server(model_path, port=50051, sequence_length=128,
+               spec_length=None, profile=False,
+               temperature: float = 1.0, top_p: float = 0.9):
     logging.basicConfig(level=logging.INFO)
     logger.info(f"Loading target model from {model_path} seq_len={sequence_length}")
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=16))
-    servicer = SpeculativeServiceServicer(model_path, sequence_length=sequence_length, spec_length=spec_length)
+    servicer = SpeculativeServiceServicer(
+        model_path,
+        sequence_length=sequence_length,
+        spec_length=spec_length,
+        temperature=temperature,
+        top_p=top_p,
+    )
     inference_pb2_grpc.add_SpeculativeServiceServicer_to_server(servicer, server)
     server_address = f"[::]:{port}"
     logger.info(f"Target server starting on {server_address}")

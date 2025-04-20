@@ -72,7 +72,9 @@ def main():
             port=args.port,
             sequence_length=args.sequence_length,
             spec_length=args.gamma,
-            profile=args.profile
+            profile=args.profile,
+            temperature=args.temperature,
+            top_p=args.top_p,
         )
 
     elif args.role == "draft":
@@ -115,10 +117,16 @@ def main():
             return
         prompt_text = args.prompt or ""
         from inference import verify
-        verify.run_model(model_name, prompt=prompt_text,
-                         max_tokens=args.max_new_tokens,
-                         sequence_length=args.sequence_length,
-                         role="target", profile=args.profile)
+        verify.run_model(
+            model_name,
+            prompt=prompt_text,
+            max_tokens=args.max_new_tokens,
+            sequence_length=args.sequence_length,
+            role="target",
+            profile=args.profile,
+            temperature=args.temperature,
+            top_p=args.top_p,
+        )
 
     elif args.role == "verify_draft":
         model_name = args.model
