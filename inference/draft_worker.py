@@ -212,7 +212,7 @@ def _run_standalone_draft(draft_model, tokenizer, prompt, max_new_tokens, profil
             logger.error(f"Draft model generation failed: {e}")
             break
         token_id = int(output[0, -1]) if not isinstance(output, (list, tuple)) else int(output[0][-1])
-        token_text = tokenizer.decode([token_id], clean_up_tokenization_spaces=True)
+        token_text = tokenizer.decode([token_id], clean_up_tokenization_spaces=False)
         output_text += token_text
         new_token_tensor = torch.tensor([[token_id]], dtype=input_ids.dtype)
         input_ids = torch.cat([input_ids, new_token_tensor], dim=1)
