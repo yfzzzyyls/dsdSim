@@ -237,7 +237,7 @@ def speculative_decode(
                 _t0 = time.perf_counter()
             _, _ = draft_model.forward(input_ids=scratch_token)
             if profile:
-                timing["target_forward"] += time.perf_counter() - _t0
+                timing["draft_forward_time"] += time.perf_counter() - _t0
             draft_model.cache_ids = torch.tensor([draft_model._next_pos], dtype=torch.int32)
             # sanity: cursor and cache_ids agree
             assert int(draft_model.cache_ids.item()) == draft_model._next_pos, \
