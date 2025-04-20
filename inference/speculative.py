@@ -34,7 +34,7 @@ def speculative_decode(
     current_gamma = max(1, gamma)          # start with user‑given gamma
     gamma_max     = 8                      # hard ceiling
     current_temp  = temperature            # draft temperature we can tweak
-    target_accept = 0.8                    # desired per‑loop acceptance rate
+    target_accept = 0.7                    # desired per‑loop acceptance rate
 
     logger.debug(
         f"[session={session_id}] Starting speculative_decode: "

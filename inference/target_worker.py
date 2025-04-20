@@ -194,73 +194,59 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
     
     def _verify_single_step(self, sess: TargetSession, draft_tokens):
         """
-         Compute p_target(d₁…dₖ | context) **without mutating** permanent state.
- 
-         We assume:
-           • sess.cache_ids holds the *next‑free* KV slot index.
-           • sess.pending_logits (if not None) already contains logits for the
-             next position (temperature‑scaled).
- 
-         Returns
-         -------
-         probs : List[float] ‑ probability for each draft token under the
-                 target model’s *temperature‑scaled* soft‑max.
-         """
-        # Early exit: no draft tokens – keep pending_logits intact
+        Fast path: score all draft_tokens in ONE forward pass.
+
+        Returns
+        -------
+        probs : List[float]   – P_target(d_i | prefix + d_<i)   for each i
+        """
+        # ---------- short‑circuit ----------
         if not draft_tokens:
             return []
-        # ---------- snapshot current pointer & logits ----------
+
+        # ----- snapshot current pointer & logits -----
         orig_cache   = sess.cache_ids.clone()
         orig_nextpos = int(orig_cache.item())
-        logits_next  = sess.pending_logits            # may be None
-        sess.pending_logits = None                    # consume
+        logits_next  = sess.pending_logits          # may be None
+        sess.pending_logits = None                  # consume
 
-        probs = []
-        prev_tok  = int(sess.current_ids[0, -1])
-        prev_pos  = orig_nextpos - 1                  # position of prev_tok
-        next_pos  = orig_nextpos                      # where d₁ will go
+        # ----- sync model → session -----
+        self._sync_kv_pointer(sess)
 
-        self._sync_kv_pointer(sess)                   # align model→session
+        # (1, N) tensor holding the whole draft chunk
+        draft_tensor = torch.tensor(
+            [draft_tokens], dtype=sess.current_ids.dtype
+        )
 
-        for tok in draft_tokens:
-            # --- P_target(tok | context) ---
-            if logits_next is None:
-                lgts, _ = self.model.forward(
-                    input_ids=torch.tensor([[prev_tok]], dtype=sess.current_ids.dtype),
-                    cache_ids=torch.tensor([prev_pos], dtype=torch.int32),
-                )
-                logits_row = lgts[0] if lgts.dim() == 2 else lgts
-            else:
-                logits_row = logits_next[0] if logits_next.dim() == 2 else logits_next
+        # ---------- ONE model.forward ----------
+        # cache_ids tells Neuron this chunk starts at the next free slot
+        logits_all, _ = self.model.forward(
+            input_ids=draft_tensor,
+            cache_ids=sess.cache_ids.clone()
+        )
 
-            logits_row = logits_row / max(self.temperature, 1e-6)
-            p = float(torch.softmax(logits_row, dim=-1)[tok].item())
-            probs.append(p)
+        # temperature‑scale then soft‑max in fp32
+        logits_all = logits_all.float() / max(self.temperature, 1e-6)
+        probs_all  = torch.softmax(logits_all, dim=-1)
 
-            # --- advance cache by *consuming* tok, capture logits for next ---
-            lgts2, _ = self.model.forward(
-                input_ids=torch.tensor([[tok]], dtype=sess.current_ids.dtype),
-                cache_ids=torch.tensor([next_pos], dtype=torch.int32),
-            )
-            logits_next = lgts2[0] if lgts2.dim() == 2 else lgts2
-            prev_tok = tok
-            prev_pos = next_pos
-            next_pos += 1
+        # pick out the probability of each draft token
+        probs = [
+            float(probs_all[i, tok].item())
+            for i, tok in enumerate(draft_tokens)
+        ]
 
-        sess.pending_logits = logits_next.clone()     # reuse next time
+        # keep logits of the *last* position so next call can reuse them
+        sess.pending_logits = logits_all[-1].clone()
 
         # ---------- restore snapshot ----------
         self.model.cache_ids = orig_cache.clone()
         if hasattr(self.model, "_next_pos"):
             self.model._next_pos = orig_nextpos
         sess.cache_ids = orig_cache
-        # final sanity: model and session pointers must match
         assert int(self.model.cache_ids.item()) == int(sess.cache_ids.item()), \
             "KV desync detected on verify exit"
+
         return probs
-    # =============================
-    # SINGLE-SEQUENCE calls
-    # =============================
 
     def VerifyDraftTokens(self, request, context):
         sid = request.session_id
@@ -279,11 +265,6 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
                 target_probs = self._verify_single_step(sess, draft_tokens)
                 sess.last_draft_chunk = draft_tokens
                 return inference_pb2.VerifyResponse(target_probs=target_probs, finished=False)
-            # expanded_ids = torch.cat([sess.current_ids, torch.tensor([draft_tokens], dtype=sess.current_ids.dtype)], dim=1)
-            # expanded_ids = torch.cat(
-            #     [sess.current_ids, torch.tensor([draft_tokens], dtype=sess.current_ids.dtype)],
-            #     dim=1,
-            # )
             start_t = time.perf_counter()
             target_probs = self._verify_single_step(sess, draft_tokens)
             verif_ms = (time.perf_counter() - start_t)
