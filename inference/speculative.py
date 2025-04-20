@@ -65,10 +65,7 @@ def speculative_decode(
         # The draft model proposes up to 'gamma' tokens
         speculative_tokens = []
         speculative_probs = []
-        logger.debug(
-            f"[session={session_id}] Entering speculative inner loop: "
-            f"tokens_generated={tokens_generated}"
-        )
+        logger.debug("[session=%s] Entering inner loop, tokens_generated=%d", session_id, tokens_generated)
         past_states = [draft_model.cache_ids]
         for _ in range(gamma):
             # Prepare a 2‑D input_ids tensor [[token_id]]
@@ -79,22 +76,23 @@ def speculative_decode(
             logits = logits / temperature
             probs = torch.softmax(logits, dim=-1)
  
-            # nucleus filter
-            sorted_p, sorted_idx = torch.sort(probs, descending=True)
-            cum_p = torch.cumsum(sorted_p, dim=0)
-            cut_idx = torch.where(cum_p >= top_p)[0][0].item()
-            nucleus_idx = sorted_idx[:cut_idx + 1]
-            nucleus_probs = sorted_p[:cut_idx + 1]
-            nucleus_probs = nucleus_probs / nucleus_probs.sum()
-            
-            # --- context‑level repetition penalty (last 50 tokens) ---
-            recent = output_tokens[-50:] + speculative_tokens   # tokens already in draft path
-            if recent:
-                recent_set = set(recent)
-                for i, tok in enumerate(nucleus_idx):
-                    if int(tok) in recent_set:
-                        nucleus_probs[i] *= 0.4   # down‑weight repeated tokens
+                # ---------- nucleus filter (fast top‑k) ----------
+                k = min(512, probs.shape[-1])          # limit sort to top‑512
+                top_vals, top_idx = torch.topk(probs, k)         # O(V) → O(k log k)
+                cum_p = torch.cumsum(top_vals, dim=0)
+                cut = torch.searchsorted(cum_p, top_p, right=True).item()
+                nucleus_idx   = top_idx[:cut + 1]
+                nucleus_probs = top_vals[:cut + 1]
                 nucleus_probs = nucleus_probs / nucleus_probs.sum()
+
+                # ---------- vectorised repetition penalty ----------
+                recent = output_tokens[-50:] + speculative_tokens
+                if recent:
+                    recent_t = torch.tensor(recent, device=nucleus_idx.device)
+                    mask = (nucleus_idx.unsqueeze(1) == recent_t).any(dim=1)
+                    if mask.any():
+                        nucleus_probs = torch.where(mask, nucleus_probs * 0.4, nucleus_probs)
+                        nucleus_probs = nucleus_probs / nucleus_probs.sum()
             
             # sample a token from the renormalised nucleus
             sample_idx = torch.multinomial(nucleus_probs, 1).item()
@@ -115,9 +113,7 @@ def speculative_decode(
             if tokens_generated + len(speculative_tokens) >= max_new_tokens:
                 break
  
-        logger.debug(
-            f"[session={session_id}] Proposed tokens: {speculative_tokens}"
-        )
+        logger.debug("[session=%s] Proposed tokens: %s", session_id, speculative_tokens)
 
         # If overshoot
         if len(speculative_tokens) > 0 and tokens_generated > max_new_tokens:
