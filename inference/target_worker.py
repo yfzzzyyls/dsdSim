@@ -345,9 +345,10 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
                 and fallback_token == self.eos_token_id
             ):
                 sess.finished = True
-            # Log cumulative verification latency after each finalize call
-            logger.info("[session=%s] cumulative verification latency: %.3f s",
-                        sid, sess.verification_time)
+            # Log cumulative verification latency **once** when the session ends
+            if sess.finished:
+                logger.info("[session=%s] total verification latency: %.3f s",
+                            sid, sess.verification_time)
 
             token_text = self.tokenizer.decode([fallback_token]).strip() if fallback_token != 0 else "<none>"
             logger.debug(f"[Finalize] returning token_id={fallback_token} ‹{token_text}› to draft model")
