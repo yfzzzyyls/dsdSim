@@ -273,6 +273,15 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
         # logits_all shape (ctx_estimate, V); keep first N rows for real tokens
         logits_all = logits_all[:n_new]
 
+        # ---------- convert logits → probabilities for each draft token ----------
+        with torch.no_grad():
+            row_probs = torch.softmax(logits_all.float(), dim=-1)   # (N, V)
+        if row_probs.dim() == 1:
+            # model returned only the last‑token distribution; use it for all
+            probs = [float(row_probs[tok].item()) for tok in draft_tokens]
+        else:
+            probs = [float(row_probs[i, tok].item()) for i, tok in enumerate(draft_tokens)]
+
         # keep logits of the *last* position so next call can reuse them
         sess.pending_logits = logits_all[-1].clone()
 
