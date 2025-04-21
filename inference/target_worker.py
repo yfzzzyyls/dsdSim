@@ -243,36 +243,35 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
         )
 
         # ---------- ONE model.forward ----------
-        # 1) pad the (1, N) tensor to compile‑time length so Neuron's static graph is satisfied
-        padded_input = self._pad_ids(draft_tensor)           # shape (1, ctx_estimate)
- 
-        # 2) build start_ids (1, ctx_estimate) containing *relative* indices 0..N-1
-        start_ids = torch.zeros((1, self._ctx_estimate), dtype=torch.int32)
+        # Build (1, N) input_ids for the draft chunk
         n_new = len(draft_tokens)
-        if n_new > self._ctx_estimate:
-            raise ValueError(
-                f"Draft chunk ({n_new}) exceeds compile length {self._ctx_estimate}"
-            )
-        # relative indices 0..n_new-1 starting at current pointer
-        start_slice = slice(orig_nextpos, orig_nextpos + n_new)
-        start_ids[0, start_slice] = torch.arange(n_new, dtype=torch.int32)
+        draft_tensor = torch.tensor([draft_tokens], dtype=sess.current_ids.dtype)
  
-        # 3) single Neuron forward; cache_ids None because start_ids controls execution
+        # Absolute positions for each new token: [orig_nextpos .. orig_nextpos+N‑1]
+        pos_tensor = torch.arange(
+            orig_nextpos, orig_nextpos + n_new, dtype=torch.int32
+        ).unsqueeze(0)                                # shape (1, N)
+ 
+        # ---- static‑shape padding to ctx_estimate (=128) ----
+        # 1) pad input_ids on the right with zeros so length == ctx_estimate
+        padded_ids = self._pad_ids(draft_tensor)      # shape (1, ctx_estimate)
+ 
+        # 2) pad cache_ids to same length; fill unused tail with ‑1 (ignored)
+        pad_cache = torch.full_like(padded_ids, -1, dtype=torch.int32)
+        pad_cache[0, :n_new] = pos_tensor[0]          # copy real positions
+
+        # Neuron expects 1‑D cache_ids for a single sequence; squeeze batch dim
+        if pad_cache.ndim == 2 and pad_cache.size(0) == 1:
+            pad_cache = pad_cache.squeeze(0)        # shape becomes (ctx_estimate,)
+ 
+        # One Neuron forward – processes N real tokens; padded tail ignored
         logits_all, _ = self.model.forward(
-            input_ids=padded_input,
-            cache_ids=None,
-            start_ids=start_ids
+            input_ids=padded_ids,
+            cache_ids=pad_cache
         )
  
-        # logits_all has shape (sequence_length, V); keep only the first N rows
-        logits_all = logits_all[: len(draft_tokens)]
-        probs_all  = torch.softmax(logits_all, dim=-1)
-
-        # pick out the probability of each draft token
-        probs = [
-            float(probs_all[i, tok].item())
-            for i, tok in enumerate(draft_tokens)
-        ]
+        # logits_all shape (ctx_estimate, V); keep first N rows for real tokens
+        logits_all = logits_all[:n_new]
 
         # keep logits of the *last* position so next call can reuse them
         sess.pending_logits = logits_all[-1].clone()
