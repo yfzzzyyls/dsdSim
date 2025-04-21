@@ -66,8 +66,12 @@ message VerifyRequest {
 }
 
 message VerifyResponse {
-  repeated float target_probs = 1;
-  bool finished = 2;
+  // Tokens that actually became part of the sequence
+  repeated int32 committed_ids = 1;
+  // How many of those committed tokens were accepted draft tokens
+  uint32 accepted_count = 2;
+  // Generation finished?
+  bool finished = 3;
 }
 
 message FinalizeRequest {

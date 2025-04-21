@@ -301,28 +301,60 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
         return probs
 
     def VerifyDraftTokens(self, request, context):
-        sid = request.session_id
+        sid          = request.session_id
         draft_tokens = list(request.draft_tokens)
-        # logger.info(f"[session={sid}] VerifyDraftTokens: {draft_tokens}")
+
         with self.lock:
             if sid not in self.sessions:
-                logger.warning(f"Session {sid} not found.")
-                return inference_pb2.VerifyResponse(target_probs=[0.0]*len(draft_tokens), finished=True)
+                return inference_pb2.VerifyResponse(committed_ids=[],
+                                                    accepted_count=0,
+                                                    finished=True)
             sess = self.sessions[sid]
-            if sess.finished:
-                logger.info(f"Session {sid} is finished.")
-                return inference_pb2.VerifyResponse(target_probs=[], finished=True)
-            self._sync_kv_pointer(sess)
-            if not draft_tokens:
-                target_probs = self._verify_single_step(sess, draft_tokens)
-                sess.last_draft_chunk = draft_tokens
-                return inference_pb2.VerifyResponse(target_probs=target_probs, finished=False)
-            start_t = time.perf_counter()
-            target_probs = self._verify_single_step(sess, draft_tokens)
-            verif_ms = (time.perf_counter() - start_t)
-            sess.verification_time += verif_ms
-            sess.last_draft_chunk = draft_tokens
-            return inference_pb2.VerifyResponse(target_probs=target_probs, finished=False)
+            if sess.finished or not draft_tokens:
+                return inference_pb2.VerifyResponse(committed_ids=[],
+                                                    accepted_count=0,
+                                                    finished=sess.finished)
+
+            committed     = []
+            accepted_cnt  = 0
+
+            # scan until first rejection
+            for tok in draft_tokens:
+                p_target = self._verify_single_step(sess, [tok])[0]
+                if p_target >= 1e-3:                       # accept
+                    accepted_cnt += 1
+                    self._commit_token(sess, tok)
+                    committed.append(tok)
+                    if self.eos_token_id == tok:
+                        break
+                else:
+                    fallback = self._generate_one_token(sess,
+                                                        temperature=self.temperature,
+                                                        top_p=self.top_p)
+                    committed.append(fallback)
+                    break
+            else:
+                # all accepted → bonus token
+                bonus = self._generate_one_token(sess,
+                                                 temperature=self.temperature,
+                                                 top_p=self.top_p)
+                committed.append(bonus)
+
+            return inference_pb2.VerifyResponse(committed_ids=committed,
+                                                accepted_count=accepted_cnt,
+                                                finished=sess.finished)
+
+    # helper used above
+    def _commit_token(self, sess, tok_id):
+        tok = torch.tensor([[tok_id]], dtype=sess.current_ids.dtype)
+        sess.current_ids = torch.cat([sess.current_ids, tok], dim=1)
+        self._sync_kv_pointer(sess)
+        _, _ = self.model.forward(input_ids=tok,
+                                  cache_ids=torch.tensor([self.model._next_pos],
+                                                         dtype=torch.int32))
+        sess.cache_ids = torch.tensor([self.model._next_pos], dtype=torch.int32)
+        if self.eos_token_id == tok_id:
+            sess.finished = True
 
     def FinalizeTokens(self, request, context):
         sid              = request.session_id

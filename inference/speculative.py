@@ -154,112 +154,35 @@ def speculative_decode(
             break
 
         # 8) Verify tokens with target model
-        if profile:
-            _t0 = time.perf_counter()
-        target_probs, target_finished = grpc_client.verify_draft_tokens(
+        # --- Verify + commit in one RPC ---
+        commit_ids, accepted_count, target_finished = grpc_client.verify_draft_tokens(
             stub, speculative_tokens, session_id=session_id
         )
-        if profile:
-            timing["grpc_server_time"] += time.perf_counter() - _t0
-        logger.debug(
-            f"[session={session_id}] Target probs len={len(target_probs)}, finished={target_finished}"
-        )
-        if target_finished and len(target_probs) < len(speculative_tokens):
-            # partial consumption => treat rest as rejected
-            speculative_tokens = speculative_tokens[:len(target_probs)]
-            speculative_probs = speculative_probs[:len(target_probs)]
-            finished = True
+        accepted_tokens_total += accepted_count
+        target_tokens_total   += len(commit_ids) - accepted_count
 
-        # 9) Accept or reject
-        accept_count = 0
-        break_point = False
-        for idx, token_id in enumerate(speculative_tokens):
-            p_target = float(target_probs[idx]) if idx < len(target_probs) else 0.0
-            p_draft = float(speculative_probs[idx]) if idx < len(speculative_probs) else 1e-9
-            ratio = p_target / p_draft if p_draft > 0 else 0.0
-            if ratio > 1.0:
-                ratio = 1.0
-
-            if random.random() < ratio:
-                accept_count += 1
-                accepted_tokens_total += 1
-                if tokenizer.eos_token_id is not None and token_id == tokenizer.eos_token_id:
-                    finished = True
-                    break_point = True
-                    break
-            else:
-                break_point = True
-                break
-        logger.debug(
-            f"[session={session_id}] accept_count={accept_count} break_point={break_point}"
-        )
-
-        # ----------------------------------------------------------
-        # After accept/reject: commit accepted draft tokens
-        # ----------------------------------------------------------
-        if accept_count > 0:
-            output_tokens.extend(speculative_tokens[:accept_count])
-            recent_deque.extend(speculative_tokens[:accept_count])
-            tokens_generated += accept_count
-            # advance prev_token_id so the next chunk starts correctly
-            prev_token_id = speculative_tokens[accept_count - 1]
-            logger.debug(
-                f"[session={session_id}] Committed tokens → "
-                f"tokens_generated={tokens_generated} prev_token_id={prev_token_id}"
-            )
-
-        if break_point and accept_count < len(speculative_tokens):
-            if profile:
-                _rt0 = time.perf_counter()
-            # The unaccepted tokens were *not* appended to output_tokens,
-            # so we should NOT pop anything here.  Simply rewind the draft
-            # model’s KV pointer.
-            draft_model.cache_ids = past_states[accept_count].clone()
-            if hasattr(draft_model, "_next_pos"):
-                draft_model._next_pos = int(draft_model.cache_ids.item())
-            # sanity: cursor and cache_ids agree after rollback
-            assert int(draft_model.cache_ids.item()) == draft_model._next_pos, \
-                "Draft KV pointer mismatch after rollback"
-            prev_token_id = output_tokens[-1] if output_tokens else prompt_ids[0, -1].item()
-            logger.debug(f"[session={session_id}] Rollback: unaccepted={len(speculative_tokens) - accept_count}, cache_ids_restored={draft_model.cache_ids.tolist()}")
-            past_states = past_states[:accept_count+1]
-            if profile:
-                timing["rollback_time"] += time.perf_counter() - _rt0
-
-        if profile:
-            _t0 = time.perf_counter()
-        final_token_id, finalize_finished = grpc_client.finalize_tokens(
-            stub, accept_count, len(speculative_tokens), session_id=session_id
-        )
-        if profile:
-            timing["grpc_server_time"] += time.perf_counter() - _t0
-        if final_token_id != 0:
-            # Always commit the fallback / extra target token
-            scratch_token[0, 0] = final_token_id
-            recent_deque.append(final_token_id)
+        # Feed committed tokens back into the draft model so KV caches stay aligned
+        for tok in commit_ids:
+            scratch_token[0, 0] = tok
             if profile:
                 _t0 = time.perf_counter()
             _, _ = draft_model.forward(input_ids=scratch_token)
             if profile:
                 timing["draft_forward_time"] += time.perf_counter() - _t0
             draft_model.cache_ids = torch.tensor([draft_model._next_pos], dtype=torch.int32)
-            # sanity: cursor and cache_ids agree
-            assert int(draft_model.cache_ids.item()) == draft_model._next_pos, \
-                "Draft KV pointer mismatch after committing target token"
-            prev_token_id = final_token_id
-            output_tokens.append(final_token_id)
-            recent_deque.append(final_token_id)
+            prev_token_id = tok
+            output_tokens.append(tok)
+            recent_deque.append(tok)
             tokens_generated += 1
-            target_tokens_total += 1
-            logger.debug(
-                f"[session={session_id}] Target token committed: {final_token_id}"
-            )
-            if tokenizer.eos_token_id is not None and final_token_id == tokenizer.eos_token_id:
+            if tokenizer.eos_token_id is not None and tok == tokenizer.eos_token_id:
                 finished = True
+
+        # Propagate server‑side finished flag
+        finished = finished or target_finished
 
         # ---------- adaptive γ and temperature (P‑controller) ----------
         if current_gamma > 0:
-            loop_accept_rate = accept_count / current_gamma
+            loop_accept_rate = accepted_count / current_gamma
             error = target_accept - loop_accept_rate
 
             # proportional update
@@ -275,7 +198,7 @@ def speculative_decode(
                              session_id, current_temp, new_temp)
             current_temp = new_temp
 
-        if finalize_finished or tokens_generated >= max_new_tokens:
+        if target_finished or tokens_generated >= max_new_tokens:
             finished = True
 
     # Build final text
