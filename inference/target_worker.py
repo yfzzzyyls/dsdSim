@@ -110,14 +110,26 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
             else:
                 current_ids = torch.zeros((1,0), dtype=torch.long)
             self.sessions[session_id] = TargetSession(current_ids)
-            # --- prime Neuron KV cache on the prompt ---
+            # --- prime Neuron KV cache on the prompt (with padding) ---
             self.model.cache_ids = None
             self.model._next_pos = 0
+
+            prompt_len = current_ids.shape[1]
+            if prompt_len < self._ctx_estimate:
+                pad_tok_id = self.tokenizer.eos_token_id or 0
+                pad_len    = self._ctx_estimate - prompt_len
+                pad_tensor = torch.full((1, pad_len),
+                                        pad_tok_id,
+                                        dtype=current_ids.dtype,
+                                        device=current_ids.device)
+                current_ids = torch.cat([current_ids, pad_tensor], dim=1)
+                prompt_len  = current_ids.shape[1]          # == _ctx_estimate
+
             if current_ids.shape[1] > 0:
-                _ = self.model.forward(current_ids)
+                _ = self.model.forward(input_ids=current_ids)
             # store pointer (next index) inside the session
             self.sessions[session_id].cache_ids = torch.tensor(
-                [current_ids.shape[1]], dtype=torch.int32
+                [prompt_len], dtype=torch.int32
             )
         return inference_pb2.StartResponse(acknowledged=True)
 
@@ -255,16 +267,28 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
         n_new = len(draft_tokens)
         orig_cache = sess.cache_ids.clone()
         start_pos  = int(orig_cache.item())
-
-        ids_tensor = torch.tensor([draft_tokens], dtype=sess.current_ids.dtype)
-        pos_tensor = torch.arange(start_pos, start_pos + n_new,
-                                  dtype=torch.int32).unsqueeze(0)
-
-        padded_ids = self._pad_ids(ids_tensor)
-        pad_cache  = torch.full_like(padded_ids, -1, dtype=torch.int32)
-        pad_cache[0, : n_new] = pos_tensor[0]
-        if pad_cache.ndim == 2:
-            pad_cache = pad_cache.squeeze(0)
+ 
+        # ------------------------------------------------------------
+        # 0) Build 1‑D vector:  [last_verified_token,  draft_tokens...]
+        #    This gives the verify model N+1 logits rows (AMUSD trick)
+        # ------------------------------------------------------------
+        if sess.current_ids.shape[1] > 0:
+            overlap_tok = int(sess.current_ids[0, -1].item())
+        else:
+            overlap_tok =  self.tokenizer.bos_token_id or 0
+ 
+        ids_tensor = torch.tensor(
+            [overlap_tok] + draft_tokens,      # length N+1
+            dtype=sess.current_ids.dtype
+        )
+        n_new = len(draft_tokens)              # still N (draft count)
+ 
+        # Absolute positions for the N+1 tokens we feed
+        pos_tensor = torch.arange(
+            start_pos - 1,      # overlap token position
+            start_pos + n_new,  # up to tN
+            dtype=torch.int32
+        )
 
         # ------------------------------------------------------------
         # Run speculative decoder: pass draft tokens via **start_ids**
@@ -273,8 +297,8 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
         # ------------------------------------------------------------
         out = self.model.adapter(
             input_ids=torch.empty((1, 0), dtype=ids_tensor.dtype, device=ids_tensor.device),
-            start_ids=ids_tensor,       # <- draft tokens here
-            cache_ids=pad_cache,
+            start_ids=ids_tensor,           # 1‑D (N+1,)
+            cache_ids=pos_tensor,           # 1‑D (N+1,)
             return_dict=False,
         )
 
@@ -289,8 +313,8 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
                 logits_all = logits_all.unsqueeze(0)
             # take top‑k slice manually (k = 512)
             scores_all, idx_all = torch.topk(logits_all, TOP_K_TARGET, dim=-1)
-        scores_all = scores_all[: n_new + 1].float()   # (N+1, 512)
-        idx_all    = idx_all[: n_new + 1].int()         # (N+1, 512)
+        scores_all = scores_all[1:n_new + 2].float()   # keep rows for t1..tN + bonus
+        idx_all    = idx_all[1:n_new + 2].int()
 
         # --- compute probability of each draft token ---
         probs_all = []
