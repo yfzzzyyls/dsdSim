@@ -277,8 +277,13 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
         with torch.no_grad():
             row_probs = torch.softmax(logits_all.float(), dim=-1)   # (N, V)
         if row_probs.dim() == 1:
-            # model returned only the last‑token distribution; use it for all
-            probs = [float(row_probs[tok].item()) for tok in draft_tokens]
+            vocab_len = row_probs.size(0)
+            if vocab_len > max(draft_tokens):        # normal case → full vocab
+                probs = [float(row_probs[tok].item()) for tok in draft_tokens]
+            else:
+                # Fallback: model returned only N values (one per token).
+                # Treat them directly as P_target(draft_i | context).
+                probs = [float(row_probs[i].item()) for i in range(n_new)]
         else:
             probs = [float(row_probs[i, tok].item()) for i, tok in enumerate(draft_tokens)]
 
