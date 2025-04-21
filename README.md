@@ -151,17 +151,4 @@ This will use the 1B draft model to generate text token-by-token for the given p
 
 *Note:* In verification modes, the model will be compiled on the fly if a compiled Neuron model is not found. By default, **`--sequence_length 128` is used; ensure you use the same sequence length that the model was compiled with (or specify** **`--sequence_length` accordingly) to avoid recompilation. The** `--max_tokens` option controls how many new tokens to generate for the prompt.
 
-## **Advanced Tips**
-
-* **NEURON_RT_VISIBLE_CORES**: If your instance has multiple NeuronCores, you can dedicate certain cores to the draft or server processes:
-
-```
-#In terminal 1 (server):export NEURON_RT_VISIBLE_CORES=4-15
-python model_service.py ...#In terminal 2 (draft):export NEURON_RT_VISIBLE_CORES=0-3
-python draft_client.py ...
-```
-
-This can allow parallel execution, improving throughput.
-
-* **Larger Models**: If using LLaMA 7B or bigger, you might need to distribute the model across multiple Neuron cores. That requires advanced compilation with **neuronx-distributed** or optimum-neuron. The approach is similar; just ensure the code references the sharded model.
-* **Modifying the Speculative Mechanism**: The draft code uses a simple loop with **use_cache=True**. If you want to do partial or multi-token steps differently, you can adapt the logic in **draft_client.py**
+## **Supported features**
