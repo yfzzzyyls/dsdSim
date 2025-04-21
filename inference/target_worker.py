@@ -247,9 +247,16 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
         logits_all = logits_all[: n_new + 1].float()
 
         # probs for each draft token
-        row_probs = torch.softmax(logits_all[:n_new], dim=-1)
-        probs = [float(row_probs[i, tok].item())
-                 for i, tok in enumerate(draft_tokens)]
+        row_slice = logits_all[:n_new]            # could be 1‑D when n_new == 1
+        row_probs = torch.softmax(row_slice, dim=-1)
+
+        if row_probs.dim() == 1:                  # only one draft token
+            probs = [float(row_probs[tok].item())]
+        else:
+            probs = [
+                float(row_probs[i, tok].item())
+                for i, tok in enumerate(draft_tokens)
+            ]
 
         logits_rows = [logits_all[i].clone() for i in range(n_new + 1)]
         sess.pending_logits = logits_rows[-1]
