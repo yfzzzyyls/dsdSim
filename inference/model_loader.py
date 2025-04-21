@@ -10,9 +10,9 @@ from transformers_neuronx.generation_utils import HuggingFaceGenerationModelAdap
 import torch
 from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers_neuronx.fused_speculation import FusedSpeculativeDecoder
-# Fused Speculative Decoding is supported.
-# fsd = FusedSpeculativeDecoder(draft_model, target_model, spec_length)
-# fsd.to_neuron()  # Compile the fused speculative model
+# fused speculative decoding utilities
+# generic Neuron interfaces (present in transformers‑neuronx >= 0.13)
+from transformers_neuronx import NeuronAutoModelForCausalLM, NeuronConfig, GenerationConfig
 
 logger = logging.getLogger(__name__)
 
@@ -192,3 +192,101 @@ def compile_model(model_path: str, sequence_length: int = DEFAULT_SEQUENCE_LENGT
         tokenizer.save_pretrained(compiled_dir)
         logger.info(f"Model and tokenizer saved to '{compiled_dir}' (no Neuron compilation performed).")
         return model
+    
+# ---------------------------------------------------------------------------
+# Target‑only helpers: compile a fused speculative decoder (γ draft + 1 bonus)
+# ---------------------------------------------------------------------------
+
+def compile_target_model(
+    model_path: str,
+    sequence_length: int = DEFAULT_SEQUENCE_LENGTH,
+    spec_length: int = 4,
+    top_k: int = 512,
+    top_p: float = 1.0,
+    temperature: float = 1.0,
+):
+    """
+    Compile a fused speculative decoder that:
+        • uses a *draft* LLaMA and a *target* LLaMA (both the same path here)
+        • verifies `spec_length` draft tokens and returns N+1 logits in 1 forward
+
+    All embedding look‑ups and top‑k / top‑p sampling run on the Neuron device
+    via `on_device_embedding` and `on_device_generation`.
+    """
+    logger.info(
+        "[compile_target_model] model=%s  γ=%d  seq_len=%d  top_k=%d top_p=%.2f",
+        model_path,
+        spec_length,
+        sequence_length,
+        top_k,
+        top_p,
+    )
+
+    # -------- on‑device generation configuration --------
+    gen_cfg = GenerationConfig(
+        top_k=top_k,
+        top_p=top_p,
+        do_sample=True,
+        temperature=temperature,
+    )
+    neuron_cfg = NeuronConfig(
+        padding_side="right",
+        attention_layout="BSH",
+        collectives_layout="BSH",
+        on_device_embedding=True,
+        on_device_generation=gen_cfg,
+    )
+
+    tp_degree = int(os.environ.get("NEURON_RT_NUM_CORES", "2"))
+
+    # ---- compile the *draft* model ----
+    draft_model = NeuronAutoModelForCausalLM.from_pretrained(
+        model_path,
+        batch_size=1,
+        n_positions=sequence_length,
+        tp_degree=tp_degree,
+        amp="bf16",
+        neuron_config=neuron_cfg,
+    )
+    draft_model.to_neuron()
+
+    # ---- compile the *target* model ----
+    target_model = NeuronAutoModelForCausalLM.from_pretrained(
+        model_path,
+        batch_size=1,
+        n_positions=sequence_length,
+        tp_degree=tp_degree,
+        amp="bf16",
+        neuron_config=neuron_cfg,
+    )
+    target_model.to_neuron()
+
+    # ---- fuse them into a speculative decoder ----
+    fused = FusedSpeculativeDecoder(draft_model, target_model, spec_length)
+    fused.to_neuron()
+
+    hf_cfg = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+    adapter = HuggingFaceGenerationModelAdapter(hf_cfg, fused)
+    return NeuronHFAdapterWrap(adapter)
+
+
+def load_target_model(
+    model_path: str,
+    sequence_length: int = DEFAULT_SEQUENCE_LENGTH,
+    spec_length: int = 4,
+    top_k: int = 512,
+    top_p: float = 1.0,
+    temperature: float = 1.0,
+):
+    """
+    Always (re)compile the fused target graph.  No on‑disk caching to keep the
+    code path simple and stateless.
+    """
+    return compile_target_model(
+        model_path,
+        sequence_length=sequence_length,
+        spec_length=spec_length,
+        top_k=top_k,
+        top_p=top_p,
+        temperature=temperature,
+    )

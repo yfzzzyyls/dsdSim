@@ -31,7 +31,11 @@ class TargetSession:
 
 class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
     def __init__(self, model_path, sequence_length=128, spec_length=None, temperature: float = 1.0, top_p: float = 0.9):
-        self.model = model_loader.load_model(model_path, sequence_length=sequence_length, spec_length=spec_length)
+        self.model = model_loader.load_target_model(
+            model_path,
+            sequence_length=sequence_length,
+            spec_length=spec_length or 4
+        )
         self.temperature = temperature
         self.top_p = top_p
         self.tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=False)
@@ -267,75 +271,51 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
         n_new = len(draft_tokens)
         orig_cache = sess.cache_ids.clone()
         self._sync_kv_pointer(sess)
-        start_pos  = int(orig_cache.item())
- 
         # ------------------------------------------------------------
-        # 0) Build 1‑D vector:  [last_verified_token,  draft_tokens...]
-        #    This gives the verify model N+1 logits rows (AMUSD trick)
+        # Speculative decoder expects:
+        #   input_ids : (1, 0)
+        #   start_ids : (1, N)   -- batch dim first
+        #   cache_ids : scalar   -- current context length
+        # It then returns (N+1, 512) logits rows.
         # ------------------------------------------------------------
-        if sess.current_ids.shape[1] > 0:
-            overlap_tok = int(sess.current_ids[0, -1].item())
-        else:
-            overlap_tok =  self.tokenizer.bos_token_id or 0
- 
-        ids_tensor = torch.tensor(
-            [overlap_tok] + draft_tokens,      # length N+1
-            dtype=sess.current_ids.dtype
-        )
-        n_new = len(draft_tokens)              # still N (draft count)
- 
-        # Absolute positions for the N+1 tokens we feed
-        pos_tensor = torch.arange(
-            start_pos - 1,      # overlap token position
-            start_pos + n_new,  # up to tN
-            dtype=torch.int32
-        )
+        start_ids_2d = torch.tensor([draft_tokens],
+                                    dtype=sess.current_ids.dtype)   # shape (1, N)
+        cache_scalar = sess.cache_ids.clone()                       # shape (1,)
 
-        # ------------------------------------------------------------
-        # Run speculative decoder: pass draft tokens via **start_ids**
-        # so the graph emits (N+1) rows.  input_ids is empty because
-        # the prompt context is already in KV cache.
-        # ------------------------------------------------------------
         out = self.model.adapter(
-            input_ids=torch.empty((1, 0), dtype=ids_tensor.dtype, device=ids_tensor.device),
-            start_ids=ids_tensor,           # 1‑D (N+1,)
-            cache_ids=pos_tensor,           # 1‑D (N+1,)
+            input_ids=torch.empty((1, 0), dtype=start_ids_2d.dtype, device=start_ids_2d.device),
+            start_ids=start_ids_2d,
+            cache_ids=cache_scalar,          # current pointer
             return_dict=False,
         )
 
         if isinstance(out, (tuple, list)) and len(out) == 2:
-            # preferred fast path: adapter already gives top‑k slice
             scores_all, idx_all = out
+            if scores_all.dim() == 3:
+                scores_all = scores_all.squeeze(0)
+                idx_all    = idx_all.squeeze(0)
         else:
-            # fallback: adapter returned full‑vocab logits
             logits_all = out if not isinstance(out, (tuple, list)) else out[0]
-            # ensure float32 and (N+1, V) shape
-            if logits_all.dim() == 1:                 # (V,)  → (1, V)
+            if logits_all.dim() == 1:
                 logits_all = logits_all.unsqueeze(0)
-            # take top‑k slice manually (k = 512)
             scores_all, idx_all = torch.topk(logits_all, TOP_K_TARGET, dim=-1)
-        scores_all = scores_all[1:n_new + 2].float()   # keep rows for t1..tN + bonus
-        idx_all    = idx_all[1:n_new + 2].int()
+        scores_all = scores_all.float()
+        idx_all    = idx_all.int()
 
-        # --- compute probability of each draft token ---
         probs_all = []
         for step, tok in enumerate(draft_tokens):
             row_scores = scores_all[step]
             row_idx    = idx_all[step]
-            
-            # nonzero(as_tuple=True) → 1‑D tensor of matching positions
             matches = (row_idx == tok).nonzero(as_tuple=True)[0]
             if matches.numel():
-                j = int(matches[0].item())   # first matching column index
+                j = int(matches[0].item())
                 p = float(torch.softmax(row_scores, dim=-1)[j].item())
             else:
                 p = 0.0
             probs_all.append(p)
 
-        # bundle rows so caller can sample later
         logits_rows = [(scores_all[i], idx_all[i]) for i in range(n_new + 1)]
 
-        # restore pointer
         sess.cache_ids = orig_cache.clone()
         self._sync_kv_pointer(sess)
         return probs_all, logits_rows
