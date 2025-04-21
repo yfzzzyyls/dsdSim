@@ -266,6 +266,7 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
 
         n_new = len(draft_tokens)
         orig_cache = sess.cache_ids.clone()
+        self._sync_kv_pointer(sess)
         start_pos  = int(orig_cache.item())
  
         # ------------------------------------------------------------
