@@ -218,90 +218,49 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
     
     def _verify_single_step(self, sess: TargetSession, draft_tokens):
         """
-        Fast path: score all draft_tokens in ONE forward pass.
-
-        Returns
-        -------
-        probs : List[float]   – P_target(d_i | prefix + d_<i)   for each i
+        ONE forward pass:
+          – returns P_target for every draft token, and
+          – provides logits for the next position (row N).
+        Assumes Neuron graph emits len(draft_tokens)+1 rows of logits.
         """
-        # ---------- short‑circuit ----------
         if not draft_tokens:
-            return []
+            return [], []
 
-        # ----- snapshot current pointer & logits -----
-        orig_cache   = sess.cache_ids.clone()
-        orig_nextpos = int(orig_cache.item())
-        logits_next  = sess.pending_logits          # may be None
-        sess.pending_logits = None                  # consume
-
-        # ----- sync model → session -----
-        self._sync_kv_pointer(sess)
-
-        # (1, N) tensor holding the whole draft chunk
-        draft_tensor = torch.tensor(
-            [draft_tokens], dtype=sess.current_ids.dtype
-        )
-
-        # ---------- ONE model.forward ----------
-        # Build (1, N) input_ids for the draft chunk
         n_new = len(draft_tokens)
-        draft_tensor = torch.tensor([draft_tokens], dtype=sess.current_ids.dtype)
- 
-        # Absolute positions for each new token: [orig_nextpos .. orig_nextpos+N‑1]
-        pos_tensor = torch.arange(
-            orig_nextpos, orig_nextpos + n_new, dtype=torch.int32
-        ).unsqueeze(0)                                # shape (1, N)
- 
-        # ---- static‑shape padding to ctx_estimate (=128) ----
-        # 1) pad input_ids on the right with zeros so length == ctx_estimate
-        padded_ids = self._pad_ids(draft_tensor)      # shape (1, ctx_estimate)
- 
-        # 2) pad cache_ids to same length; fill unused tail with ‑1 (ignored)
-        pad_cache = torch.full_like(padded_ids, -1, dtype=torch.int32)
-        pad_cache[0, :n_new] = pos_tensor[0]          # copy real positions
+        orig_cache = sess.cache_ids.clone()
+        start_pos  = int(orig_cache.item())
 
-        # Neuron expects 1‑D cache_ids for a single sequence; squeeze batch dim
-        if pad_cache.ndim == 2 and pad_cache.size(0) == 1:
-            pad_cache = pad_cache.squeeze(0)        # shape becomes (ctx_estimate,)
- 
-        # One Neuron forward – processes N real tokens; padded tail ignored
+        ids_tensor = torch.tensor([draft_tokens], dtype=sess.current_ids.dtype)
+        pos_tensor = torch.arange(start_pos, start_pos + n_new,
+                                  dtype=torch.int32).unsqueeze(0)
+
+        padded_ids = self._pad_ids(ids_tensor)
+        pad_cache  = torch.full_like(padded_ids, -1, dtype=torch.int32)
+        pad_cache[0, : n_new] = pos_tensor[0]
+        if pad_cache.ndim == 2:
+            pad_cache = pad_cache.squeeze(0)
+
         logits_all, _ = self.model.forward(
             input_ids=padded_ids,
-            cache_ids=pad_cache
-        )
- 
-        # logits_all shape (ctx_estimate, V); keep first N rows for real tokens
-        logits_all = logits_all[:n_new]
+            cache_ids=pad_cache,
+        )                           # shape (N+1, vocab)
+        logits_all = logits_all[: n_new + 1].float()
 
-        # ---------- convert logits → probabilities for each draft token ----------
-        with torch.no_grad():
-            row_probs = torch.softmax(logits_all.float(), dim=-1)   # (N, V)
-        if row_probs.dim() == 1:
-            vocab_len = row_probs.size(0)
-            if vocab_len > max(draft_tokens):        # normal case → full vocab
-                probs = [float(row_probs[tok].item()) for tok in draft_tokens]
-            else:
-                # Fallback: model returned only N values (one per token).
-                # Treat them directly as P_target(draft_i | context).
-                probs = [float(row_probs[i].item()) for i in range(n_new)]
-        else:
-            probs = [float(row_probs[i, tok].item()) for i, tok in enumerate(draft_tokens)]
+        # probs for each draft token
+        row_probs = torch.softmax(logits_all[:n_new], dim=-1)
+        probs = [float(row_probs[i, tok].item())
+                 for i, tok in enumerate(draft_tokens)]
 
-        # keep logits of the *last* position so next call can reuse them
-        sess.pending_logits = logits_all[-1].clone()
+        logits_rows = [logits_all[i].clone() for i in range(n_new + 1)]
+        sess.pending_logits = logits_rows[-1]
 
-        # ---------- restore snapshot ----------
-        self.model.cache_ids = orig_cache.clone()
-        if hasattr(self.model, "_next_pos"):
-            self.model._next_pos = orig_nextpos
-        sess.cache_ids = orig_cache
-        assert int(self.model.cache_ids.item()) == int(sess.cache_ids.item()), \
-            "KV desync detected on verify exit"
-
-        return probs
+        # restore pointer
+        sess.cache_ids = orig_cache.clone()
+        self._sync_kv_pointer(sess)
+        return probs, logits_rows
 
     def VerifyDraftTokens(self, request, context):
-        sid          = request.session_id
+        sid = request.session_id
         draft_tokens = list(request.draft_tokens)
 
         with self.lock:
@@ -309,40 +268,54 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
                 return inference_pb2.VerifyResponse(committed_ids=[],
                                                     accepted_count=0,
                                                     finished=True)
+
             sess = self.sessions[sid]
             if sess.finished or not draft_tokens:
                 return inference_pb2.VerifyResponse(committed_ids=[],
                                                     accepted_count=0,
                                                     finished=sess.finished)
 
-            committed     = []
-            accepted_cnt  = 0
+            committed    = []
+            accepted_cnt = 0
 
-            # scan until first rejection
-            for tok in draft_tokens:
-                p_target = self._verify_single_step(sess, [tok])[0]
-                if p_target >= 1e-3:                       # accept
+            # ----- single forward pass (scores + per‑step logits) -----
+            probs_all, logits_rows = self._verify_single_step(sess, draft_tokens)
+
+            # Walk until first rejection
+            for idx, tok in enumerate(draft_tokens):
+                current_logits = logits_rows[idx]
+                p_target = probs_all[idx]
+                if p_target >= 1e-3:
                     accepted_cnt += 1
                     self._commit_token(sess, tok)
                     committed.append(tok)
-                    if self.eos_token_id == tok:
+                    if tok == self.eos_token_id:
                         break
                 else:
-                    fallback = self._generate_one_token(sess,
-                                                        temperature=self.temperature,
-                                                        top_p=self.top_p)
+                    # first rejection → use logits at this position
+                    fallback = self._sample_from_logits(
+                        current_logits,
+                        temperature=self.temperature,
+                        top_p=self.top_p,
+                    )
+                    self._commit_token(sess, fallback)
                     committed.append(fallback)
                     break
             else:
-                # all accepted → bonus token
-                bonus = self._generate_one_token(sess,
-                                                 temperature=self.temperature,
-                                                 top_p=self.top_p)
+                # all accepted → use logits_rows[-1] as bonus token
+                bonus = self._sample_from_logits(
+                    logits_rows[-1],
+                    temperature=self.temperature,
+                    top_p=self.top_p,
+                )
+                self._commit_token(sess, bonus)
                 committed.append(bonus)
 
-            return inference_pb2.VerifyResponse(committed_ids=committed,
-                                                accepted_count=accepted_cnt,
-                                                finished=sess.finished)
+            return inference_pb2.VerifyResponse(
+                committed_ids=committed,
+                accepted_count=accepted_cnt,
+                finished=sess.finished,
+            )
 
     # helper used above
     def _commit_token(self, sess, tok_id):
@@ -355,6 +328,21 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
         sess.cache_ids = torch.tensor([self.model._next_pos], dtype=torch.int32)
         if self.eos_token_id == tok_id:
             sess.finished = True
+
+    def _sample_from_logits(self, logits, temperature=1.0, top_p=0.9):
+        logits = logits / max(1e-8, temperature)
+        probs  = torch.softmax(logits, dim=-1)
+
+        # nucleus sampling
+        sorted_probs, sorted_idx = torch.sort(probs, descending=True)
+        cumsum = torch.cumsum(sorted_probs, dim=-1)
+        cutoff = torch.searchsorted(cumsum, top_p, right=True).item()
+        keep_idx   = sorted_idx[: cutoff + 1]
+        keep_probs = sorted_probs[: cutoff + 1]
+        keep_probs = keep_probs / keep_probs.sum()
+
+        choice = torch.multinomial(keep_probs, 1).item()
+        return int(keep_idx[choice].item())
 
     def FinalizeTokens(self, request, context):
         sid              = request.session_id
