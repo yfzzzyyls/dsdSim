@@ -243,19 +243,29 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
         )
 
         # ---------- ONE model.forward ----------
-        # cache_ids tells Neuron this chunk starts at the next free slot
-        # pad to compile‑time length (128) so Neuron is happy
-        padded_input = self._pad_ids(draft_tensor)
+        # 1) pad the (1, N) tensor to compile‑time length so Neuron's static graph is satisfied
+        padded_input = self._pad_ids(draft_tensor)           # shape (1, ctx_estimate)
+ 
+        # 2) build start_ids (1, ctx_estimate) containing *relative* indices 0..N-1
+        start_ids = torch.zeros((1, self._ctx_estimate), dtype=torch.int32)
+        n_new = len(draft_tokens)
+        if n_new > self._ctx_estimate:
+            raise ValueError(
+                f"Draft chunk ({n_new}) exceeds compile length {self._ctx_estimate}"
+            )
+        # relative indices 0..n_new-1 starting at current pointer
+        start_slice = slice(orig_nextpos, orig_nextpos + n_new)
+        start_ids[0, start_slice] = torch.arange(n_new, dtype=torch.int32)
+ 
+        # 3) single Neuron forward; cache_ids None because start_ids controls execution
         logits_all, _ = self.model.forward(
             input_ids=padded_input,
-            cache_ids=sess.cache_ids.clone()
+            cache_ids=None,
+            start_ids=start_ids
         )
-
-        # logits_all shape is (128, V); keep only the first N rows
+ 
+        # logits_all has shape (sequence_length, V); keep only the first N rows
         logits_all = logits_all[: len(draft_tokens)]
-
-        # temperature‑scale then soft‑max in fp32
-        logits_all = logits_all.float() / max(self.temperature, 1e-6)
         probs_all  = torch.softmax(logits_all, dim=-1)
 
         # pick out the probability of each draft token
