@@ -73,6 +73,27 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
         assert int(self.model.cache_ids.item()) == int(sess.cache_ids.item()), \
             "Target KV cache_ids desynchronised after sync"
 
+    # ------------------------------------------------------------
+    # Utility: sample from <scores, indices> row returned by top‑k
+    # ------------------------------------------------------------
+    def _sample_from_topk(self, scores_row, idx_row, temperature: float = 1.0, top_p: float = 0.9):
+        """
+        scores_row : 1‑D tensor, un‑normalised logits for top‑k tokens
+        idx_row    : 1‑D tensor, token‑ids that correspond to scores_row
+        """
+        logits = scores_row.float() / max(1e-8, temperature)
+        probs  = torch.softmax(logits, dim=-1)
+
+        cum_p = torch.cumsum(torch.sort(probs, descending=True)[0], dim=0)
+        cut   = torch.searchsorted(cum_p, top_p, right=True).item()
+        sorted_probs, sorted_idx = torch.sort(probs, descending=True)
+        keep_probs = sorted_probs[: cut + 1]
+        keep_idx   = idx_row[sorted_idx[: cut + 1]]
+        keep_probs = keep_probs / keep_probs.sum()
+
+        choice = torch.multinomial(keep_probs, 1).item()
+        return int(keep_idx[choice].item())
+
 
     def StartGeneration(self, request, context):
         session_id = request.session_id
@@ -219,10 +240,14 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
     
     def _verify_single_step(self, sess: TargetSession, draft_tokens):
         """
-        ONE forward pass:
-          – returns P_target for every draft token, and
-          – provides logits for the next position (row N).
-        Assumes Neuron graph emits len(draft_tokens)+1 rows of logits.
+        One Neuron forward on the *whole* draft chunk.
+        Returns:
+            probs_all  – List[float]  P_target(d_i) for each draft token
+            rows       – List[Tuple[scores_row, idx_row]]  len = N+1
+                          where each element is (scores, indices) 1‑D tensors
+        Works with top_k=512: the model returns two tensors
+            scores : (N+1, 512)
+            idx    : (N+1, 512)   token‑ids that correspond to those scores
         """
         if not draft_tokens:
             return [], []
@@ -241,39 +266,54 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
         if pad_cache.ndim == 2:
             pad_cache = pad_cache.squeeze(0)
 
-        logits_all, _ = self.model.forward(
-            input_ids=padded_ids,
+        # ------------------------------------------------------------
+        # Run speculative decoder: pass draft tokens via **start_ids**
+        # so the graph emits (N+1) rows.  input_ids is empty because
+        # the prompt context is already in KV cache.
+        # ------------------------------------------------------------
+        out = self.model.adapter(
+            input_ids=torch.empty((1, 0), dtype=ids_tensor.dtype, device=ids_tensor.device),
+            start_ids=ids_tensor,       # <- draft tokens here
             cache_ids=pad_cache,
-        )                           # shape (N+1, vocab)
-        logits_all = logits_all[: n_new + 1].float()
+            return_dict=False,
+        )
 
-        # probs for each draft token
-        row_slice = logits_all[:n_new]            # could be 1‑D when n_new == 1
-        row_probs = torch.softmax(row_slice, dim=-1)
-
-
-        # ---------------- single‑pass, top‑k slice ----------------
-        probs = []
-        if row_probs.dim() == 1:       # single draft token
-            tok_id = draft_tokens[0]
-            if tok_id < row_probs.size(0):
-                probs.append(float(row_probs[tok_id].item()))
-            else:
-                probs.append(0.0)      # token not in top‑k slice → reject
+        if isinstance(out, (tuple, list)) and len(out) == 2:
+            # preferred fast path: adapter already gives top‑k slice
+            scores_all, idx_all = out
         else:
-            for i, tok_id in enumerate(draft_tokens):
-                if tok_id < row_probs.size(1):
-                    probs.append(float(row_probs[i, tok_id].item()))
-                else:
-                    probs.append(0.0)
+            # fallback: adapter returned full‑vocab logits
+            logits_all = out if not isinstance(out, (tuple, list)) else out[0]
+            # ensure float32 and (N+1, V) shape
+            if logits_all.dim() == 1:                 # (V,)  → (1, V)
+                logits_all = logits_all.unsqueeze(0)
+            # take top‑k slice manually (k = 512)
+            scores_all, idx_all = torch.topk(logits_all, TOP_K_TARGET, dim=-1)
+        scores_all = scores_all[: n_new + 1].float()   # (N+1, 512)
+        idx_all    = idx_all[: n_new + 1].int()         # (N+1, 512)
 
-        logits_rows = [logits_all[i].clone() for i in range(n_new + 1)]
-        sess.pending_logits = logits_rows[-1]
+        # --- compute probability of each draft token ---
+        probs_all = []
+        for step, tok in enumerate(draft_tokens):
+            row_scores = scores_all[step]
+            row_idx    = idx_all[step]
+            
+            # nonzero(as_tuple=True) → 1‑D tensor of matching positions
+            matches = (row_idx == tok).nonzero(as_tuple=True)[0]
+            if matches.numel():
+                j = int(matches[0].item())   # first matching column index
+                p = float(torch.softmax(row_scores, dim=-1)[j].item())
+            else:
+                p = 0.0
+            probs_all.append(p)
+
+        # bundle rows so caller can sample later
+        logits_rows = [(scores_all[i], idx_all[i]) for i in range(n_new + 1)]
 
         # restore pointer
         sess.cache_ids = orig_cache.clone()
         self._sync_kv_pointer(sess)
-        return probs, logits_rows
+        return probs_all, logits_rows
 
     def VerifyDraftTokens(self, request, context):
         sid = request.session_id
@@ -299,7 +339,7 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
 
             # Walk until first rejection
             for idx, tok in enumerate(draft_tokens):
-                current_logits = logits_rows[idx]
+                current_scores, current_idx = logits_rows[idx]
                 p_target = probs_all[idx]
                 if p_target >= 1e-3:
                     accepted_cnt += 1
@@ -308,9 +348,8 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
                     if tok == self.eos_token_id:
                         break
                 else:
-                    # first rejection → use logits at this position
-                    fallback = self._sample_from_logits(
-                        current_logits,
+                    fallback = self._sample_from_topk(
+                        current_scores, current_idx,
                         temperature=self.temperature,
                         top_p=self.top_p,
                     )
@@ -318,9 +357,9 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
                     committed.append(fallback)
                     break
             else:
-                # all accepted → use logits_rows[-1] as bonus token
-                bonus = self._sample_from_logits(
-                    logits_rows[-1],
+                bonus_scores, bonus_idx = logits_rows[-1]
+                bonus = self._sample_from_topk(
+                    bonus_scores, bonus_idx,
                     temperature=self.temperature,
                     top_p=self.top_p,
                 )
