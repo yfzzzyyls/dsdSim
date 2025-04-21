@@ -173,9 +173,10 @@ def compile_model(model_path: str, sequence_length: int = DEFAULT_SEQUENCE_LENGT
             batch_size=1,
             amp='bf16',
             n_positions=sequence_length,
-            context_length_estimate=spec_length if spec_length else sequence_length,
+            context_length_estimate=sequence_length,
             tp_degree=tp_degree
         )
+
         # If a speculative length is provided, enable that many-token speculative decoder
         if spec_length is not None:
             logger.info(f"Enabling speculative decoder with length {spec_length}...")
