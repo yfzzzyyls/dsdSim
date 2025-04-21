@@ -3,6 +3,7 @@ import torch
 from concurrent import futures
 import grpc
 import time
+TOP_K_TARGET = 512      # keep in sync with speculative.py
 from inference import model_loader
 from transformers import AutoTokenizer
 from grpc_comm import inference_pb2, inference_pb2_grpc
@@ -250,13 +251,21 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
         row_slice = logits_all[:n_new]            # could be 1‑D when n_new == 1
         row_probs = torch.softmax(row_slice, dim=-1)
 
-        if row_probs.dim() == 1:                  # only one draft token
-            probs = [float(row_probs[tok].item())]
+
+        # ---------------- single‑pass, top‑k slice ----------------
+        probs = []
+        if row_probs.dim() == 1:       # single draft token
+            tok_id = draft_tokens[0]
+            if tok_id < row_probs.size(0):
+                probs.append(float(row_probs[tok_id].item()))
+            else:
+                probs.append(0.0)      # token not in top‑k slice → reject
         else:
-            probs = [
-                float(row_probs[i, tok].item())
-                for i, tok in enumerate(draft_tokens)
-            ]
+            for i, tok_id in enumerate(draft_tokens):
+                if tok_id < row_probs.size(1):
+                    probs.append(float(row_probs[i, tok_id].item()))
+                else:
+                    probs.append(0.0)
 
         logits_rows = [logits_all[i].clone() for i in range(n_new + 1)]
         sess.pending_logits = logits_rows[-1]
@@ -337,19 +346,32 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
             sess.finished = True
 
     def _sample_from_logits(self, logits, temperature=1.0, top_p=0.9):
-        logits = logits / max(1e-8, temperature)
+        """
+        Sample a token from 'logits' using:
+ 
+            1. Optional temperature scaling
+            2. Hard top‑k cutoff (k = TOP_K_TARGET)
+            3. Nucleus (top‑p) sampling inside that slice
+ 
+        Keeping the same top‑k (512) as the draft side ensures both
+        models see the same candidate set size, which reduces divergence.
+        """
+        logits = logits.float() / max(1e-8, temperature)      # temp‑scale (float32)
         probs  = torch.softmax(logits, dim=-1)
-
-        # nucleus sampling
-        sorted_probs, sorted_idx = torch.sort(probs, descending=True)
-        cumsum = torch.cumsum(sorted_probs, dim=-1)
-        cutoff = torch.searchsorted(cumsum, top_p, right=True).item()
-        keep_idx   = sorted_idx[: cutoff + 1]
-        keep_probs = sorted_probs[: cutoff + 1]
-        keep_probs = keep_probs / keep_probs.sum()
-
-        choice = torch.multinomial(keep_probs, 1).item()
-        return int(keep_idx[choice].item())
+ 
+        # ---------- hard top‑k (512) ----------
+        k = min(TOP_K_TARGET, probs.shape[-1])
+        top_vals, top_idx = torch.topk(probs, k)              # (k,) each
+ 
+        # ---------- nucleus filter ----------
+        cum_p = torch.cumsum(top_vals, dim=0)
+        cutoff = torch.searchsorted(cum_p, top_p, right=True).item()
+        nucleus_idx   = top_idx[: cutoff + 1]
+        nucleus_probs = top_vals[: cutoff + 1]
+        nucleus_probs = nucleus_probs / nucleus_probs.sum()
+ 
+        choice = torch.multinomial(nucleus_probs, 1).item()
+        return int(nucleus_idx[choice].item())
 
     def FinalizeTokens(self, request, context):
         sid              = request.session_id
