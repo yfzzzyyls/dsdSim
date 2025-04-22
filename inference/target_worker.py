@@ -48,8 +48,20 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
         self.top_p = top_p
         self.tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=False)
         self.eos_token_id = self.tokenizer.eos_token_id
-        # Start with zero; will be set per‑prompt in StartGeneration
-        self._ctx_estimate = 0
+        # ------------------------------------------------------------
+        # Discover the compile‑time `context_length_estimate` so we can
+        # pad short inputs (γ‑token chunks, short prompts) up to the
+        # bucket size Neuron expects (64, 128, …).
+        # ------------------------------------------------------------
+        compiled_est = None
+        base_adapter = getattr(self.model, "adapter", None)
+        if base_adapter is not None and hasattr(base_adapter, "model"):
+            inner = base_adapter.model
+            compiled_est = getattr(inner, "context_length_estimate", None)
+        if compiled_est is None:
+            compiled_est = sequence_length            # fallback
+        self._ctx_estimate = int(compiled_est)
+        logger.info("[init] detected context_length_estimate=%d", self._ctx_estimate)
         self.sessions = {}  # session_id -> TargetSession
         self.lock = torch.multiprocessing.Lock()
 
@@ -128,19 +140,11 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
             self.model._next_pos = 0
 
             prompt_len = current_ids.shape[1]
-            # Use the real prompt length as the compile‑time estimate for this session
-            self._ctx_estimate = prompt_len
-
             if current_ids.shape[1] > 0:
-                # Build an explicit position tensor 0 … L‑1 so Neuron
-                # sees cache_ids and does not hit the .max(None) bug.
-                pos_tensor = torch.arange(
-                    current_ids.shape[1], dtype=torch.int32
-                ).unsqueeze(0)        # shape (1, L)
-                _ = self.model.forward(
-                    input_ids=current_ids,
-                    cache_ids=pos_tensor,
-                )
+                padded_ids = self._pad_ids(current_ids)
+                # Let Neuron assign positions (cache_ids=None) – it will
+                # allocate 0…len(padded_ids)-1 and ignore padding tokens 0.
+                _ = self.model.forward(input_ids=padded_ids, cache_ids=None)
             # store pointer (next index) inside the session
             self.sessions[session_id].cache_ids = torch.tensor(
                 [prompt_len], dtype=torch.int32
@@ -278,8 +282,10 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
 
         self._sync_kv_pointer(sess)
         ids = torch.tensor([draft_tokens], dtype=sess.current_ids.dtype)   # (1, n)
-        logits = self.model.forward(input_ids=ids)[0]      # (1, n, V)
-        logits = logits.squeeze(0)                         #  → (n, V)
+        ids = self._pad_ids(ids)       # right‑pad up to _ctx_estimate (64)
+        logits = self.model.forward(input_ids=ids)[0]      # (1, n_pad, V)
+        logits = logits.squeeze(0)                         #  → (n_pad, V)
+        logits = logits[: len(draft_tokens)]               # keep real rows
 
         # ---- DEBUG: dump one row so we can inspect distributions ----
         logger.info("[verify] logits chunk shape=%s  row0_sum=%.3f",

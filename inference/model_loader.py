@@ -152,7 +152,7 @@ def compile_model(model_path: str, sequence_length: int = DEFAULT_SEQUENCE_LENGT
     # ------------------------------------------------------------------
     # Ensure the compiled graph supports “prompt + max γ + safety”
     # ------------------------------------------------------------------
-    ctx_len = sequence_length #+ (spec_length or 0) + 2
+    ctx_len = sequence_length
     base_name = os.path.basename(os.path.normpath(model_path))
     compiled_dir = f"{base_name}-compiled-{sequence_length}"
     logger.info(f"Compiling model '{model_path}' to Neuron (sequence_length={sequence_length})...")
@@ -223,12 +223,13 @@ def compile_target_model(
         model_path, spec_length, sequence_length,
     )
 
-    ctx_len = sequence_length + spec_length + 2   # prompt + γ + bonus + slack
+    ctx_len = sequence_length
     tp_deg  = int(os.environ.get("NEURON_RT_NUM_CORES", "2"))
 
-    # ——— Neuron config ———
+    # ——— Neuron config, only used when on_device_generation = True ———
     gen_cfg = GenerationConfig(top_k=top_k, top_p=top_p,
                                do_sample=True, temperature=temperature)
+    
     neuron_cfg = NeuronConfig(
         padding_side="right",
         attention_layout="BSH",
