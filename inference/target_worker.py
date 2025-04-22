@@ -43,7 +43,8 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
         self.top_p = top_p
         self.tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=False)
         self.eos_token_id = self.tokenizer.eos_token_id
-        self._ctx_estimate = sequence_length
+        # Start with zero; will be set per‑prompt in StartGeneration
+        self._ctx_estimate = 0
         self.sessions = {}  # session_id -> TargetSession
         self.lock = torch.multiprocessing.Lock()
 
@@ -122,15 +123,8 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
             self.model._next_pos = 0
 
             prompt_len = current_ids.shape[1]
-            if prompt_len < self._ctx_estimate:
-                pad_tok_id = self.tokenizer.eos_token_id or 0
-                pad_len    = self._ctx_estimate - prompt_len
-                pad_tensor = torch.full((1, pad_len),
-                                        pad_tok_id,
-                                        dtype=current_ids.dtype,
-                                        device=current_ids.device)
-                current_ids = torch.cat([current_ids, pad_tensor], dim=1)
-                prompt_len  = current_ids.shape[1]          # == _ctx_estimate
+            # Use the real prompt length as the compile‑time estimate for this session
+            self._ctx_estimate = prompt_len
 
             if current_ids.shape[1] > 0:
                 # Build an explicit position tensor 0 … L‑1 so Neuron
