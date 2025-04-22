@@ -1,18 +1,4 @@
-#
-# ------------------------------------------------------------------
-# Utility: disable the compile‑time `context_length_estimate` guard
-# ------------------------------------------------------------------
-def _disable_ctx_estimate(obj):
-    """
-    Recursively set `.context_length_estimate` to 0 on the Neuron model
-    and any nested `.model` that also carries the attribute, so incremental
-    forwards with <64 tokens no longer throw
-        ValueError: context_length (…) shouldn't be smaller than estimate (…)
-    """
-    if hasattr(obj, "context_length_estimate"):
-        obj.context_length_estimate = 0
-    if hasattr(obj, "model"):
-        _disable_ctx_estimate(obj.model)
+
 import os
 import logging
 import shutil
@@ -30,6 +16,22 @@ from transformers_neuronx.fused_speculation import FusedSpeculativeDecoder
 from transformers_neuronx import NeuronAutoModelForCausalLM, NeuronConfig, GenerationConfig
 
 logger = logging.getLogger(__name__)
+
+# ------------------------------------------------------------------
+# Utility: disable the compile‑time `context_length_estimate` guard
+# ------------------------------------------------------------------
+def _disable_ctx_estimate(obj):
+    """
+    Recursively set `.context_length_estimate` to 0 on the Neuron model
+    and any nested `.model` that also carries the attribute, so incremental
+    forwards with <64 tokens no longer throw
+        ValueError: context_length (…) shouldn't be smaller than estimate (…)
+    """
+    if hasattr(obj, "context_length_estimate"):
+        obj.context_length_estimate = 0
+    if hasattr(obj, "model"):
+        _disable_ctx_estimate(obj.model)
+
 
 class NeuronHFAdapterWrap(torch.nn.Module):
     """
@@ -245,6 +247,7 @@ def compile_target_model(
         model_path,
         batch_size=1,
         n_positions=ctx_len,
+        context_length_estimate=spec_length
         tp_degree=tp_deg,
         amp="bf16",
         neuron_config=neuron_cfg,
