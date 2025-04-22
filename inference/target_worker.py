@@ -34,7 +34,10 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
         self.model = model_loader.load_target_model(
             model_path,
             sequence_length=sequence_length,
-            spec_length=spec_length or 4
+            spec_length=spec_length or 4,
+            top_k=TOP_K_TARGET,
+            top_p=top_p,
+            temperature=temperature,
         )
         self.temperature = temperature
         self.top_p = top_p
@@ -130,7 +133,15 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
                 prompt_len  = current_ids.shape[1]          # == _ctx_estimate
 
             if current_ids.shape[1] > 0:
-                _ = self.model.forward(input_ids=current_ids)
+                # Build an explicit position tensor 0 … L‑1 so Neuron
+                # sees cache_ids and does not hit the .max(None) bug.
+                pos_tensor = torch.arange(
+                    current_ids.shape[1], dtype=torch.int32
+                ).unsqueeze(0)        # shape (1, L)
+                _ = self.model.forward(
+                    input_ids=current_ids,
+                    cache_ids=pos_tensor,
+                )
             # store pointer (next index) inside the session
             self.sessions[session_id].cache_ids = torch.tensor(
                 [prompt_len], dtype=torch.int32
@@ -271,21 +282,25 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
         n_new = len(draft_tokens)
         orig_cache = sess.cache_ids.clone()
         self._sync_kv_pointer(sess)
-        # ------------------------------------------------------------
-        # Speculative decoder expects:
-        #   input_ids : (1, 0)
-        #   start_ids : (1, N)   -- batch dim first
-        #   cache_ids : scalar   -- current context length
-        # It then returns (N+1, 512) logits rows.
-        # ------------------------------------------------------------
-        start_ids_2d = torch.tensor([draft_tokens],
-                                    dtype=sess.current_ids.dtype)   # shape (1, N)
-        cache_scalar = sess.cache_ids.clone()                       # shape (1,)
+        # ----------------------------------------------------------------
+        # FusedSpeculativeDecoder expects:
+        #   • input_ids : (1, 0)
+        #   • start_ids : (γ,)    1‑D vector of the draft tokens
+        #   • cache_ids : scalar  (int32 tensor with the current pos)
+        # ----------------------------------------------------------------
+        start_vec = torch.tensor(draft_tokens,
+                                 dtype=sess.current_ids.dtype)      # shape (γ(gamma_chunk),)
+
+        gamma_chunk = self.model.spec_length   # or .speculation_length depending on version
+        if start_vec.numel() < gamma_chunk:
+            pad_tok = self.eos_token_id or 0
+            pad = torch.full((gamma_chunk - start_vec.numel(),), pad_tok, dtype=start_vec.dtype)
+            start_vec = torch.cat([start_vec, pad])
 
         out = self.model.adapter(
-            input_ids=torch.empty((1, 0), dtype=start_ids_2d.dtype, device=start_ids_2d.device),
-            start_ids=start_ids_2d,
-            cache_ids=cache_scalar,          # current pointer
+            input_ids=torch.empty((1, 0), dtype=start_vec.dtype, device=start_vec.device),
+            start_ids=start_vec,
+            cache_ids=sess.cache_ids.clone(),       # scalar int32 tensor
             return_dict=False,
         )
 

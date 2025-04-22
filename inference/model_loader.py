@@ -265,9 +265,37 @@ def compile_target_model(
     fused = FusedSpeculativeDecoder(draft_model, target_model, spec_length)
     fused.to_neuron()
 
-    hf_cfg = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
-    adapter = HuggingFaceGenerationModelAdapter(hf_cfg, fused)
-    return NeuronHFAdapterWrap(adapter)
+    # ------------------------------------------------------------
+    # Locate (or build) a HuggingFaceGenerationModelAdapter so the
+    # rest of the server code can call .adapter(...).
+    # ------------------------------------------------------------
+    if hasattr(fused, "adapter"):
+        tgt_adapter = fused.adapter
+
+    elif hasattr(fused, "target_model") and hasattr(fused.target_model, "adapter"):
+        tgt_adapter = fused.target_model.adapter
+
+    elif hasattr(fused, "target") and hasattr(fused.target, "adapter"):
+        tgt_adapter = fused.target.adapter
+
+    else:
+        # ‑‑ Fallback: create a new HF adapter around the *target* model
+        from transformers import AutoConfig
+        hf_cfg = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+        if hasattr(fused, "target_model"):
+            base_model = fused.target_model
+        elif hasattr(fused, "target"):
+            base_model = fused.target
+        else:
+            # last resort: assume the second argument was the target
+            base_model = target_model
+        logger.warning(
+            "[compile_target_model] FusedSpeculativeDecoder exposes no '.adapter'; "
+            "wrapping target model with HuggingFaceGenerationModelAdapter."
+        )
+        tgt_adapter = HuggingFaceGenerationModelAdapter(hf_cfg, base_model)
+
+    return NeuronHFAdapterWrap(tgt_adapter)
 
 
 def load_target_model(
@@ -275,7 +303,7 @@ def load_target_model(
     sequence_length: int = DEFAULT_SEQUENCE_LENGTH,
     spec_length: int = 4,
     top_k: int = 512,
-    top_p: float = 1.0,
+    top_p: float = 0.9,
     temperature: float = 1.0,
 ):
     """
