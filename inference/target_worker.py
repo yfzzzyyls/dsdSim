@@ -3,6 +3,7 @@ import torch
 from concurrent import futures
 import grpc
 import time
+import random
 TOP_K_TARGET = 512      # keep in sync with speculative.py
 from inference import model_loader
 from transformers import AutoTokenizer
@@ -332,6 +333,10 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
     def VerifyDraftTokens(self, request, context):
         sid = request.session_id
         draft_tokens = list(request.draft_tokens)
+        draft_probs  = list(request.draft_probs)
+        if len(draft_probs) != len(draft_tokens):
+            context.abort(grpc.StatusCode.INVALID_ARGUMENT,
+                          "draft_probs length must equal draft_tokens length")
 
         with self.lock:
             if sid not in self.sessions:
@@ -351,11 +356,13 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
             # ----- single forward pass (scores + per‑step logits) -----
             probs_all, logits_rows = self._verify_single_step(sess, draft_tokens)
 
-            # Walk until first rejection
+            # Walk until first rejection (Metropolis–Hastings acceptance)
             for idx, tok in enumerate(draft_tokens):
                 current_scores, current_idx = logits_rows[idx]
                 p_target = probs_all[idx]
-                if p_target >= 1e-3:
+                q_draft  = max(draft_probs[idx], 1e-8)
+                ratio    = min(1.0, p_target / q_draft)
+                if random.random() < ratio:
                     accepted_cnt += 1
                     self._commit_token(sess, tok)
                     committed.append(tok)

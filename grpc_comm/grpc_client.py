@@ -66,13 +66,14 @@ def finalize_batch_tokens(stub, sequences):
 # SINGLE-SEQUENCE CLIENT CALLS (existing)
 # -----------------------------------------
 
-def verify_draft_tokens(stub, draft_tokens, session_id=0):
+def verify_draft_tokens(stub, draft_tokens, draft_probs, session_id=0):
     """
     Unified RPC: returns (committed_ids, accepted_count, finished)
     """
     request = inference_pb2.VerifyRequest(
         session_id=session_id,
         draft_tokens=draft_tokens,
+        draft_probs=draft_probs,
     )
     response = stub.VerifyDraftTokens(request)
 

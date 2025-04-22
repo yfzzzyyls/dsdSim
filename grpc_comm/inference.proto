@@ -1,3 +1,6 @@
+// NOTE: After modifying this file run:
+//   python -m grpc_tools.protoc -I. --python_out=. --grpc_python_out=. inference.proto
+// to regenerate *_pb2.py stubs.
 syntax = "proto3";
 option py_generic_services = false;
 
@@ -63,6 +66,7 @@ message FinalizeBatchResponse {
 message VerifyRequest {
   uint64 session_id = 1;
   repeated int32 draft_tokens = 2;
+  repeated float draft_probs = 3;   // probability q(x) for each draft token
 }
 
 message VerifyResponse {
