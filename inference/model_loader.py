@@ -21,9 +21,10 @@ class NeuronHFAdapterWrap(torch.nn.Module):
     Thin wrapper so .forward accepts input_ids, cache_ids=None
     and returns (logits, cache_ids) packaged as CausalLMOutputWithPast.
     """
-    def __init__(self, adapter):
+    def __init__(self, adapter, cache_ids_rank2: bool = False):
         super().__init__()
         self.adapter = adapter
+        self._cache2d = cache_ids_rank2   # True ⇒ build (1,L) position tensors
         self.cache_ids = None  # Initialize KV cache pointer storage
         self._next_pos = 0  # next position index in the KV cache
         self.config = adapter.config
@@ -37,17 +38,20 @@ class NeuronHFAdapterWrap(torch.nn.Module):
     #                    .repeat(batch, 1))       # -> (B, L)
     # inference/model_loader.py  – inside class NeuronHFAdapterWrap
 
-    # helper: build a 1‑D Int32 tensor  [start, …, start+L‑1]
-    # inference/model_loader.py  – inside NeuronHFAdapterWrap
+    # helper: build a position tensor of the shape expected by the compiled graph
     def _build_pos(self, start: int, length: int):
-        # ALWAYS return (1, L) so Neuron’s helper that does .max(dim=1)
-        # sees the expected rank‑2 tensor.
-        return torch.arange(start, start + length,
-                            dtype=torch.int32).unsqueeze(0)      # ←  (1, L)
+        """
+        When self._cache2d is False  → return 1‑D  (L,)
+        When self._cache2d is True   → return 2‑D  (1, L)
+        """
+        pos = torch.arange(start, start + length, dtype=torch.int32)
+        if self._cache2d:
+            pos = pos.unsqueeze(0)            # (1, L)
+        return pos
 
     def forward(self, input_ids, cache_ids=None, return_all_logits=False, **kwargs):
         """
-        Run one incremental forward on the Neuron adapter, fabricating an explicit 2‑D `cache_ids`
+        Run one incremental forward on the Neuron adapter, fabricating an explicit position
         tensor for models that require it, but passing `cache_ids=None` for draft models
         that expose a speculative‑decoder interface (i.e., have attribute `spec_length`).
 
@@ -57,37 +61,22 @@ class NeuronHFAdapterWrap(torch.nn.Module):
         cache_ids : torch.IntTensor   shape (B, L_new) OR None
         """
         B, L = input_ids.shape
-        # ------------------------------------------------------------------
-        # ALWAYS build an explicit (batch, L) position tensor when the caller
-        # does not supply one.  This works for both draft *and* target models
-        # that were compiled without the Neuron fused‑speculation wrapper.
-        # ------------------------------------------------------------------
         if cache_ids is None:
             cache_ids = self._build_pos(self._next_pos, L)
 
-        # ------------------------------------------------------------------
-        # Forward through the wrapped HuggingFaceGenerationModelAdapter
-        # ------------------------------------------------------------------
         out = self.adapter(input_ids=input_ids,
                            cache_ids=cache_ids,
                            return_dict=False,
                            **kwargs)
 
-        # Advance internal pointer
         self._next_pos = int(cache_ids.max().item()) + 1
         self.cache_ids = torch.tensor([self._next_pos], dtype=torch.int32)
 
-        # ------------------------------------------------------------------
-        # Extract logits
-        #   • if return_all_logits==False  → keep only the *last* step
-        #   • if return_all_logits==True   → keep every step
-        # ------------------------------------------------------------------
         logits = out[0] if isinstance(out, (tuple, list)) else (
                  out.logits if hasattr(out, "logits") else out)
 
         if logits.ndim == 3:                           # (B, L, V)
             if return_all_logits:
-                # keep full (L, V) slice, squeeze batch if B == 1
                 logits = logits.squeeze(0) if logits.size(0) == 1 else logits
             else:
                 logits = logits[:, -1, :]              # last step only
@@ -181,7 +170,7 @@ def compile_model(model_path: str, sequence_length: int = DEFAULT_SEQUENCE_LENGT
         model.to_neuron()
         hf_config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
         adapter = HuggingFaceGenerationModelAdapter(hf_config, model)
-        return NeuronHFAdapterWrap(adapter)
+        return NeuronHFAdapterWrap(adapter, cache_ids_rank2=False)
     else:
         RuntimeError(f"Model type '{model_type}' not supported for compilation.")
         model = AutoModelForCausalLM.from_pretrained(model_path)
@@ -244,7 +233,7 @@ def compile_target_model(
     cfg = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
     adapter = HuggingFaceGenerationModelAdapter(cfg, target)
     logger.info("[compile_target_model] Neuron graph compiled (ctx_len=%d)", ctx_len)
-    return NeuronHFAdapterWrap(adapter)
+    return NeuronHFAdapterWrap(adapter, cache_ids_rank2=True)
 
 
 def load_target_model(
