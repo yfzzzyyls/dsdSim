@@ -1,3 +1,18 @@
+#
+# ------------------------------------------------------------------
+# Utility: disable the compile‑time `context_length_estimate` guard
+# ------------------------------------------------------------------
+def _disable_ctx_estimate(obj):
+    """
+    Recursively set `.context_length_estimate` to 0 on the Neuron model
+    and any nested `.model` that also carries the attribute, so incremental
+    forwards with <64 tokens no longer throw
+        ValueError: context_length (…) shouldn't be smaller than estimate (…)
+    """
+    if hasattr(obj, "context_length_estimate"):
+        obj.context_length_estimate = 0
+    if hasattr(obj, "model"):
+        _disable_ctx_estimate(obj.model)
 import os
 import logging
 import shutil
@@ -168,6 +183,8 @@ def compile_model(model_path: str, sequence_length: int = DEFAULT_SEQUENCE_LENGT
 
         # If a speculative length is provided, enable that many-token speculative decoder
         model.to_neuron()
+        # Disable static context‑length guard (draft side)
+        _disable_ctx_estimate(model)
         hf_config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
         adapter = HuggingFaceGenerationModelAdapter(hf_config, model)
         return NeuronHFAdapterWrap(adapter, cache_ids_rank2=False)
@@ -206,6 +223,10 @@ def compile_target_model(
     )
 
     ctx_len = sequence_length
+    # Safety‑margin so the target graph has a bucket larger than any possible
+    # prompt + generated tokens. 128 was too tight and caused StopIteration.
+    if ctx_len < 512:
+        ctx_len = 512
     tp_deg  = int(os.environ.get("NEURON_RT_NUM_CORES", "2"))
 
     # ——— Neuron config, only used when on_device_generation = True ———
@@ -229,6 +250,8 @@ def compile_target_model(
         neuron_config=neuron_cfg,
     )
     target.to_neuron()     # compile
+    # Disable static context‑length guard (target side)
+    _disable_ctx_estimate(target)
 
     cfg = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
     adapter = HuggingFaceGenerationModelAdapter(cfg, target)

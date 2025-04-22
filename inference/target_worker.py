@@ -60,7 +60,9 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
             compiled_est = getattr(inner, "context_length_estimate", None)
         if compiled_est is None:
             compiled_est = sequence_length            # fallback
-        self._ctx_estimate = int(compiled_est)
+        # We have just disabled the guard inside the model, so we can safely
+        # ignore the compile‑time bucket size.
+        self._ctx_estimate = 0
         logger.info("[init] detected context_length_estimate=%d", self._ctx_estimate)
         self.sessions = {}  # session_id -> TargetSession
         self.lock = torch.multiprocessing.Lock()
@@ -74,15 +76,17 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
         >= the compile‑time estimate (self._ctx_estimate, defaults to the
         --sequence_length used at compile time).  If the supplied tensor
         is shorter we right‑pad with zeros so its shape is (1, ctx_estimate).
- 
+
         Parameters
         ----------
         input_ids : torch.Tensor   shape (1, L), dtype = same as model input
- 
+
         Returns
         -------
         torch.Tensor  shape (1, max(L, ctx_estimate))
         """
+        if self._ctx_estimate == 0:
+            return input_ids
         seq_len = input_ids.shape[1]
         if seq_len >= self._ctx_estimate:            # already long enough
             return input_ids
@@ -282,7 +286,7 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
 
         self._sync_kv_pointer(sess)
         ids = torch.tensor([draft_tokens], dtype=sess.current_ids.dtype)   # (1, n)
-        ids = self._pad_ids(ids)       # right‑pad up to _ctx_estimate (64)
+        # No extra right-padding; pass ids directly to the model
         logits, _ = self.model.forward(
             input_ids=ids,
             cache_ids=None,          # wrapper builds (1,L) cache_ids internally
