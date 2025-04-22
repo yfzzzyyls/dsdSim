@@ -266,8 +266,6 @@ def compile_target_model(
         neuron_config=neuron_cfg,
     )
     target_model.to_neuron()
-    print("[debug] Model n_positions:", ctx_len)
-    print("Buckets:", target_model.adapter.model.program.n_positions_list)
     # ---- fuse them into a speculative decoder ----
     fused = FusedSpeculativeDecoder(draft_model, target_model, spec_length)
     fused.to_neuron()
