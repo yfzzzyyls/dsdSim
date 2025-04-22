@@ -31,12 +31,17 @@ class NeuronHFAdapterWrap(torch.nn.Module):
     # ------------------------------------------------------------------  
     # helper: build a (batch, length) int32 tensor [start, …, start+L‑1]  
     # ------------------------------------------------------------------
-    def _build_pos(self, start: int, length: int, batch: int = 1):
-        return (torch.arange(start, start + length, dtype=torch.int32)
-                       .unsqueeze(0)            # -> (1, L)
-                       .repeat(batch, 1))       # -> (B, L)
+    # def _build_pos(self, start: int, length: int, batch: int = 1):
+    #     return (torch.arange(start, start + length, dtype=torch.int32)
+    #                    .unsqueeze(0)            # -> (1, L)
+    #                    .repeat(batch, 1))       # -> (B, L)
+    # inference/model_loader.py  – inside class NeuronHFAdapterWrap
 
-    def forward(self, input_ids, cache_ids=None, **kwargs):
+    # helper: build a 1‑D Int32 vector  [start, …, start+L‑1]
+    def _build_pos(self, start: int, length: int):
+        return torch.arange(start, start + length, dtype=torch.int32)   # <‑‑ 1‑D
+
+    def forward(self, input_ids, cache_ids=None, return_all_logits=False, **kwargs):
         """
         Run one incremental forward on the Neuron adapter, fabricating an explicit 2‑D `cache_ids`
         tensor for models that require it, but passing `cache_ids=None` for draft models
@@ -60,7 +65,8 @@ class NeuronHFAdapterWrap(torch.nn.Module):
             needs_explicit_pos = not hasattr(self.adapter, "spec_length")
             if needs_explicit_pos:
                 # Target‑side or non‑fused model → build [start…start+L‑1]
-                cache_ids = self._build_pos(self._next_pos, L, B)
+                # cache_ids = self._build_pos(self._next_pos, L, B)
+                cache_ids = self._build_pos(self._next_pos, L)   # now 1‑D
             else:
                 # Draft model with fused speculative decoder – let Neuron
                 # generate positions internally.
@@ -80,15 +86,21 @@ class NeuronHFAdapterWrap(torch.nn.Module):
         self.cache_ids = torch.tensor([self._next_pos], dtype=torch.int32)
 
         # ------------------------------------------------------------------
-        # Extract logits (shape → 1‑D for caller convenience)
+        # Extract logits
+        #   • if return_all_logits==False  → keep only the *last* step
+        #   • if return_all_logits==True   → keep every step
         # ------------------------------------------------------------------
         logits = out[0] if isinstance(out, (tuple, list)) else (
                  out.logits if hasattr(out, "logits") else out)
 
-        if logits.ndim == 3:      # (B, L, V)
-            logits = logits[:, -1, :]       # keep last step
-        if logits.ndim == 2 and logits.size(0) == 1:
-            logits = logits[0]              # -> (V,)
+        if logits.ndim == 3:                           # (B, L, V)
+            if return_all_logits:
+                # keep full (L, V) slice, squeeze batch if B == 1
+                logits = logits.squeeze(0) if logits.size(0) == 1 else logits
+            else:
+                logits = logits[:, -1, :]              # last step only
+        if logits.ndim == 2 and logits.size(0) == 1 and not return_all_logits:
+            logits = logits[0]                         # → (V,)
 
         return logits, cache_ids
 
@@ -121,6 +133,9 @@ class NeuronHFAdapterWrap(torch.nn.Module):
             eos_token_id=self.config.eos_token_id,
         )
         return out
+    
+    # inference/model_loader.py  – inside class NeuronHFAdapterWrap
+
 
 # Default sequence length (can be overridden by function arguments)
 DEFAULT_SEQUENCE_LENGTH = 128

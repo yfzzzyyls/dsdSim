@@ -141,9 +141,7 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
 
             prompt_len = current_ids.shape[1]
             if current_ids.shape[1] > 0:
-                pos_tensor = torch.arange(
-                    current_ids.shape[1], dtype=torch.int32
-                ).unsqueeze(0)                 # (1, L_prompt)
+                pos_tensor = torch.arange(current_ids.shape[1], dtype=torch.int32)   # 1‑D
                 _ = self.model.forward(
                     input_ids=current_ids,
                     cache_ids=pos_tensor,
@@ -290,9 +288,12 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
             int(self.model.cache_ids.item()),
             int(self.model.cache_ids.item()) + ids.shape[1],
             dtype=torch.int32
-        ).unsqueeze(0)
-        logits = self.model.forward(input_ids=ids, cache_ids=pos_tensor)[0]      # (1, n_pad, V)
-        logits = logits.squeeze(0)                         #  → (n_pad, V)
+        )
+        logits, _ = self.model.forward(
+            input_ids=ids,
+            cache_ids=pos_tensor,
+            return_all_logits=True
+        )
         logits = logits[: len(draft_tokens)]               # keep real rows
 
         # ---- DEBUG: dump one row so we can inspect distributions ----
