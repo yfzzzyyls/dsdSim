@@ -174,22 +174,32 @@ def compile_model(model_path: str, sequence_length: int = DEFAULT_SEQUENCE_LENGT
 
     tp_degree = int(os.environ.get("NEURON_RT_NUM_CORES", "2"))
     if model_type.lower() == "llama" or "llama" in model_path.lower():
-        logger.info(f"Compiling model using optimized LLaMA for Neuron ...")
-        model = LlamaForSampling.from_pretrained(
+        logger.info(f"Compiling model using NeuronAutoModelForCausalLM ...")
+        # ---- build Neuron config with logits‑returning generation disabled ----
+        neuron_cfg = NeuronConfig(
+            padding_side="right",
+            attention_layout="BSH",
+            collectives_layout="BSH",
+            on_device_embedding=True,
+            on_device_generation=None,   # return logits on host
+        )
+        model = NeuronAutoModelForCausalLM.from_pretrained(
             model_path,
             batch_size=1,
-            amp='bf16',
             n_positions=ctx_len,
-            tp_degree=tp_degree
+            context_length_estimate=ctx_len,
+            tp_degree=tp_degree,
+            amp="bf16",
+            neuron_config=neuron_cfg,
         )
-
-        # If a speculative length is provided, enable that many-token speculative decoder
         model.to_neuron()
-        # Disable static context‑length guard (draft side)
+        # Draft side also needs full logits for each token,
+        # so we wrap with HuggingFaceGenerationModelAdapter
+        hf_cfg = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+        adapter = HuggingFaceGenerationModelAdapter(hf_cfg, model)
+        # disable context_length_estimate guard inside the compiled graph
         _disable_ctx_estimate(model)
-        hf_config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
-        adapter = HuggingFaceGenerationModelAdapter(hf_config, model)
-        return NeuronHFAdapterWrap(adapter, cache_ids_rank2=False)
+        return NeuronHFAdapterWrap(adapter, cache_ids_rank2=True)
     else:
         RuntimeError(f"Model type '{model_type}' not supported for compilation.")
         model = AutoModelForCausalLM.from_pretrained(model_path)

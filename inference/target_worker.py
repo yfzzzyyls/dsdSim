@@ -61,9 +61,22 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
         if compiled_est is None:
             compiled_est = sequence_length            # fallback
 
-        # Keep the bucket so _pad_ids() can right‑pad short inputs.
-        self._ctx_estimate = compiled_est or 0
+        # inference/target_worker.py  – inside SpeculativeServiceServicer.__init__
+
+        def _deep_ctx_estimate(obj):
+            best = getattr(obj, "context_length_estimate", None)
+            for name in ("model", "base_model", "checkpoint_model"):
+                child = getattr(obj, name, None)
+                if child is not None:
+                    sub = _deep_ctx_estimate(child)
+                    if sub is not None:
+                        best = max(best or 0, sub)
+            return best
+
+        compiled_est = _deep_ctx_estimate(self.model) or sequence_length
+        self._ctx_estimate = compiled_est
         logger.info("[init] detected context_length_estimate=%d", self._ctx_estimate)
+
         self.sessions = {}  # session_id -> TargetSession
         self.lock = torch.multiprocessing.Lock()
 
@@ -94,6 +107,36 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
         pad_len = self._ctx_estimate - seq_len
         pad = torch.zeros((1, pad_len), dtype=input_ids.dtype, device=input_ids.device)
         return torch.cat([input_ids, pad], dim=1)
+
+    # ------------------------------------------------------------------
+    # Safe Neuron forward that auto‑pads inputs if the compile‑time
+    # context_length_estimate guard triggers.
+    # ------------------------------------------------------------------
+    def _safe_forward(self, *, input_ids, cache_ids=None,
+                      return_all_logits=False, **kwargs):
+        """
+        Wrapper around self.model.forward that retries with right‑padding
+        when the underlying Neuron graph raises:
+            ValueError: context_length (...) shouldn't be smaller than estimate (...)
+        """
+        try:
+            return self.model.forward(
+                input_ids=input_ids,
+                cache_ids=cache_ids,
+                return_all_logits=return_all_logits,
+                **kwargs,
+            )
+        except ValueError as e:
+            msg = str(e)
+            if "context_length" in msg and "estimate" in msg:
+                padded_ids = self._pad_ids(input_ids)
+                return self.model.forward(
+                    input_ids=padded_ids,
+                    cache_ids=cache_ids,
+                    return_all_logits=return_all_logits,
+                    **kwargs,
+                )
+            raise
 
     def _sync_kv_pointer(self, sess: TargetSession):
         self.model.cache_ids = sess.cache_ids.clone()
@@ -149,7 +192,7 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
 
             # prompt_len already set above before padding
             if current_ids.shape[1] > 0:
-                _ = self.model.forward(
+                _ = self._safe_forward(
                     input_ids=current_ids,
                     cache_ids=None,   # let wrapper fabricate correct (1,L) cache_ids
                 )
@@ -275,10 +318,10 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
         ids = torch.tensor([draft_tokens], dtype=sess.current_ids.dtype)
         ids = self._pad_ids(ids)
         # No extra right-padding; pass ids directly to the model
-        logits, _ = self.model.forward(
+        logits, _ = self._safe_forward(
             input_ids=ids,
             cache_ids=None,          # wrapper builds (1,L) cache_ids internally
-            return_all_logits=True
+            return_all_logits=True,
         )
         logits = logits[: len(draft_tokens)]               # keep real rows
 
@@ -371,14 +414,10 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
         tok = torch.tensor([[tok_id]], dtype=sess.current_ids.dtype)
         sess.current_ids = torch.cat([sess.current_ids, tok], dim=1)
         self._sync_kv_pointer(sess)
-        # _, _ = self.model.forward(input_ids=tok,
-        #                           cache_ids=torch.tensor([self.model._next_pos],
-        #                                                  dtype=torch.int32))
-        # sess.cache_ids = torch.tensor([self.model._next_pos], dtype=torch.int32)
         # inference/target_worker.py  – helper _commit_token
         tok_ids = torch.tensor([[tok_id]], dtype=sess.current_ids.dtype)
         tok_ids = self._pad_ids(tok_ids)
-        _, _ = self.model.forward(
+        _, _ = self._safe_forward(
             input_ids=tok_ids,
         )
         sess.cache_ids = torch.tensor([[self.model._next_pos]], dtype=torch.int32)
@@ -439,7 +478,7 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
                      torch.tensor([[t]], dtype=sess.current_ids.dtype)],
                     dim=1)
                 self._sync_kv_pointer(sess)
-                lgts, _ = self.model.forward(
+                lgts, _ = self._safe_forward(
                     input_ids=torch.tensor([[t]], dtype=sess.current_ids.dtype),
                     cache_ids=torch.tensor([self.model._next_pos], dtype=torch.int32),
                 )
@@ -523,9 +562,9 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
         token_id = int(out_ids[0, -1].item())
 
         # Advance KV cache inside the Neuron model to reflect the new token
-        _, _ = self.model.forward(
+        _, _ = self._safe_forward(
             input_ids=torch.tensor([[token_id]], dtype=sess.current_ids.dtype),
-            cache_ids=torch.tensor([self.model._next_pos], dtype=torch.int32)
+            cache_ids=torch.tensor([self.model._next_pos], dtype=torch.int32),
         )
         sess.cache_ids = torch.tensor([self.model._next_pos], dtype=torch.int32)
 
