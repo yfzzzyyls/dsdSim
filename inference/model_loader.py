@@ -213,11 +213,13 @@ def compile_target_model(
     All embedding look‑ups and top‑k / top‑p sampling run on the Neuron device
     via `on_device_embedding` and `on_device_generation`.
     """
+    n_pos_total = sequence_length + spec_length + 1
     logger.info(
-        "[compile_target_model] model=%s  γ=%d  seq_len=%d  top_k=%d top_p=%.2f",
+        "[compile_target_model] model=%s  γ=%d  ctx_len=%d  n_pos=%d  top_k=%d top_p=%.2f",
         model_path,
         spec_length,
         sequence_length,
+        n_pos_total,
         top_k,
         top_p,
     )
@@ -243,7 +245,7 @@ def compile_target_model(
     draft_model = NeuronAutoModelForCausalLM.from_pretrained(
         model_path,
         batch_size=1,
-        n_positions=sequence_length,
+        n_positions=n_pos_total,
         tp_degree=tp_degree,
         amp="bf16",
         neuron_config=neuron_cfg,
@@ -254,7 +256,7 @@ def compile_target_model(
     target_model = NeuronAutoModelForCausalLM.from_pretrained(
         model_path,
         batch_size=1,
-        n_positions=sequence_length,
+        n_positions=n_pos_total,
         tp_degree=tp_degree,
         amp="bf16",
         neuron_config=neuron_cfg,
