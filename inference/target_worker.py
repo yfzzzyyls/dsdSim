@@ -145,9 +145,9 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
                     input_ids=current_ids,
                     cache_ids=None,   # let wrapper fabricate correct (1,L) cache_ids
                 )
-            # store pointer (next index) inside the session
+            # store pointer (next index) inside the session (rank‑2 tensor (1,1))
             self.sessions[session_id].cache_ids = torch.tensor(
-                [prompt_len], dtype=torch.int32
+                [[prompt_len]], dtype=torch.int32
             )
         return inference_pb2.StartResponse(acknowledged=True)
 
@@ -379,10 +379,17 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
         tok = torch.tensor([[tok_id]], dtype=sess.current_ids.dtype)
         sess.current_ids = torch.cat([sess.current_ids, tok], dim=1)
         self._sync_kv_pointer(sess)
-        _, _ = self.model.forward(input_ids=tok,
-                                  cache_ids=torch.tensor([self.model._next_pos],
-                                                         dtype=torch.int32))
-        sess.cache_ids = torch.tensor([self.model._next_pos], dtype=torch.int32)
+        # _, _ = self.model.forward(input_ids=tok,
+        #                           cache_ids=torch.tensor([self.model._next_pos],
+        #                                                  dtype=torch.int32))
+        # sess.cache_ids = torch.tensor([self.model._next_pos], dtype=torch.int32)
+        # inference/target_worker.py  – helper _commit_token
+        _, _ = self.model.forward(
+            input_ids=torch.tensor([[tok_id]], dtype=sess.current_ids.dtype),
+            cache_ids=torch.tensor([[self.model._next_pos]],   # (1,1) ← was (1)
+                                dtype=torch.int32),
+        )
+        sess.cache_ids = torch.tensor([[self.model._next_pos]], dtype=torch.int32)
         if self.eos_token_id == tok_id:
             sess.finished = True
 

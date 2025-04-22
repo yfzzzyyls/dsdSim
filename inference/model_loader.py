@@ -38,11 +38,12 @@ class NeuronHFAdapterWrap(torch.nn.Module):
     # inference/model_loader.py  – inside class NeuronHFAdapterWrap
 
     # helper: build a 1‑D Int32 tensor  [start, …, start+L‑1]
+    # inference/model_loader.py  – inside NeuronHFAdapterWrap
     def _build_pos(self, start: int, length: int):
-        # Build a 1‑D Int32 tensor [start, ..., start+L-1] with shape (L,)
-        # A 1‑D shape avoids the RuntimeError raised by transformers‑neuronx
-        # when .item() is called on a multi‑element row tensor.
-        return torch.arange(start, start + length, dtype=torch.int32)
+        # ALWAYS return (1, L) so Neuron’s helper that does .max(dim=1)
+        # sees the expected rank‑2 tensor.
+        return torch.arange(start, start + length,
+                            dtype=torch.int32).unsqueeze(0)      # ←  (1, L)
 
     def forward(self, input_ids, cache_ids=None, return_all_logits=False, **kwargs):
         """
