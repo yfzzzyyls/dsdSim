@@ -247,7 +247,7 @@ def compile_target_model(
         model_path,
         batch_size=1,
         n_positions=ctx_len,
-        context_length_estimate=spec_length,
+        context_length_estimate=ctx_len,
         tp_degree=tp_deg,
         amp="bf16",
         neuron_config=neuron_cfg,
