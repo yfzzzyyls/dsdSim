@@ -85,10 +85,10 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
         -------
         torch.Tensor  shape (1, max(L, ctx_estimate))
         """
-        logger.debug("[pad_ids] seq_len=%d  bucket=%d", seq_len, self._ctx_estimate)
         if self._ctx_estimate == 0:
             return input_ids
         seq_len = input_ids.shape[1]
+        logger.debug("[pad_ids] seq_len=%d  bucket=%d", seq_len, self._ctx_estimate)
         if seq_len >= self._ctx_estimate:            # already long enough
             return input_ids
         pad_len = self._ctx_estimate - seq_len
