@@ -141,10 +141,9 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
 
             prompt_len = current_ids.shape[1]
             if current_ids.shape[1] > 0:
-                pos_tensor = torch.arange(current_ids.shape[1], dtype=torch.int32)   # 1‑D
                 _ = self.model.forward(
                     input_ids=current_ids,
-                    cache_ids=pos_tensor,
+                    cache_ids=None,   # let wrapper fabricate correct (1,L) cache_ids
                 )
             # store pointer (next index) inside the session
             self.sessions[session_id].cache_ids = torch.tensor(
@@ -284,14 +283,9 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
         self._sync_kv_pointer(sess)
         ids = torch.tensor([draft_tokens], dtype=sess.current_ids.dtype)   # (1, n)
         ids = self._pad_ids(ids)       # right‑pad up to _ctx_estimate (64)
-        pos_tensor = torch.arange(
-            int(self.model.cache_ids.item()),
-            int(self.model.cache_ids.item()) + ids.shape[1],
-            dtype=torch.int32
-        )
         logits, _ = self.model.forward(
             input_ids=ids,
-            cache_ids=pos_tensor,
+            cache_ids=None,          # wrapper builds (1,L) cache_ids internally
             return_all_logits=True
         )
         logits = logits[: len(draft_tokens)]               # keep real rows

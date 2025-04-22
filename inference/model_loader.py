@@ -37,9 +37,11 @@ class NeuronHFAdapterWrap(torch.nn.Module):
     #                    .repeat(batch, 1))       # -> (B, L)
     # inference/model_loader.py  – inside class NeuronHFAdapterWrap
 
-    # helper: build a 1‑D Int32 vector  [start, …, start+L‑1]
+    # helper: build a (1, L) Int32 tensor  [start, …, start+L‑1]
     def _build_pos(self, start: int, length: int):
-        return torch.arange(start, start + length, dtype=torch.int32)   # <‑‑ 1‑D
+        # Build a (1, L) tensor so downstream code that expects
+        # a batch‑dimension can safely call .max(dim=1)
+        return torch.arange(start, start + length, dtype=torch.int32).unsqueeze(0)
 
     def forward(self, input_ids, cache_ids=None, return_all_logits=False, **kwargs):
         """
