@@ -91,13 +91,13 @@ rm -r /var/tmp/neuron-compile-cache
 ### **Compile & Run the Target Model Server**
 
 ```
-python main.py --role target --model /home/ubuntu/models/llama-3.1-8b/ --port 50051 --sequence_length 128 --top_p 1.0
+python main.py --role target --model /home/ubuntu/models/llama-3.2-3b/ --port 50051 --sequence_length 64 --gamma 4
 ```
 
 ### **Compile & Run the Draft Model server**
 
 ```
-python main.py --role draft --model /home/ubuntu/models/llama-3.2-1b/ --target_host 18.188.214.41 --port 50051 --prompt_text prompt.txt --max_new_tokens 64 --gamma 4 --sequence_length 128 --profile --top_p 1.0 --temperature 0.9
+python main.py --role draft --model /home/ubuntu/models/llama-3.2-1b/ --target_host 3.137.153.173 --port 50051 --prompt_text prompt.txt --max_new_tokens 32 --gamma 4 --sequence_length 64
 ```
 
 ### **Example Output**
