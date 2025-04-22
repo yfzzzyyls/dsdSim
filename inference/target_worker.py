@@ -43,7 +43,7 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
         self.top_p = top_p
         self.tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=False)
         self.eos_token_id = self.tokenizer.eos_token_id
-        self._ctx_estimate = sequence_length + (spec_length or 4)
+        self._ctx_estimate = sequence_length
         self.sessions = {}  # session_id -> TargetSession
         self.lock = torch.multiprocessing.Lock()
 
