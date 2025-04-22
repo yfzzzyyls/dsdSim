@@ -38,69 +38,47 @@ class NeuronHFAdapterWrap(torch.nn.Module):
 
     def forward(self, input_ids, cache_ids=None, **kwargs):
         """
-        Neuron draft forward with explicit per‑call KV‑cache positions.
-        We maintain a cursor `_next_pos` so each incremental step passes
-        ONLY the positions of the *new* tokens.  This avoids the
-        “Tensor with N elements cannot be converted to Scalar” error.
+        Run one incremental forward on the Neuron adapter **always**
+        passing an explicit 2‑D `cache_ids` tensor so upstream
+        `transformers_neuronx.*` helpers never see `None`.
+
+        Parameters
+        ----------
+        input_ids : torch.LongTensor  shape (B, L_new)
+        cache_ids : torch.IntTensor   shape (B, L_new) OR None
         """
-        B, L = input_ids.shape  # batch, new‑token count
-
-        # ------------------------------------------------------------------
-        # Decide which position tensor to pass for these L new tokens
-        # ------------------------------------------------------------------
+        B, L = input_ids.shape
         if cache_ids is None:
-            if self._next_pos == 0:
-                # First (prompt‑priming) call – let Neuron allocate 0…L‑1
-                pos_tensor = None                    # Neuron fills it
-                next_pos_after = L
-            else:
-                # Incremental call – build positions [_next_pos, …]
-                pos_tensor = self._build_pos(self._next_pos, L, B)
-                next_pos_after = self._next_pos + L
+            # Build position indices [_next_pos, …]
+            cache_ids = self._build_pos(self._next_pos, L, B)   # (B, L)
         else:
-            # Caller supplied explicit positions (e.g. during rollback)
-            pos_tensor = cache_ids
-            next_pos_after = int(cache_ids.max().item()) + 1
+            # Caller supplied explicit positions (e.g., rollback); honour them
+            cache_ids = cache_ids
 
-        # If we are generating exactly one token (B==1, L==1), Neuron expects
-        # cache_ids to be 1‑D → torch.Size([1]); squeeze the batch dim.
-        if pos_tensor is not None and pos_tensor.ndim == 2 and pos_tensor.size(0) == 1 and pos_tensor.size(1) == 1:
-            pos_tensor = pos_tensor.squeeze(0)   # shape (1,)  – compatible with Neuron
         # ------------------------------------------------------------------
-        # Run Neuron adapter
+        # Forward through the wrapped HuggingFaceGenerationModelAdapter
         # ------------------------------------------------------------------
         out = self.adapter(input_ids=input_ids,
-                           cache_ids=pos_tensor,
+                           cache_ids=cache_ids,
                            return_dict=False,
                            **kwargs)
 
-        # ------------------------------------------------------------------
-        # Update internal cursor & cache pointer
-        # ------------------------------------------------------------------
-        self._next_pos = next_pos_after
-        if pos_tensor is None:
-            # Reconstruct positions 0…L‑1 for the prompt stage
-            # For prompt (B==1, L>1) keep 2‑D; for B==1, L==1 we can squeeze
-            pos_tensor = self._build_pos(0, L, B)
-            if pos_tensor.ndim == 2 and pos_tensor.size(0) == 1 and pos_tensor.size(1) == 1:
-                pos_tensor = pos_tensor.squeeze(0)
-        # self.cache_ids = pos_tensor if pos_tensor.ndim == 1 else pos_tensor.squeeze(0)
+        # Advance internal pointer
+        self._next_pos = int(cache_ids.max().item()) + 1
         self.cache_ids = torch.tensor([self._next_pos], dtype=torch.int32)
 
         # ------------------------------------------------------------------
-        # Unpack logits to 1‑D tensor
+        # Extract logits (shape → 1‑D for caller convenience)
         # ------------------------------------------------------------------
-        if isinstance(out, (tuple, list)):
-            logits = out[0]
-        else:
-            logits = out.logits if hasattr(out, "logits") else out
+        logits = out[0] if isinstance(out, (tuple, list)) else (
+                 out.logits if hasattr(out, "logits") else out)
 
-        if logits.dim() == 3:
-            logits = logits[0, -1, :]
-        elif logits.dim() == 2:
-            logits = logits[0]
+        if logits.ndim == 3:      # (B, L, V)
+            logits = logits[:, -1, :]       # keep last step
+        if logits.ndim == 2 and logits.size(0) == 1:
+            logits = logits[0]              # -> (V,)
 
-        return logits, pos_tensor
+        return logits, cache_ids
 
     # ------------------------------------------------------------------
     # Convenience: greedy sampling so verify.py can run target model alone

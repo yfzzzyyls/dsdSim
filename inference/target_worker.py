@@ -141,10 +141,13 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
 
             prompt_len = current_ids.shape[1]
             if current_ids.shape[1] > 0:
-                padded_ids = self._pad_ids(current_ids)
-                # Let Neuron assign positions (cache_ids=None) – it will
-                # allocate 0…len(padded_ids)-1 and ignore padding tokens 0.
-                _ = self.model.forward(input_ids=padded_ids, cache_ids=None)
+                pos_tensor = torch.arange(
+                    current_ids.shape[1], dtype=torch.int32
+                ).unsqueeze(0)                 # (1, L_prompt)
+                _ = self.model.forward(
+                    input_ids=current_ids,
+                    cache_ids=pos_tensor,
+                )
             # store pointer (next index) inside the session
             self.sessions[session_id].cache_ids = torch.tensor(
                 [prompt_len], dtype=torch.int32
@@ -283,7 +286,12 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
         self._sync_kv_pointer(sess)
         ids = torch.tensor([draft_tokens], dtype=sess.current_ids.dtype)   # (1, n)
         ids = self._pad_ids(ids)       # right‑pad up to _ctx_estimate (64)
-        logits = self.model.forward(input_ids=ids)[0]      # (1, n_pad, V)
+        pos_tensor = torch.arange(
+            int(self.model.cache_ids.item()),
+            int(self.model.cache_ids.item()) + ids.shape[1],
+            dtype=torch.int32
+        ).unsqueeze(0)
+        logits = self.model.forward(input_ids=ids, cache_ids=pos_tensor)[0]      # (1, n_pad, V)
         logits = logits.squeeze(0)                         #  → (n_pad, V)
         logits = logits[: len(draft_tokens)]               # keep real rows
 
