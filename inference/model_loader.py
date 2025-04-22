@@ -253,8 +253,6 @@ def compile_target_model(
         neuron_config=neuron_cfg,
     )
     target.to_neuron()     # compile
-    # Disable static context‑length guard (target side)
-    _disable_ctx_estimate(target)
 
     cfg = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
     adapter = HuggingFaceGenerationModelAdapter(cfg, target)
