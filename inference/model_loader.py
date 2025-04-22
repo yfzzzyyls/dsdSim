@@ -226,7 +226,7 @@ def compile_target_model(
         top_p,
     )
     # unified context length = prompt + γ + 2
-    ctx_len = sequence_length + spec_length + 2
+    ctx_len = sequence_length # + spec_length + 2
 
     # -------- on‑device generation configuration --------
     gen_cfg = GenerationConfig(
@@ -245,16 +245,16 @@ def compile_target_model(
 
     tp_degree = int(os.environ.get("NEURON_RT_NUM_CORES", "2"))
 
-    # ---- compile the *draft* model ----
-    draft_model = NeuronAutoModelForCausalLM.from_pretrained(
-        model_path,
-        batch_size=1,
-        n_positions=ctx_len,
-        tp_degree=tp_degree,
-        amp="bf16",
-        neuron_config=neuron_cfg,
-    )
-    draft_model.to_neuron()
+    # # ---- compile the *draft* model ----
+    # draft_model = NeuronAutoModelForCausalLM.from_pretrained(
+    #     model_path,
+    #     batch_size=1,
+    #     n_positions=ctx_len,
+    #     tp_degree=tp_degree,
+    #     amp="bf16",
+    #     neuron_config=neuron_cfg,
+    # )
+    # draft_model.to_neuron()
 
     # ---- compile the *target* model ----
     target_model = NeuronAutoModelForCausalLM.from_pretrained(
@@ -267,39 +267,20 @@ def compile_target_model(
     )
     target_model.to_neuron()
     # ---- fuse them into a speculative decoder ----
-    fused = FusedSpeculativeDecoder(draft_model, target_model, spec_length)
+    # FusedSpeculativeDecoder signature is (draft_model, target_model, spec_length).
+    # We use the same Neuron‑compiled model for both draft and target roles
+    # because we only need the target’s logits slice for verification.
+    fused = FusedSpeculativeDecoder(target_model, target_model, spec_length)
     fused.to_neuron()
 
     # ------------------------------------------------------------
     # Locate (or build) a HuggingFaceGenerationModelAdapter so the
     # rest of the server code can call .adapter(...).
     # ------------------------------------------------------------
-    if hasattr(fused, "adapter"):
-        tgt_adapter = fused.adapter
+    # Prefer the adapter already baked into the fused speculative decoder
 
-    elif hasattr(fused, "target_model") and hasattr(fused.target_model, "adapter"):
-        tgt_adapter = fused.target_model.adapter
-
-    elif hasattr(fused, "target") and hasattr(fused.target, "adapter"):
-        tgt_adapter = fused.target.adapter
-
-    else:
-        # ‑‑ Fallback: create a new HF adapter around the *target* model
-        from transformers import AutoConfig
-        hf_cfg = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
-        if hasattr(fused, "target_model"):
-            base_model = fused.target_model
-        elif hasattr(fused, "target"):
-            base_model = fused.target
-        else:
-            # last resort: assume the second argument was the target
-            base_model = target_model
-        logger.warning(
-            "[compile_target_model] FusedSpeculativeDecoder exposes no '.adapter'; "
-            "wrapping target model with HuggingFaceGenerationModelAdapter."
-        )
-        tgt_adapter = HuggingFaceGenerationModelAdapter(hf_cfg, base_model)
-
+    hf_cfg = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+    tgt_adapter = HuggingFaceGenerationModelAdapter(hf_cfg, fused)
     return NeuronHFAdapterWrap(tgt_adapter)
 
 

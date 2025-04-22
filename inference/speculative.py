@@ -83,6 +83,22 @@ def speculative_decode(
     start_t = time.time()
 
     while not finished and tokens_generated < max_new_tokens:
+        # ------------------------------------------------------------
+        # Runtime guard: never let prompt_len + generated + γ + 1
+        # exceed the compiled maximum n_positions of the draft model.
+        # ------------------------------------------------------------
+        ctx_limit = getattr(draft_model, "n_positions", None)
+        if ctx_limit is None and hasattr(getattr(draft_model, "config", None), "n_positions"):
+            ctx_limit = draft_model.config.n_positions
+        if ctx_limit is None:
+            # Fallback – assume up to 2048 tokens if draft model does not expose it
+            ctx_limit = 512
+        if draft_model._next_pos + current_gamma + 1 > ctx_limit:
+            logger.error(
+                "[session=%s] Reached compile-time context limit (%d); stopping generation.",
+                session_id, ctx_limit
+            )
+            break
         # The draft model proposes up to 'gamma' tokens
         speculative_tokens = []
         speculative_probs = []
