@@ -109,6 +109,7 @@ def speculative_decode(
             if profile:
                 _t0 = time.perf_counter()
             logits, _ = draft_model.forward(input_ids=scratch_token)
+            logger.info("[draft] logits row0 sum=%.3f", torch.softmax(logits.float(), dim=-1).sum())
             if profile:
                 timing["draft_forward_time"] += time.perf_counter() - _t0
             logits = logits.float()

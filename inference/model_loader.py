@@ -152,7 +152,7 @@ def compile_model(model_path: str, sequence_length: int = DEFAULT_SEQUENCE_LENGT
     # ------------------------------------------------------------------
     # Ensure the compiled graph supports “prompt + max γ + safety”
     # ------------------------------------------------------------------
-    ctx_len = sequence_length + (spec_length or 0) + 2
+    ctx_len = sequence_length #+ (spec_length or 0) + 2
     base_name = os.path.basename(os.path.normpath(model_path))
     compiled_dir = f"{base_name}-compiled-{sequence_length}"
     logger.info(f"Compiling model '{model_path}' to Neuron (sequence_length={sequence_length})...")
@@ -190,6 +190,7 @@ def compile_model(model_path: str, sequence_length: int = DEFAULT_SEQUENCE_LENGT
         adapter = HuggingFaceGenerationModelAdapter(hf_config, model)
         return NeuronHFAdapterWrap(adapter)
     else:
+        RuntimeError(f"Model type '{model_type}' not supported for compilation.")
         model = AutoModelForCausalLM.from_pretrained(model_path)
         model.save_pretrained(compiled_dir)
         tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=False)
@@ -206,82 +207,50 @@ def compile_target_model(
     sequence_length: int = DEFAULT_SEQUENCE_LENGTH,
     spec_length: int = 4,
     top_k: int = 512,
-    top_p: float = 1.0,
+    top_p: float = 0.9,
     temperature: float = 1.0,
 ):
     """
-    Compile a fused speculative decoder that:
-        • uses a *draft* LLaMA and a *target* LLaMA (both the same path here)
-        • verifies `spec_length` draft tokens and returns N+1 logits in 1 forward
+    Compile ONE Neuron target model (no fused graph) so we can
+    capture FULL logits for every draft token.
 
-    All embedding look‑ups and top‑k / top‑p sampling run on the Neuron device
-    via `on_device_embedding` and `on_device_generation`.
+    Returns
+    -------
+    NeuronHFAdapterWrap  – exposes .forward returning logits
     """
     logger.info(
-        "[compile_target_model] model=%s  γ=%d  seq_len=%d  top_k=%d top_p=%.2f",
-        model_path,
-        spec_length,
-        sequence_length,
-        top_k,
-        top_p,
+        "[compile_target_model] building Neuron target‑only model %s  γ=%d  seq_len=%d",
+        model_path, spec_length, sequence_length,
     )
-    # unified context length = prompt + γ + 2
-    ctx_len = sequence_length # + spec_length + 2
 
-    # -------- on‑device generation configuration --------
-    gen_cfg = GenerationConfig(
-        top_k=top_k,
-        top_p=top_p,
-        do_sample=True,
-        temperature=temperature,
-    )
+    ctx_len = sequence_length + spec_length + 2   # prompt + γ + bonus + slack
+    tp_deg  = int(os.environ.get("NEURON_RT_NUM_CORES", "2"))
+
+    # ——— Neuron config ———
+    gen_cfg = GenerationConfig(top_k=top_k, top_p=top_p,
+                               do_sample=True, temperature=temperature)
     neuron_cfg = NeuronConfig(
         padding_side="right",
         attention_layout="BSH",
         collectives_layout="BSH",
-        on_device_embedding=True,
-        on_device_generation=gen_cfg,
+        on_device_embedding=True,       # keep fast embeds
+        on_device_generation=None,      # <-- DISABLE device sampling ⇒ we get logits back
     )
 
-    tp_degree = int(os.environ.get("NEURON_RT_NUM_CORES", "2"))
-
-    # # ---- compile the *draft* model ----
-    # draft_model = NeuronAutoModelForCausalLM.from_pretrained(
-    #     model_path,
-    #     batch_size=1,
-    #     n_positions=ctx_len,
-    #     tp_degree=tp_degree,
-    #     amp="bf16",
-    #     neuron_config=neuron_cfg,
-    # )
-    # draft_model.to_neuron()
-
-    # ---- compile the *target* model ----
-    target_model = NeuronAutoModelForCausalLM.from_pretrained(
+    target = NeuronAutoModelForCausalLM.from_pretrained(
         model_path,
         batch_size=1,
         n_positions=ctx_len,
-        tp_degree=tp_degree,
+        tp_degree=tp_deg,
         amp="bf16",
         neuron_config=neuron_cfg,
     )
-    target_model.to_neuron()
-    # ---- fuse them into a speculative decoder ----
-    # FusedSpeculativeDecoder signature is (draft_model, target_model, spec_length).
-    # We use the same Neuron‑compiled model for both draft and target roles
-    # because we only need the target’s logits slice for verification.
-    fused = FusedSpeculativeDecoder(target_model, target_model, spec_length)
-    fused.to_neuron()
+    target.to_neuron()     # compile
 
-    # ------------------------------------------------------------
-    # Locate (or build) a HuggingFaceGenerationModelAdapter so the
-    # rest of the server code can call .adapter(...).
-    # ------------------------------------------------------------
-    # Prefer the adapter already baked into the fused speculative decoder
-
-    hf_cfg = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
-    tgt_adapter = HuggingFaceGenerationModelAdapter(hf_cfg, fused)
-    return NeuronHFAdapterWrap(tgt_adapter)
+    cfg = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+    adapter = HuggingFaceGenerationModelAdapter(cfg, target)
+    logger.info("[compile_target_model] Neuron graph compiled (ctx_len=%d)", ctx_len)
+    return NeuronHFAdapterWrap(adapter)
 
 
 def load_target_model(

@@ -9,6 +9,10 @@ from inference import model_loader
 from transformers import AutoTokenizer
 from grpc_comm import inference_pb2, inference_pb2_grpc
 
+# Small helper: Softmax once per row in float32 for numeric stability
+def _row_softmax(t: torch.Tensor) -> torch.Tensor:
+    return torch.softmax(t.float(), dim=-1)
+
 logger = logging.getLogger(__name__)
 if not logger.hasHandlers():
     h = logging.StreamHandler()
@@ -262,72 +266,40 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
     
     def _verify_single_step(self, sess: TargetSession, draft_tokens):
         """
-        One Neuron forward on the *whole* draft chunk.
-        Returns:
-            probs_all  – List[float]  P_target(d_i) for each draft token
-            rows       – List[Tuple[scores_row, idx_row]]  len = N+1
-                          where each element is (scores, indices) 1‑D tensors
-        Works with top_k=512: the model returns two tensors
-            scores : (N+1, 512)
-            idx    : (N+1, 512)   token‑ids that correspond to those scores
+        Forward the whole draft chunk through the Neuron target, capture logits.
+
+        Returns
+        -------
+        probs_all   : List[float]       – P_target(d_i) for each draft token
+        logits_rows : List[Tuple[scores, idx]]  – len = n_new
         """
         if not draft_tokens:
             return [], []
 
-        n_new = len(draft_tokens)
-        orig_cache = sess.cache_ids.clone()
         self._sync_kv_pointer(sess)
-        # ----------------------------------------------------------------
-        # FusedSpeculativeDecoder expects:
-        #   • input_ids : (1, 0)
-        #   • start_ids : (γ,)    1‑D vector of the draft tokens
-        #   • cache_ids : scalar  (int32 tensor with the current pos)
-        # ----------------------------------------------------------------
-        start_vec = torch.tensor(draft_tokens,
-                                 dtype=sess.current_ids.dtype)      # shape (γ(gamma_chunk),)
+        ids = torch.tensor([draft_tokens], dtype=sess.current_ids.dtype)   # (1, n)
+        logits = self.model.forward(input_ids=ids)[0]      # (1, n, V)
+        logits = logits.squeeze(0)                         #  → (n, V)
 
-        gamma_chunk = self.model.spec_length   # or .speculation_length depending on version
-        if start_vec.numel() < gamma_chunk:
-            pad_tok = self.eos_token_id or 0
-            pad = torch.full((gamma_chunk - start_vec.numel(),), pad_tok, dtype=start_vec.dtype)
-            start_vec = torch.cat([start_vec, pad])
+        # ---- DEBUG: dump one row so we can inspect distributions ----
+        logger.info("[verify] logits chunk shape=%s  row0_sum=%.3f",
+                    tuple(logits.shape),
+                    _row_softmax(logits[0]).sum())
 
-        out = self.model.adapter(
-            input_ids=torch.empty((1, 0), dtype=start_vec.dtype, device=start_vec.device),
-            start_ids=start_vec,
-            cache_ids=sess.cache_ids.clone(),       # scalar int32 tensor
-            return_dict=False,
-        )
-
-        if isinstance(out, (tuple, list)) and len(out) == 2:
-            scores_all, idx_all = out
-            if scores_all.dim() == 3:
-                scores_all = scores_all.squeeze(0)
-                idx_all    = idx_all.squeeze(0)
-        else:
-            logits_all = out if not isinstance(out, (tuple, list)) else out[0]
-            if logits_all.dim() == 1:
-                logits_all = logits_all.unsqueeze(0)
-            scores_all, idx_all = torch.topk(logits_all, TOP_K_TARGET, dim=-1)
-        scores_all = scores_all.float()
-        idx_all    = idx_all.int()
+        scores_all, idx_all = torch.topk(logits, TOP_K_TARGET, dim=-1)     # (n, 512)
 
         probs_all = []
         for step, tok in enumerate(draft_tokens):
-            row_scores = scores_all[step]
-            row_idx    = idx_all[step]
-            matches = (row_idx == tok).nonzero(as_tuple=True)[0]
-            if matches.numel():
-                j = int(matches[0].item())
-                p = float(torch.softmax(row_scores, dim=-1)[j].item())
+            idx_row  = idx_all[step]
+            scr_row  = scores_all[step]
+            hit = (idx_row == tok).nonzero(as_tuple=True)[0]
+            if hit.numel():
+                j = int(hit[0].item())
+                probs_all.append(float(_row_softmax(scr_row)[j].item()))
             else:
-                p = 0.0
-            probs_all.append(p)
+                probs_all.append(0.0)
 
-        logits_rows = [(scores_all[i], idx_all[i]) for i in range(n_new + 1)]
-
-        sess.cache_ids = orig_cache.clone()
-        self._sync_kv_pointer(sess)
+        logits_rows = [(scores_all[i], idx_all[i]) for i in range(len(draft_tokens))]
         return probs_all, logits_rows
 
     def VerifyDraftTokens(self, request, context):
