@@ -56,24 +56,12 @@ class NeuronHFAdapterWrap(torch.nn.Module):
         """
         B, L = input_ids.shape
         # ------------------------------------------------------------------
-        # Decide whether to fabricate an explicit position tensor.
-        # Draft models compiled with `.enable_speculative_decoder()`
-        # expect `cache_ids=None`; giving them a (B,L) tensor triggers
-        # the RuntimeError you saw ("Tensor with 12 elements cannot be
-        # converted to scalar").  We therefore *skip* building cache_ids
-        # when the wrapped adapter exposes attribute `spec_length`.
+        # ALWAYS build an explicit (batch, L) position tensor when the caller
+        # does not supply one.  This works for both draft *and* target models
+        # that were compiled without the Neuron fused‑speculation wrapper.
         # ------------------------------------------------------------------
         if cache_ids is None:
-            needs_explicit_pos = not hasattr(self.adapter, "spec_length")
-            if needs_explicit_pos:
-                # Target‑side or non‑fused model → build [start…start+L‑1]
-                # cache_ids = self._build_pos(self._next_pos, L, B)
-                cache_ids = self._build_pos(self._next_pos, L)   # now 1‑D
-            else:
-                # Draft model with fused speculative decoder – let Neuron
-                # generate positions internally.
-                cache_ids = None
-        # else: caller supplied explicit tensor – use it as‑is
+            cache_ids = self._build_pos(self._next_pos, L)
 
         # ------------------------------------------------------------------
         # Forward through the wrapped HuggingFaceGenerationModelAdapter
