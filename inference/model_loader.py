@@ -149,6 +149,10 @@ def compile_model(model_path: str, sequence_length: int = DEFAULT_SEQUENCE_LENGT
     compiles it to a TorchScript that can run on NeuronCores, and saves the compiled model
     and tokenizer to a local folder for future use.
     """
+    # ------------------------------------------------------------------
+    # Ensure the compiled graph supports “prompt + max γ + safety”
+    # ------------------------------------------------------------------
+    ctx_len = sequence_length + (spec_length or 0) + 2
     base_name = os.path.basename(os.path.normpath(model_path))
     compiled_dir = f"{base_name}-compiled-{sequence_length}"
     logger.info(f"Compiling model '{model_path}' to Neuron (sequence_length={sequence_length})...")
@@ -172,8 +176,8 @@ def compile_model(model_path: str, sequence_length: int = DEFAULT_SEQUENCE_LENGT
             model_path,
             batch_size=1,
             amp='bf16',
-            n_positions=sequence_length,
-            context_length_estimate=sequence_length,
+            n_positions=ctx_len,
+            context_length_estimate=ctx_len,
             tp_degree=tp_degree
         )
 
@@ -221,6 +225,8 @@ def compile_target_model(
         top_k,
         top_p,
     )
+    # unified context length = prompt + γ + 2
+    ctx_len = sequence_length + spec_length + 2
 
     # -------- on‑device generation configuration --------
     gen_cfg = GenerationConfig(
@@ -243,7 +249,7 @@ def compile_target_model(
     draft_model = NeuronAutoModelForCausalLM.from_pretrained(
         model_path,
         batch_size=1,
-        n_positions=sequence_length,
+        n_positions=ctx_len,
         tp_degree=tp_degree,
         amp="bf16",
         neuron_config=neuron_cfg,
@@ -254,13 +260,14 @@ def compile_target_model(
     target_model = NeuronAutoModelForCausalLM.from_pretrained(
         model_path,
         batch_size=1,
-        n_positions=sequence_length,
+        n_positions=ctx_len,
         tp_degree=tp_degree,
         amp="bf16",
         neuron_config=neuron_cfg,
     )
     target_model.to_neuron()
-
+    print("[debug] Model n_positions:", ctx_len)
+    print("Buckets:", target_model.adapter.model.program.n_positions_list)
     # ---- fuse them into a speculative decoder ----
     fused = FusedSpeculativeDecoder(draft_model, target_model, spec_length)
     fused.to_neuron()
