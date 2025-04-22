@@ -60,9 +60,9 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
             compiled_est = getattr(inner, "context_length_estimate", None)
         if compiled_est is None:
             compiled_est = sequence_length            # fallback
-        # We have just disabled the guard inside the model, so we can safely
-        # ignore the compile‑time bucket size.
-        self._ctx_estimate = 0
+
+        # Keep the bucket so _pad_ids() can right‑pad short inputs.
+        self._ctx_estimate = compiled_est or 0
         logger.info("[init] detected context_length_estimate=%d", self._ctx_estimate)
         self.sessions = {}  # session_id -> TargetSession
         self.lock = torch.multiprocessing.Lock()
@@ -138,12 +138,15 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
                 current_ids = enc["input_ids"]
             else:
                 current_ids = torch.zeros((1,0), dtype=torch.long)
+            # --- right‑pad the prompt so its length matches the compile‑time bucket ---
+            prompt_len = current_ids.shape[1]            # length BEFORE padding
+            current_ids = self._pad_ids(current_ids)     # shape (1, max(L, ctx_estimate))
             self.sessions[session_id] = TargetSession(current_ids)
             # --- prime Neuron KV cache on the prompt (with padding) ---
             self.model.cache_ids = None
             self.model._next_pos = 0
 
-            prompt_len = current_ids.shape[1]
+            # prompt_len already set above before padding
             if current_ids.shape[1] > 0:
                 _ = self.model.forward(
                     input_ids=current_ids,
@@ -254,24 +257,7 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
                 results.append(inference_pb2.FinalizeBatchResult(session_id=sid, finished=sess.finished))
         return inference_pb2.FinalizeBatchResponse(results=results)
 
-    # def _verify_single_step(self, sess, draft_tokens):
-    #     # fallback approach, calls model per token
-    #     probs = []
-    #     # temp_ids = sess.current_ids.clone()
-    #     temp_ids = self._pad_ids(sess.current_ids.clone())
-    #     for t in draft_tokens:
-    #         out = self.model(temp_ids)
-    #         logits = _extract_logits(out)
-    #         row_probs = torch.softmax(logits, dim=-1)
-    #         p = float(row_probs[0, t].item())
-    #         probs.append(p)
-    #         # appended_tok = torch.tensor([[t]], dtype=temp_ids.dtype)
-    #         # temp_ids = torch.cat([temp_ids, appended_tok], dim=1)
-    #         appended_tok = torch.tensor([[t]], dtype=temp_ids.dtype)
-    #         temp_ids = torch.cat([temp_ids, appended_tok], dim=1)
-    #         temp_ids = self._pad_ids(temp_ids)
-    #     return probs
-    
+   
     def _verify_single_step(self, sess: TargetSession, draft_tokens):
         """
         Forward the whole draft chunk through the Neuron target, capture logits.
@@ -285,7 +271,8 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
             return [], []
 
         self._sync_kv_pointer(sess)
-        ids = torch.tensor([draft_tokens], dtype=sess.current_ids.dtype)   # (1, n)
+        ids = torch.tensor([draft_tokens], dtype=sess.current_ids.dtype)
+        ids = self._pad_ids(ids)
         # No extra right-padding; pass ids directly to the model
         logits, _ = self.model.forward(
             input_ids=ids,
@@ -388,10 +375,10 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
         #                                                  dtype=torch.int32))
         # sess.cache_ids = torch.tensor([self.model._next_pos], dtype=torch.int32)
         # inference/target_worker.py  – helper _commit_token
+        tok_ids = torch.tensor([[tok_id]], dtype=sess.current_ids.dtype)
+        tok_ids = self._pad_ids(tok_ids)
         _, _ = self.model.forward(
-            input_ids=torch.tensor([[tok_id]], dtype=sess.current_ids.dtype),
-            cache_ids=torch.tensor([[self.model._next_pos]],   # (1,1) ← was (1)
-                                dtype=torch.int32),
+            input_ids=tok_ids,
         )
         sess.cache_ids = torch.tensor([[self.model._next_pos]], dtype=torch.int32)
         if self.eos_token_id == tok_id:
