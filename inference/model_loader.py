@@ -38,9 +38,9 @@ class NeuronHFAdapterWrap(torch.nn.Module):
 
     def forward(self, input_ids, cache_ids=None, **kwargs):
         """
-        Run one incremental forward on the Neuron adapter **always**
-        passing an explicit 2‑D `cache_ids` tensor so upstream
-        `transformers_neuronx.*` helpers never see `None`.
+        Run one incremental forward on the Neuron adapter, fabricating an explicit 2‑D `cache_ids`
+        tensor for models that require it, but passing `cache_ids=None` for draft models
+        that expose a speculative‑decoder interface (i.e., have attribute `spec_length`).
 
         Parameters
         ----------
@@ -48,12 +48,24 @@ class NeuronHFAdapterWrap(torch.nn.Module):
         cache_ids : torch.IntTensor   shape (B, L_new) OR None
         """
         B, L = input_ids.shape
+        # ------------------------------------------------------------------
+        # Decide whether to fabricate an explicit position tensor.
+        # Draft models compiled with `.enable_speculative_decoder()`
+        # expect `cache_ids=None`; giving them a (B,L) tensor triggers
+        # the RuntimeError you saw ("Tensor with 12 elements cannot be
+        # converted to scalar").  We therefore *skip* building cache_ids
+        # when the wrapped adapter exposes attribute `spec_length`.
+        # ------------------------------------------------------------------
         if cache_ids is None:
-            # Build position indices [_next_pos, …]
-            cache_ids = self._build_pos(self._next_pos, L, B)   # (B, L)
-        else:
-            # Caller supplied explicit positions (e.g., rollback); honour them
-            cache_ids = cache_ids
+            needs_explicit_pos = not hasattr(self.adapter, "spec_length")
+            if needs_explicit_pos:
+                # Target‑side or non‑fused model → build [start…start+L‑1]
+                cache_ids = self._build_pos(self._next_pos, L, B)
+            else:
+                # Draft model with fused speculative decoder – let Neuron
+                # generate positions internally.
+                cache_ids = None
+        # else: caller supplied explicit tensor – use it as‑is
 
         # ------------------------------------------------------------------
         # Forward through the wrapped HuggingFaceGenerationModelAdapter
@@ -155,14 +167,10 @@ def compile_model(model_path: str, sequence_length: int = DEFAULT_SEQUENCE_LENGT
             batch_size=1,
             amp='bf16',
             n_positions=ctx_len,
-            context_length_estimate=ctx_len,
             tp_degree=tp_degree
         )
 
         # If a speculative length is provided, enable that many-token speculative decoder
-        if spec_length is not None:
-            logger.info(f"Enabling speculative decoder with length {spec_length}...")
-            model.enable_speculative_decoder(spec_length)
         model.to_neuron()
         hf_config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
         adapter = HuggingFaceGenerationModelAdapter(hf_config, model)
