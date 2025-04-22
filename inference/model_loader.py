@@ -257,12 +257,14 @@ def compile_target_model(
         model_path,
         batch_size=1,
         n_positions=ctx_len,
-        context_length_estimate=ctx_len,
+        context_length_estimate=64,
         tp_degree=tp_deg,
         amp="bf16",
         neuron_config=neuron_cfg,
     )
     target.to_neuron()     # compile
+    # Disable compile‑time context‑length guard so short verify chunks work
+    _disable_ctx_estimate(target)
 
     cfg = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
     adapter = HuggingFaceGenerationModelAdapter(cfg, target)
