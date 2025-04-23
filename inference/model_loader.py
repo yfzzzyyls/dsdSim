@@ -13,7 +13,7 @@ from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers_neuronx.fused_speculation import FusedSpeculativeDecoder
 # fused speculative decoding utilities
 # generic Neuron interfaces (present in transformers‑neuronx >= 0.13)
-from transformers_neuronx import NeuronAutoModelForCausalLM, NeuronConfig, GenerationConfig
+from transformers_neuronx import NeuronConfig, GenerationConfig
 
 logger = logging.getLogger(__name__)
 
@@ -174,31 +174,25 @@ def compile_model(model_path: str, sequence_length: int = DEFAULT_SEQUENCE_LENGT
 
     tp_degree = int(os.environ.get("NEURON_RT_NUM_CORES", "2"))
     if model_type.lower() == "llama" or "llama" in model_path.lower():
-        logger.info(f"Compiling model using NeuronAutoModelForCausalLM ...")
-        # ---- build Neuron config with logits‑returning generation disabled ----
-        neuron_cfg = NeuronConfig(
-            padding_side="right",
-            attention_layout="BSH",
-            collectives_layout="BSH",
-            on_device_embedding=True,
-            on_device_generation=None,   # return logits on host
-        )
-        model = NeuronAutoModelForCausalLM.from_pretrained(
+        logger.info("Compiling LLama model using LlamaForSampling ...")
+        # LlamaForSampling already exposes a Neuron‑optimised incremental graph
+        model = LlamaForSampling.from_pretrained(
             model_path,
             batch_size=1,
             n_positions=ctx_len,
             context_length_estimate=ctx_len,
             tp_degree=tp_degree,
             amp="bf16",
-            neuron_config=neuron_cfg,
         )
         model.to_neuron()
-        # Draft side also needs full logits for each token,
-        # so we wrap with HuggingFaceGenerationModelAdapter
-        hf_cfg = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+
+        # Wrap so .forward returns logits and accepts cache_ids=None
+        hf_cfg  = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
         adapter = HuggingFaceGenerationModelAdapter(hf_cfg, model)
-        # disable context_length_estimate guard inside the compiled graph
+
+        # Disable compile‑time context‑length guard so short chunks don’t throw
         _disable_ctx_estimate(model)
+
         return NeuronHFAdapterWrap(adapter, cache_ids_rank2=True)
     else:
         RuntimeError(f"Model type '{model_type}' not supported for compilation.")
@@ -234,41 +228,27 @@ def compile_target_model(
         model_path, spec_length, sequence_length,
     )
 
-    ctx_len = sequence_length
-    # Safety‑margin so the target graph has a bucket larger than any possible
-    # prompt + generated tokens. 128 was too tight and caused StopIteration.
-    if ctx_len < 512:
-        ctx_len = 512
+    # Use the same LlamaForSampling backend for the target so interfaces match
+    ctx_len = max(sequence_length, 512)   # safety slack
     tp_deg  = int(os.environ.get("NEURON_RT_NUM_CORES", "2"))
 
-    # ——— Neuron config, only used when on_device_generation = True ———
-    gen_cfg = GenerationConfig(top_k=top_k, top_p=top_p,
-                               do_sample=True, temperature=temperature)
-    
-    neuron_cfg = NeuronConfig(
-        padding_side="right",
-        attention_layout="BSH",
-        collectives_layout="BSH",
-        on_device_embedding=True,       # keep fast embeds
-        on_device_generation=None,      # <-- DISABLE device sampling ⇒ we get logits back
-    )
+    logger.info("[compile_target_model] Compiling target with LlamaForSampling …")
 
-    target = NeuronAutoModelForCausalLM.from_pretrained(
+    target = LlamaForSampling.from_pretrained(
         model_path,
         batch_size=1,
         n_positions=ctx_len,
-        context_length_estimate=64,
+        context_length_estimate=ctx_len,
         tp_degree=tp_deg,
         amp="bf16",
-        neuron_config=neuron_cfg,
     )
-    target.to_neuron()     # compile
-    # Disable compile‑time context‑length guard so short verify chunks work
+    target.to_neuron()
+
+    # Disable compile‑time guard
     _disable_ctx_estimate(target)
 
     cfg = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
     adapter = HuggingFaceGenerationModelAdapter(cfg, target)
-    logger.info("[compile_target_model] Neuron graph compiled (ctx_len=%d)", ctx_len)
     return NeuronHFAdapterWrap(adapter, cache_ids_rank2=True)
 
 
