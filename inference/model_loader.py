@@ -252,7 +252,7 @@ def compile_target_model(
 
     cfg = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
     adapter = HuggingFaceGenerationModelAdapter(cfg, target)
-    return NeuronHFAdapterWrap(adapter, cache_ids_rank2=False)
+    return NeuronHFAdapterWrap(adapter, cache_ids_rank2=True)
 
 
 def load_target_model(
