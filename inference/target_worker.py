@@ -183,22 +183,23 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
             else:
                 current_ids = torch.zeros((1,0), dtype=torch.long)
             # --- right‑pad the prompt so its length matches the compile‑time bucket ---
-            prompt_len = current_ids.shape[1]            # length BEFORE padding
-            current_ids = self._pad_ids(current_ids)     # shape (1, max(L, ctx_estimate))
+            orig_len    = current_ids.shape[1]           # prompt tokens before padding
+            current_ids = self._pad_ids(current_ids)     # may extend to bucket size
             self.sessions[session_id] = TargetSession(current_ids)
-            # --- prime Neuron KV cache on the prompt (with padding) ---
+
+            # --- prime Neuron KV cache on the (possibly padded) prompt ---
             self.model.cache_ids = None
             self.model._next_pos = 0
 
-            # prompt_len already set above before padding
             if current_ids.shape[1] > 0:
                 _ = self._safe_forward(
                     input_ids=current_ids,
                     cache_ids=None,   # let wrapper fabricate correct (1,L) cache_ids
                 )
-            # store pointer (next index) inside the session (rank‑2 tensor (1,1))
+            # store pointer (next index) after the FULL prompt (incl. padding)
+            padded_len = current_ids.shape[1]            # equals self.model._next_pos after prime
             self.sessions[session_id].cache_ids = torch.tensor(
-                [[prompt_len]], dtype=torch.int32
+                [[padded_len]], dtype=torch.int32
             )
         return inference_pb2.StartResponse(acknowledged=True)
 
@@ -316,8 +317,7 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
 
         self._sync_kv_pointer(sess)
         ids = torch.tensor([draft_tokens], dtype=sess.current_ids.dtype)
-        ids = self._pad_ids(ids)
-        # No extra right-padding; pass ids directly to the model
+        # No right‑padding for incremental steps – keep true length
         logits, _ = self._safe_forward(
             input_ids=ids,
             cache_ids=None,          # wrapper builds (1,L) cache_ids internally
@@ -416,7 +416,6 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
         self._sync_kv_pointer(sess)
         # inference/target_worker.py  – helper _commit_token
         tok_ids = torch.tensor([[tok_id]], dtype=sess.current_ids.dtype)
-        tok_ids = self._pad_ids(tok_ids)
         _, _ = self._safe_forward(
             input_ids=tok_ids,
         )

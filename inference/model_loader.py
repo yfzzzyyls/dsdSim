@@ -81,10 +81,13 @@ class NeuronHFAdapterWrap(torch.nn.Module):
         if cache_ids is None:
             cache_ids = self._build_pos(self._next_pos, L)
 
-        out = self.adapter(input_ids=input_ids,
-                           cache_ids=cache_ids,
-                           return_dict=False,
-                           **kwargs)
+        out = self.adapter(
+            input_ids=input_ids,
+            cache_ids=cache_ids,
+            start_ids=cache_ids,   # propagate position tensor for compiled graph
+            return_dict=False,
+            **kwargs,
+        )
 
         self._next_pos = int(cache_ids.max().item()) + 1
         self.cache_ids = torch.tensor([self._next_pos], dtype=torch.int32)
@@ -193,7 +196,7 @@ def compile_model(model_path: str, sequence_length: int = DEFAULT_SEQUENCE_LENGT
         # Disable compile‑time context‑length guard so short chunks don’t throw
         _disable_ctx_estimate(model)
 
-        return NeuronHFAdapterWrap(adapter, cache_ids_rank2=True)
+        return NeuronHFAdapterWrap(adapter, cache_ids_rank2=False)
     else:
         RuntimeError(f"Model type '{model_type}' not supported for compilation.")
         model = AutoModelForCausalLM.from_pretrained(model_path)
@@ -249,7 +252,7 @@ def compile_target_model(
 
     cfg = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
     adapter = HuggingFaceGenerationModelAdapter(cfg, target)
-    return NeuronHFAdapterWrap(adapter, cache_ids_rank2=True)
+    return NeuronHFAdapterWrap(adapter, cache_ids_rank2=False)
 
 
 def load_target_model(
