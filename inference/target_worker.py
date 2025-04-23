@@ -199,7 +199,7 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
             # store pointer (next index) after the FULL prompt (incl. padding)
             padded_len = current_ids.shape[1]            # equals self.model._next_pos after prime
             self.sessions[session_id].cache_ids = torch.tensor(
-                [[padded_len]], dtype=torch.int32
+                [padded_len], dtype=torch.int32
             )
         return inference_pb2.StartResponse(acknowledged=True)
 
@@ -419,7 +419,7 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
         _, _ = self._safe_forward(
             input_ids=tok_ids,
         )
-        sess.cache_ids = torch.tensor([[self.model._next_pos]], dtype=torch.int32)
+        sess.cache_ids = torch.tensor([self.model._next_pos], dtype=torch.int32)
         if self.eos_token_id == tok_id:
             sess.finished = True
 
