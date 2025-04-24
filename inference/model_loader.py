@@ -174,19 +174,38 @@ def compile_model(model_path: str, sequence_length: int = DEFAULT_SEQUENCE_LENGT
             amp='bf16',
             n_positions=sequence_length,
             context_length_estimate=sequence_length,
-            tp_degree=tp_degree
+            tp_degree=tp_degree,
+            return_all_logits=True,
+            return_dict=True,
+            torchscript=True,
+            use_cache=True,
+            trust_remote_code=True,
         )
-        # If a speculative length is provided, enable that many-token speculative decoder
-        if spec_length is not None:
-            model.enable_speculative_decoder(spec_length)
         model.to_neuron()
+        # ------------------------------------------------------------------
+        # Ensure tokenizer & configs have an explicit PAD token.
+        # This silences HF warnings and lets Neuron skip attention‑mask logic.
+        # ------------------------------------------------------------------
+        tokenizer = AutoTokenizer.from_pretrained(model_path,
+                                                  trust_remote_code=True,
+                                                  use_fast=False)
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token           # reuse </s>
+        # Make the id available everywhere
+        tokenizer.pad_token_id = tokenizer.eos_token_id
         hf_config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+        if hf_config.pad_token_id is None:
+            hf_config.pad_token_id = tokenizer.pad_token_id
+        model.config.pad_token_id = hf_config.pad_token_id
         adapter = HuggingFaceGenerationModelAdapter(hf_config, model)
         return NeuronHFAdapterWrap(adapter)
     else:
         model = AutoModelForCausalLM.from_pretrained(model_path)
         model.save_pretrained(compiled_dir)
         tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=False)
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+        tokenizer.pad_token_id = tokenizer.eos_token_id
         tokenizer.save_pretrained(compiled_dir)
         logger.info(f"Model and tokenizer saved to '{compiled_dir}' (no Neuron compilation performed).")
         return model

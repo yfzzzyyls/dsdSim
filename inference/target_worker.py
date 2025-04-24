@@ -269,6 +269,7 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
             input_ids=padded_ids,
             cache_ids=pad_cache
         )
+        logger.info(f"[verify] logits_all shape: {logits_all.shape}")
  
         # logits_all shape (ctx_estimate, V); keep first N rows for real tokens
         logits_all = logits_all[:n_new]
