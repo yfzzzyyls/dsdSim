@@ -95,9 +95,11 @@ class NeuronHFAdapterWrap(torch.nn.Module):
         else:
             logits = out.logits if hasattr(out, "logits") else out
 
+        # KEEP THE FULL (B, L, V) TENSOR – verification code will
+        # select the rows it needs.
         if logits.dim() == 3:
             logits = logits[0, -1, :]
-        elif logits.dim() == 2:
+        if logits.dim() == 2:
             logits = logits[0]
 
         return logits, pos_tensor
@@ -174,7 +176,9 @@ def compile_model(model_path: str, sequence_length: int = DEFAULT_SEQUENCE_LENGT
             amp='bf16',
             n_positions=sequence_length,
             context_length_estimate=sequence_length,
+            spec_length = spec_length,
             tp_degree=tp_degree,
+            on_device_generation=False,
             return_all_logits=True,
             return_dict=True,
             torchscript=True,
@@ -198,6 +202,40 @@ def compile_model(model_path: str, sequence_length: int = DEFAULT_SEQUENCE_LENGT
             hf_config.pad_token_id = tokenizer.pad_token_id
         model.config.pad_token_id = hf_config.pad_token_id
         adapter = HuggingFaceGenerationModelAdapter(hf_config, model)
+        # --------------------------------------------------------------
+        # DEBUG: Inspect raw Neuron model output shape *before* wrapping
+        # --------------------------------------------------------------
+        # try:
+        #     # create a small random batch (1, 4) just to probe the output
+        #     debug_batch = torch.randint(
+        #         low=0,
+        #         high=hf_config.vocab_size,
+        #         size=(1, 4),
+        #         dtype=torch.int64
+        #     )
+        #     raw_out = adapter(input_ids=debug_batch, cache_ids=None, return_dict=True)
+        #     logger.info(f"[DEBUG] raw adapter logits shape: {raw_out.logits.shape}")
+        # except Exception as e:
+        #     logger.warning(f"[DEBUG] raw adapter call failed: {e}")
+
+
+        # --------------------------------------------------------------
+        # Quick sanity‑check: call the underlying model.forward so we can pass spec_length.
+        # --------------------------------------------------------------
+        # debug_batch = torch.randint(0, hf_config.vocab_size, (1, 4))
+        # # Call the underlying LlamaForSampling forward so we can pass spec_length.
+        # raw_out = model.forward(
+        #     input_ids=debug_batch,
+        #     cache_ids=None,
+        #     spec_length=debug_batch.shape[1],   # ask for all-token logits
+        #     return_dict=True,
+        # )
+        # logger.info(
+        #     "[DEBUG] LlamaForSampling raw logits shape %s",
+        #     raw_out.shape,
+        # )
+
+        # Wrap the adapter so downstream code keeps the KV‑pointer logic
         return NeuronHFAdapterWrap(adapter)
     else:
         model = AutoModelForCausalLM.from_pretrained(model_path)
