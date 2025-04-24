@@ -302,7 +302,8 @@ def compile_target_model(model_path: str,
 
     tp_degree = int(os.environ.get("NEURON_RT_NUM_CORES", "2"))
     # For now we only special‑case Llama; add other families as needed.
-    neuron_cfg = NeuronConfig(is_eagle_target=True)
+    neuron_cfg = NeuronConfig(is_eagle_target=False,
+                          cast_logits_dtype="bfloat16")   # <- enables safe cast
     model = LlamaForSampling.from_pretrained(
         model_path,
         batch_size            = 1,
@@ -313,24 +314,27 @@ def compile_target_model(model_path: str,
         neuron_config         = neuron_cfg,
         tp_degree             = tp_degree,
         on_device_generation  = False,        # we need raw logits on host
-        return_all_logits     = True,         # **key line – full distributions**
+        return_all_logits     = False,         # **key line – full distributions**
+        return_all_outputs    = True,   #  ← add this
         return_dict           = True,
         torchscript           = True,
         use_cache             = True,
         trust_remote_code     = True,
     )
     # ------------------------------------------------------------------
-    # WORK‑AROUND: LlamaForSampling._forward may return (logits, aux)
-    # when return_all_logits=True.  The default _cast_logits expects a
-    # tensor and crashes with AttributeError: 'tuple' object has no
-    # attribute 'to'.  Replace it with a safe version that unwraps the
-    # first element if a tuple is received.
+    # WORK‑AROUND: LlamaForSampling._forward returns (logits, hidden)
+    # for Eagle‑target graphs.  The default _cast_logits expects a tensor
+    # and fails with AttributeError: 'tuple' object has no attribute 'to'.
+    # Replace it with a safe version that unwraps the logits.
     # ------------------------------------------------------------------
-    # def _safe_cast_logits(self, logits):
+    # def _safe_cast(self, logits):
+    #     # logits is (logits_bsv, hidden) when Eagle target
     #     if isinstance(logits, (tuple, list)):
-    #         logits = logits[0]
-    #     return logits       # leave dtype unchanged; Neuron already returns bf16
-    # model._cast_logits = types.MethodType(_safe_cast_logits, model)
+    #         log, hid = logits
+    #         # Neuron already gives bf16; no dtype conversion needed
+    #         return log, hid          # return BOTH tensors
+    #     return logits                # non-Eagle path (single tensor)
+    # model._cast_logits = types.MethodType(_safe_cast, model)
 
     model.enable_speculative_decoder(spec_buckets) 
 
