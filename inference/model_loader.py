@@ -48,7 +48,7 @@ class NeuronHFAdapterWrap(torch.nn.Module):
 
         # Ensure speculation length default mirrors input_ids length
         if spec_length is None:
-            RuntimeError("spec_length must be provided for tree_speculative_forward")
+            raise RuntimeError("spec_length must be provided for speculative_forward")
             # spec_length = input_ids.shape[1]
 
         return self.adapter.model.speculative_forward(
@@ -60,12 +60,12 @@ class NeuronHFAdapterWrap(torch.nn.Module):
 
     def tree_speculative_forward(self, input_ids, *, cache_ids=None,
                                  spec_length=None, **kwargs):
-        
+
         # Ensure speculation length default mirrors input_ids length
         if spec_length is None:
-            RuntimeError("spec_length must be provided for tree_speculative_forward")
+            raise RuntimeError("spec_length must be provided for tree_speculative_forward")
             # spec_length = input_ids.shape[1]
-
+        logger.info(f"Calling tree_speculative_forward with spec_length={spec_length}")
         return self.adapter.model.tree_speculative_forward(
             input_ids=input_ids,
             cache_ids=cache_ids,

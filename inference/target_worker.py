@@ -250,6 +250,10 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
  
         # One Neuron forward – processes N real tokens; padded tail ignored
                 # ---------- ONE model.tree_speculative_forward ----------
+        logger.info(f"[verify] model.tree_speculative_forward: "
+                    f"input_ids.shape={padded_ids.shape}, "
+                    f"cache_ids.shape={pad_cache.shape}, "
+                    f"spec_length={n_new}")
         logits_all, _ = self.model.tree_speculative_forward(
             input_ids=padded_ids,
             cache_ids=pad_cache,
