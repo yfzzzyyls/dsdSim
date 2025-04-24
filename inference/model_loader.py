@@ -151,8 +151,6 @@ def compile_model(model_path: str, sequence_length: int = DEFAULT_SEQUENCE_LENGT
     compiles it to a TorchScript that can run on NeuronCores, and saves the compiled model
     and tokenizer to a local folder for future use.
     """
-    base_name = os.path.basename(os.path.normpath(model_path))
-    compiled_dir = f"{base_name}-compiled-{sequence_length}"
     logger.info(f"Compiling model '{model_path}' to Neuron (sequence_length={sequence_length})...")
 
     model_type = ""
@@ -239,11 +237,70 @@ def compile_model(model_path: str, sequence_length: int = DEFAULT_SEQUENCE_LENGT
         return NeuronHFAdapterWrap(adapter)
     else:
         model = AutoModelForCausalLM.from_pretrained(model_path)
-        model.save_pretrained(compiled_dir)
         tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=False)
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
         tokenizer.pad_token_id = tokenizer.eos_token_id
-        tokenizer.save_pretrained(compiled_dir)
-        logger.info(f"Model and tokenizer saved to '{compiled_dir}' (no Neuron compilation performed).")
+        logger.info("Non‑Neuron path: loaded model & tokenizer; skipping on‑disk save because we re‑compile on every run.")
         return model
+    
+
+def compile_target_model(model_path: str,
+                         sequence_length: int = DEFAULT_SEQUENCE_LENGTH,
+                         spec_length: int | None = None):
+    """
+            Compile the *target* model.  Differs from `compile_model` (used for
+    the draft model) in that we always expose **all** logits for the
+    tokens supplied in each forward pass so the verification step can
+    access the full distribution.  No other behavioural changes are
+    introduced.
+    """
+
+    logger.info(f"[Target‑compile] Compiling '{model_path}' → Neuron "
+                f"(sequence_length={sequence_length}, spec_length={spec_length})")
+
+    tp_degree = int(os.environ.get("NEURON_RT_NUM_CORES", "2"))
+    # For now we only special‑case Llama; add other families as needed.
+    model = LlamaForSampling.from_pretrained(
+        model_path,
+        batch_size            = 1,
+        amp                   = "bf16",
+        n_positions           = sequence_length,
+        context_length_estimate = sequence_length,
+        spec_length           = spec_length,
+        tp_degree             = tp_degree,
+        on_device_generation  = False,        # we need raw logits on host
+        return_all_logits     = True,         # **key line – full distributions**
+        return_dict           = True,
+        torchscript           = True,
+        use_cache             = True,
+        trust_remote_code     = True,
+    )
+    model.to_neuron()
+
+    # Ensure PAD token is defined so we can always right‑pad inputs.
+    tokenizer = AutoTokenizer.from_pretrained(model_path,
+                                              trust_remote_code=True,
+                                              use_fast=False)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.pad_token_id = tokenizer.eos_token_id
+
+    hf_config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+    if hf_config.pad_token_id is None:
+        hf_config.pad_token_id = tokenizer.pad_token_id
+    model.config.pad_token_id = hf_config.pad_token_id
+
+    adapter = HuggingFaceGenerationModelAdapter(hf_config, model)
+    return NeuronHFAdapterWrap(adapter)
+
+
+def load_target_model(model_path: str,
+                      sequence_length: int = DEFAULT_SEQUENCE_LENGTH,
+                      spec_length: int | None = None):
+    """
+    Convenience wrapper the *target* side should call instead of `load_model`.
+    """
+    return compile_target_model(model_path,
+                                sequence_length=sequence_length,
+                                spec_length=spec_length)

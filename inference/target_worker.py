@@ -30,7 +30,9 @@ class TargetSession:
 
 class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
     def __init__(self, model_path, sequence_length=128, spec_length=None, temperature: float = 1.0, top_p: float = 0.9):
-        self.model = model_loader.load_model(model_path, sequence_length=sequence_length, spec_length=spec_length)
+        self.model = model_loader.load_target_model(model_path,
+                                            sequence_length=sequence_length,
+                                            spec_length=spec_length)
         self.temperature = temperature
         self.top_p = top_p
         self.tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=False)
