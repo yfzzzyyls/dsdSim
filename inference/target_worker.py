@@ -253,11 +253,11 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
         logger.info(f"[verify] model.tree_speculative_forward: "
                     f"input_ids.shape={padded_ids.shape}, "
                     f"cache_ids.shape={pad_cache.shape}, "
-                    f"spec_length={n_new}")
+                    f"verify_speculation_length={n_new}")
         logits_all, _ = self.model.tree_speculative_forward(
             input_ids=padded_ids,
             cache_ids=pad_cache,
-            spec_length=n_new
+            spec_length=n_new,
         )
         # tree_speculative_forward returns (B, N, V); drop batch dim
         if logits_all.dim() == 3:
@@ -313,19 +313,23 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
             committed     = []
             accepted_cnt  = 0
 
-            # scan until first rejection
-            for tok in draft_tokens:
-                p_target = self._verify_single_step(sess, [tok])[0]
-                if p_target >= 1e-3:                       # accept
+            # ---- ONE verification pass for the entire chunk ----
+            probs = self._verify_single_step(sess, draft_tokens)
+
+            for tok, p_target in zip(draft_tokens, probs):
+                if p_target >= 1e-3:                 # accept
                     accepted_cnt += 1
                     self._commit_token(sess, tok)
                     committed.append(tok)
                     if self.eos_token_id == tok:
                         break
                 else:
-                    fallback = self._generate_one_token(sess,
-                                                        temperature=self.temperature,
-                                                        top_p=self.top_p)
+                    # first rejection → immediately generate fallback then stop
+                    fallback = self._generate_one_token(
+                        sess,
+                        temperature=self.temperature,
+                        top_p=self.top_p,
+                    )
                     committed.append(fallback)
                     break
             else:

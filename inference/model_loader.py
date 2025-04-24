@@ -283,8 +283,7 @@ def compile_model(model_path: str, sequence_length: int = DEFAULT_SEQUENCE_LENGT
     
 
 def compile_target_model(model_path: str,
-                         sequence_length: int = DEFAULT_SEQUENCE_LENGTH,
-                         spec_length: int | None = None):
+                         sequence_length: int = DEFAULT_SEQUENCE_LENGTH):
     """
             Compile the *target* model.  Differs from `compile_model` (used for
     the draft model) in that we always expose **all** logits for the
@@ -294,7 +293,7 @@ def compile_target_model(model_path: str,
     """
 
     logger.info(f"[Target‑compile] Compiling '{model_path}' → Neuron "
-                f"(sequence_length={sequence_length}, spec_length={spec_length})")
+                f"(sequence_length={sequence_length},")
 
     # ------------------------------------------------------------------
     # If the caller did not specify a `spec_length`, assume the default
@@ -328,6 +327,9 @@ def compile_target_model(model_path: str,
     )
     model.to_neuron()
 
+    logger.info("Compiled speculation buckets: %s", list(model.decoder_lm_head_for_speculation.keys()))
+    logger.info("Spec-lengths: %s", sorted({k[0] for k in model.decoder_lm_head_for_speculation}))
+
     # Ensure PAD token is defined so we can always right‑pad inputs.
     tokenizer = AutoTokenizer.from_pretrained(model_path,
                                               trust_remote_code=True,
@@ -352,5 +354,4 @@ def load_target_model(model_path: str,
     Convenience wrapper the *target* side should call instead of `load_model`.
     """
     return compile_target_model(model_path,
-                                sequence_length=sequence_length,
-                                spec_length=spec_length)
+                                sequence_length=sequence_length)
