@@ -8,6 +8,7 @@ from transformers_neuronx import LlamaForSampling
 from transformers_neuronx.module import save_pretrained_split
 from transformers_neuronx.generation_utils import HuggingFaceGenerationModelAdapter
 import torch
+from transformers_neuronx.config import NeuronConfig
 from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers_neuronx.fused_speculation import FusedSpeculativeDecoder
 # Fused Speculative Decoding is supported.
@@ -283,40 +284,32 @@ def compile_model(model_path: str, sequence_length: int = DEFAULT_SEQUENCE_LENGT
     
 
 def compile_target_model(model_path: str,
-                         sequence_length: int = DEFAULT_SEQUENCE_LENGTH):
+                         sequence_length: int = DEFAULT_SEQUENCE_LENGTH,
+                         spec_buckets: list[int] | None = None):
     """
-            Compile the *target* model.  Differs from `compile_model` (used for
+    Compile the *target* model.  Differs from `compile_model` (used for
     the draft model) in that we always expose **all** logits for the
     tokens supplied in each forward pass so the verification step can
     access the full distribution.  No other behavioural changes are
     introduced.
     """
+    if spec_buckets is None:
+        raise RuntimeError("spec_buckets must be provided for compile_target_model")
 
     logger.info(f"[Target‑compile] Compiling '{model_path}' → Neuron "
                 f"(sequence_length={sequence_length},")
 
-    # ------------------------------------------------------------------
-    # If the caller did not specify a `spec_length`, assume the default
-    # gamma (4).  The Neuron compiler generates a distinct sub‑graph for
-    # every (spec_length, batch_size) pair requested at compile‑time, so
-    # compiling with `None` then calling the runtime kernels with an int
-    # (e.g. 1 … 4) triggers a KeyError such as `(None, 1)`.  Falling back
-    # to 4 ensures the compiled model supports verifying up to four‑token
-    # speculative chunks out of the box.
-    # ------------------------------------------------------------------
-    # if spec_length is None:
-    #     logger.warning(f"spec_length not specified; defaulting to 4")
-    #     spec_length = 4
-
     tp_degree = int(os.environ.get("NEURON_RT_NUM_CORES", "2"))
     # For now we only special‑case Llama; add other families as needed.
+    neuron_cfg = NeuronConfig(is_eagle_target=True)
     model = LlamaForSampling.from_pretrained(
         model_path,
         batch_size            = 1,
         amp                   = "bf16",
         n_positions           = sequence_length,
         context_length_estimate = sequence_length,
-        spec_length           = [1, 2, 4, 8],
+        spec_length           = spec_buckets,
+        neuron_config         = neuron_cfg,
         tp_degree             = tp_degree,
         on_device_generation  = False,        # we need raw logits on host
         return_all_logits     = True,         # **key line – full distributions**
@@ -327,8 +320,8 @@ def compile_target_model(model_path: str,
     )
     model.to_neuron()
 
+    logger.info("Requested spec-length buckets: %s", spec_buckets)
     logger.info("Compiled speculation buckets: %s", list(model.decoder_lm_head_for_speculation.keys()))
-    logger.info("Spec-lengths: %s", sorted({k[0] for k in model.decoder_lm_head_for_speculation}))
 
     # Ensure PAD token is defined so we can always right‑pad inputs.
     tokenizer = AutoTokenizer.from_pretrained(model_path,
@@ -348,10 +341,10 @@ def compile_target_model(model_path: str,
 
 
 def load_target_model(model_path: str,
-                      sequence_length: int = DEFAULT_SEQUENCE_LENGTH,
-                      spec_length: int | None = None):
+                      sequence_length: int = DEFAULT_SEQUENCE_LENGTH):
     """
     Convenience wrapper the *target* side should call instead of `load_model`.
     """
     return compile_target_model(model_path,
-                                sequence_length=sequence_length)
+                                sequence_length=sequence_length,
+                                spec_buckets=[1, 2, 4, 8])
