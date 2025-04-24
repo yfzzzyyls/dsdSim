@@ -305,9 +305,9 @@ def compile_target_model(model_path: str,
     # to 4 ensures the compiled model supports verifying up to four‑token
     # speculative chunks out of the box.
     # ------------------------------------------------------------------
-    if spec_length is None:
-        logger.warning(f"spec_length not specified; defaulting to 4")
-        spec_length = 4
+    # if spec_length is None:
+    #     logger.warning(f"spec_length not specified; defaulting to 4")
+    #     spec_length = 4
 
     tp_degree = int(os.environ.get("NEURON_RT_NUM_CORES", "2"))
     # For now we only special‑case Llama; add other families as needed.
