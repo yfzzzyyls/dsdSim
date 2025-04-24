@@ -36,6 +36,43 @@ class NeuronHFAdapterWrap(torch.nn.Module):
                        .unsqueeze(0)            # -> (1, L)
                        .repeat(batch, 1))       # -> (B, L)
 
+    # ------------------------------------------------------------------
+    # Speculative helpers – expose Neuron-native multi-token kernels
+    # ------------------------------------------------------------------
+    def speculative_forward(self, input_ids, *, cache_ids=None,
+                            spec_length=None, **kwargs):
+        """
+        Pass-through to the Neuron graph that returns logits for **all**
+        tokens in `input_ids` (shape = (B, N, V)).
+        """
+
+        # Ensure speculation length default mirrors input_ids length
+        if spec_length is None:
+            RuntimeError("spec_length must be provided for tree_speculative_forward")
+            # spec_length = input_ids.shape[1]
+
+        return self.adapter.model.speculative_forward(
+            input_ids=input_ids,
+            cache_ids=cache_ids,
+            speculation_length=spec_length, # or input_ids.shape[1],
+            **kwargs
+        )
+
+    def tree_speculative_forward(self, input_ids, *, cache_ids=None,
+                                 spec_length=None, **kwargs):
+        
+        # Ensure speculation length default mirrors input_ids length
+        if spec_length is None:
+            RuntimeError("spec_length must be provided for tree_speculative_forward")
+            # spec_length = input_ids.shape[1]
+
+        return self.adapter.model.tree_speculative_forward(
+            input_ids=input_ids,
+            cache_ids=cache_ids,
+            speculation_length=spec_length,
+            **kwargs,
+        )
+
     def forward(self, input_ids, cache_ids=None, **kwargs):
         """
         Neuron draft forward with explicit per‑call KV‑cache positions.
@@ -258,6 +295,19 @@ def compile_target_model(model_path: str,
 
     logger.info(f"[Target‑compile] Compiling '{model_path}' → Neuron "
                 f"(sequence_length={sequence_length}, spec_length={spec_length})")
+
+    # ------------------------------------------------------------------
+    # If the caller did not specify a `spec_length`, assume the default
+    # gamma (4).  The Neuron compiler generates a distinct sub‑graph for
+    # every (spec_length, batch_size) pair requested at compile‑time, so
+    # compiling with `None` then calling the runtime kernels with an int
+    # (e.g. 1 … 4) triggers a KeyError such as `(None, 1)`.  Falling back
+    # to 4 ensures the compiled model supports verifying up to four‑token
+    # speculative chunks out of the box.
+    # ------------------------------------------------------------------
+    if spec_length is None:
+        logger.warning(f"spec_length not specified; defaulting to 4")
+        spec_length = 4
 
     tp_degree = int(os.environ.get("NEURON_RT_NUM_CORES", "2"))
     # For now we only special‑case Llama; add other families as needed.

@@ -200,24 +200,6 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
                 results.append(inference_pb2.FinalizeBatchResult(session_id=sid, finished=sess.finished))
         return inference_pb2.FinalizeBatchResponse(results=results)
 
-    # def _verify_single_step(self, sess, draft_tokens):
-    #     # fallback approach, calls model per token
-    #     probs = []
-    #     # temp_ids = sess.current_ids.clone()
-    #     temp_ids = self._pad_ids(sess.current_ids.clone())
-    #     for t in draft_tokens:
-    #         out = self.model(temp_ids)
-    #         logits = _extract_logits(out)
-    #         row_probs = torch.softmax(logits, dim=-1)
-    #         p = float(row_probs[0, t].item())
-    #         probs.append(p)
-    #         # appended_tok = torch.tensor([[t]], dtype=temp_ids.dtype)
-    #         # temp_ids = torch.cat([temp_ids, appended_tok], dim=1)
-    #         appended_tok = torch.tensor([[t]], dtype=temp_ids.dtype)
-    #         temp_ids = torch.cat([temp_ids, appended_tok], dim=1)
-    #         temp_ids = self._pad_ids(temp_ids)
-    #     return probs
-    
     def _verify_single_step(self, sess: TargetSession, draft_tokens):
         """
         Fast path: score all draft_tokens in ONE forward pass.
@@ -267,10 +249,16 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
             pad_cache = pad_cache.squeeze(0)        # shape becomes (ctx_estimate,)
  
         # One Neuron forward – processes N real tokens; padded tail ignored
-        logits_all, _ = self.model.forward(
+                # ---------- ONE model.tree_speculative_forward ----------
+        logits_all, _ = self.model.tree_speculative_forward(
             input_ids=padded_ids,
-            cache_ids=pad_cache
+            cache_ids=pad_cache,
+            spec_length=n_new
         )
+        # tree_speculative_forward returns (B, N, V); drop batch dim
+        if logits_all.dim() == 3:
+            logits_all = logits_all[0]           # → (N, V)
+
         logger.info(f"[verify] logits_all shape: {logits_all.shape}")
  
         # logits_all shape (ctx_estimate, V); keep first N rows for real tokens
