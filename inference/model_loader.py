@@ -317,7 +317,7 @@ def compile_target_model(model_path: str,
         amp                   = "bf16",
         n_positions           = sequence_length,
         context_length_estimate = sequence_length,
-        spec_length           = spec_length,
+        spec_length           = [1, 2, 4, 8],
         tp_degree             = tp_degree,
         on_device_generation  = False,        # we need raw logits on host
         return_all_logits     = True,         # **key line – full distributions**
