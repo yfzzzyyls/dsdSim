@@ -11,6 +11,7 @@ import torch
 from transformers_neuronx.config import NeuronConfig
 from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers_neuronx.fused_speculation import FusedSpeculativeDecoder
+import types
 # Fused Speculative Decoding is supported.
 # fsd = FusedSpeculativeDecoder(draft_model, target_model, spec_length)
 # fsd.to_neuron()  # Compile the fused speculative model
@@ -318,6 +319,21 @@ def compile_target_model(model_path: str,
         use_cache             = True,
         trust_remote_code     = True,
     )
+    # ------------------------------------------------------------------
+    # WORK‑AROUND: LlamaForSampling._forward may return (logits, aux)
+    # when return_all_logits=True.  The default _cast_logits expects a
+    # tensor and crashes with AttributeError: 'tuple' object has no
+    # attribute 'to'.  Replace it with a safe version that unwraps the
+    # first element if a tuple is received.
+    # ------------------------------------------------------------------
+    # def _safe_cast_logits(self, logits):
+    #     if isinstance(logits, (tuple, list)):
+    #         logits = logits[0]
+    #     return logits       # leave dtype unchanged; Neuron already returns bf16
+    # model._cast_logits = types.MethodType(_safe_cast_logits, model)
+
+    model.enable_speculative_decoder(spec_buckets) 
+
     model.to_neuron()
 
     logger.info("Requested spec-length buckets: %s", spec_buckets)
