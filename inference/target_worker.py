@@ -210,17 +210,26 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
         """
         logger.info("Commit raw tok_ids=%s", tok_ids)
         
-        # ---- sanity checks (add these) ---------------------------------
-        # 1) bucket match
-        assert len(tok_ids) in bucket_lengths, \
-            f"Commit length {len(tok_ids)} not in compiled buckets {sorted(bucket_lengths)}"
-
-        # 2) no placeholder / out-of-vocab IDs
-        assert all(0 < t < self.tokenizer.vocab_size for t in tok_ids), \
-            f"Found placeholder or OOV token in commit_ids: {tok_ids}"
-        # ----------------------------------------------------------------
         if not tok_ids:
             return
+        
+        # ===============================================================
+        # Discover the compiled speculation bucket sizes ONCE per call.
+        # ===============================================================
+        inner = self.model.adapter.model
+        bucket_lengths = {k[0] if isinstance(k, tuple) else int(k)
+                            for k in inner.decoder_lm_head_for_speculation.keys()}
+        # ---------------------------------------------------------------
+        # Strip any placeholder IDs before sanity checks
+        # ---------------------------------------------------------------
+        tok_ids = [t for t in tok_ids if t > 0]
+
+        # Sanity checks
+        assert len(tok_ids) in bucket_lengths, \
+            f"Commit length {len(tok_ids)} not compiled; buckets={sorted(bucket_lengths)}"
+        assert all(0 < t < self.tokenizer.vocab_size for t in tok_ids), \
+            f"OOV or placeholder token in commit_ids: {tok_ids}"
+
         self._sync_kv_pointer(sess)
 
         # (1, K) tensor of the new tokens
