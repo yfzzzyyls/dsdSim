@@ -117,34 +117,34 @@ def speculative_decode(
             nucleus_probs = nucleus_probs / nucleus_probs.sum()
 
             # ---------- repetition penalty (1‑ to NGRAM_WINDOW‑gram) ----------
-            if recent_deque:
-                # Build a flat list of recent output + current draft chunk
-                recent_ids = list(recent_deque) + speculative_tokens
-                # Penalise 1‑gram repeats first
-                recent1 = torch.tensor(recent_ids, device=nucleus_idx.device)
-                mask1   = (nucleus_idx.unsqueeze(1) == recent1).any(dim=1)
+            # if recent_deque:
+            #     # Build a flat list of recent output + current draft chunk
+            #     recent_ids = list(recent_deque) + speculative_tokens
+            #     # Penalise 1‑gram repeats first
+            #     recent1 = torch.tensor(recent_ids, device=nucleus_idx.device)
+            #     mask1   = (nucleus_idx.unsqueeze(1) == recent1).any(dim=1)
 
-                # Optional higher‑order n‑gram penalty (up to NGRAM_WINDOW)
-                mask_ngram = mask1.clone()
-                if len(recent_ids) >= 2 and NGRAM_WINDOW >= 2:
-                    for n in range(2, NGRAM_WINDOW + 1):
-                        if len(recent_ids) < n:
-                            break
-                        tail = recent_ids[-(n-1):]                # last n‑1 tokens
-                        # create tensor [tail + candidate] for each nucleus candidate
-                        cand = torch.cat([
-                            torch.tensor(tail, device=nucleus_idx.device).repeat(nucleus_idx.size(0), 1),
-                            nucleus_idx.unsqueeze(1)
-                        ], dim=1)
-                        # search n‑gram occurrences in recent_ids as sliding window
-                        recent_ng = torch.tensor(recent_ids, device=nucleus_idx.device)
-                        windows = recent_ng.unfold(0, n, 1)       # shape (L-n+1, n)
-                        match = (cand.unsqueeze(1) == windows).all(dim=2).any(dim=1)
-                        mask_ngram |= match
+            #     # Optional higher‑order n‑gram penalty (up to NGRAM_WINDOW)
+            #     mask_ngram = mask1.clone()
+            #     if len(recent_ids) >= 2 and NGRAM_WINDOW >= 2:
+            #         for n in range(2, NGRAM_WINDOW + 1):
+            #             if len(recent_ids) < n:
+            #                 break
+            #             tail = recent_ids[-(n-1):]                # last n‑1 tokens
+            #             # create tensor [tail + candidate] for each nucleus candidate
+            #             cand = torch.cat([
+            #                 torch.tensor(tail, device=nucleus_idx.device).repeat(nucleus_idx.size(0), 1),
+            #                 nucleus_idx.unsqueeze(1)
+            #             ], dim=1)
+            #             # search n‑gram occurrences in recent_ids as sliding window
+            #             recent_ng = torch.tensor(recent_ids, device=nucleus_idx.device)
+            #             windows = recent_ng.unfold(0, n, 1)       # shape (L-n+1, n)
+            #             match = (cand.unsqueeze(1) == windows).all(dim=2).any(dim=1)
+            #             mask_ngram |= match
 
-                if mask_ngram.any():
-                    nucleus_probs = torch.where(mask_ngram, nucleus_probs * REP_PENALTY, nucleus_probs)
-                    nucleus_probs = nucleus_probs / nucleus_probs.sum()
+            #     if mask_ngram.any():
+            #         nucleus_probs = torch.where(mask_ngram, nucleus_probs * REP_PENALTY, nucleus_probs)
+            #         nucleus_probs = nucleus_probs / nucleus_probs.sum()
             
             # sample a token from the renormalised nucleus
             sample_idx = torch.multinomial(nucleus_probs, 1).item()
