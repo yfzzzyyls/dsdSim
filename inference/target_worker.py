@@ -245,11 +245,19 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
             spec_length=len(tok_ids),
         )
 
-        # Update session‑side state
-        sess.cache_ids = torch.tensor([self.model._next_pos], dtype=torch.int32)
-        sess.current_ids = torch.cat([sess.current_ids, in_tensor], dim=1)
+        # ----- Update KV pointer and session history -----
+        new_next_pos = int(self.model._next_pos) + len(tok_ids)
+        self.model._next_pos = new_next_pos          # advance global pointer
+        sess.cache_ids = torch.tensor([new_next_pos], dtype=torch.int32)
+
+        # Append committed ids to session's token history
+        new_tok_tensor = torch.tensor([tok_ids], dtype=sess.current_ids.dtype)
+        sess.current_ids = torch.cat([sess.current_ids, new_tok_tensor], dim=1)
+
         if self.eos_token_id is not None and any(t == self.eos_token_id for t in tok_ids):
             sess.finished = True
+
+        logger.info("Committed %d tokens; _next_pos -> %d", len(tok_ids), new_next_pos)
 
     def _verify_single_step(self, sess: TargetSession, draft_tokens):
         """
