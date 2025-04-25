@@ -103,22 +103,14 @@ python main.py --role draft --model /home/ubuntu/models/llama-3.2-1b/ --target_h
 ### **Example Output**
 
 ```
-INFO:inference.draft_worker:[Thread-2] Starting speculative decoding with session_id=104464132
-INFO:inference.draft_worker:[Thread-0] Starting speculative decoding with session_id=3780988024
-INFO:inference.draft_worker:[Thread-1] Starting speculative decoding with session_id=1574770097
-INFO:inference.speculative:Speculative decoding match rate: 37.50% (Draft accepted: 48, Target generated: 80)
-INFO:inference.speculative:Speculative decoding match rate: 22.48% (Draft accepted: 29, Target generated: 100)
-INFO:inference.speculative:Speculative decoding match rate: 17.83% (Draft accepted: 23, Target generated: 106)
+2025-04-25 03:36:14,234 INFO inference.draft_worker: [BATCH] Decoding prompt 0: What is the difference between llama and alpaca?
+2025-04-25 03:36:22,733 INFO inference.speculative: Latency: 8.49 seconds
+2025-04-25 03:36:22,733 INFO inference.speculative: Speculative decoding match rate: 9.38% (Draft accepted: 6, Target generated: 58)
+2025-04-25 03:36:22,733 INFO inference.draft_worker: Batched decode completed in 8.50s.
 
-=== Final Batched Outputs ===
-
+=== Final Outputs (BATCH approach) ===
 [Prompt 0 Output]:
-Once upon a time, there there
-......
-[Prompt 1 Output]:
-......
-[Prompt 2 Output]:
-......
+What is the difference between llama and alpaca? Alpacas are native to South America Peru, Bolivia, Chile have grey, brown, white, rose grey and fawn coloured coats while llamas have been domestic garded for over 4,000 years, are usually brown in colour, have thick woolly coats and longer legs and have been used far quieter and
 ```
 
 ## **Performance Profiling Stats**
