@@ -295,9 +295,8 @@ def compile_target_model(model_path: str,
     introduced.
     """
     # Compile γ + 1 buckets so verify pass includes the bonus‑token row
-    base_buckets = [1, 2, 4, 8]
-    spec_buckets = [g + 1 for g in base_buckets]      # -> [2, 3, 5, 9]
-    spec_buckets = [1, 2, 3, 5, 9]
+    max_gamma = 8
+    spec_buckets = list(range(1, max_gamma + 2))   # [1,2,3,4,5,6,7,8,9]
 
     if spec_buckets is None:
         raise RuntimeError("spec_buckets must be provided for compile_target_model")
