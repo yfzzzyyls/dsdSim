@@ -208,6 +208,7 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
         We use `speculative_forward` (not plain forward) to bypass the
         context‑bucket check that requires input length ≥ ctx_estimate.
         """
+        tok_ids = [t for t in tok_ids if t > 0]
         if not tok_ids:
             return
         self._sync_kv_pointer(sess)
