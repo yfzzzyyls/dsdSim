@@ -31,7 +31,9 @@ def speculative_decode(
     with full rollback of the draft model's past states.
     Extended to handle a session_id so multiple prompts can run concurrently on the server.
     """
-    current_gamma = max(1, gamma)          # start with user‑given gamma
+    valid_gammas = (1, 2, 4, 8)   # must match compiled buckets on target
+    # snap initial γ to the largest compiled bucket ≤ user request
+    current_gamma = max(g for g in valid_gammas if g <= max(1, gamma))
     gamma_max     = 8                      # hard ceiling
     current_temp  = temperature            # draft temperature we can tweak
     target_accept = 0.7                    # desired per‑loop acceptance rate
@@ -185,11 +187,14 @@ def speculative_decode(
             loop_accept_rate = accepted_count / current_gamma
             error = target_accept - loop_accept_rate
 
-            # proportional update
-            new_gamma = int(max(1, min(gamma_max, current_gamma + 0.5 * error * current_gamma)))
+            # PID suggestion
+            desired_gamma = int(max(1, min(gamma_max,
+                                           current_gamma + 0.5 * error * current_gamma)))
+            # snap to nearest compiled bucket _not exceeding_ desired_gamma
+            new_gamma = max(g for g in valid_gammas if g <= desired_gamma)
             if new_gamma != current_gamma:
-                logger.debug("[session=%s] Adjust gamma %d → %d (acc_rate=%.2f)",
-                             session_id, current_gamma, new_gamma, loop_accept_rate)
+                logger.debug("[session=%s] Adjust γ %d → %d (acc_rate=%.2f, desired=%d)",
+                             session_id, current_gamma, new_gamma, loop_accept_rate, desired_gamma)
             current_gamma = new_gamma
 
             new_temp = max(0.3, min(2.0, current_temp * (1 + 0.2 * error)))

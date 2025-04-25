@@ -229,39 +229,31 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
         # Build (1, N) input_ids for the draft chunk
         n_new = len(draft_tokens)
         draft_tensor = torch.tensor([draft_tokens], dtype=sess.current_ids.dtype)
- 
-        # Absolute positions for each new token: [orig_nextpos .. orig_nextpos+N‑1]
-        pos_tensor = torch.arange(
-            orig_nextpos, orig_nextpos + n_new, dtype=torch.int32
-        ).unsqueeze(0)                                # shape (1, N)
- 
-        # ---- static‑shape padding to ctx_estimate (=128) ----
-        # 1) pad input_ids on the right with zeros so length == ctx_estimate
-        padded_ids = self._pad_ids(draft_tensor)      # shape (1, ctx_estimate)
- 
-        # 2) pad cache_ids to same length; fill unused tail with ‑1 (ignored)
-        pad_cache = torch.full_like(padded_ids, -1, dtype=torch.int32)
-        pad_cache[0, :n_new] = pos_tensor[0]          # copy real positions
 
-        # Neuron expects 1‑D cache_ids for a single sequence; squeeze batch dim
-        if pad_cache.ndim == 2 and pad_cache.size(0) == 1:
-            pad_cache = pad_cache.squeeze(0)        # shape becomes (ctx_estimate,)
- 
-        # One Neuron forward – processes N real tokens; padded tail ignored
-                # ---------- ONE model.tree_speculative_forward ----------
-        logger.info(f"[verify] model.tree_speculative_forward: "
-                    f"input_ids.shape={padded_ids.shape}, "
-                    f"cache_ids.shape={pad_cache.shape}, "
-                    f"verify_speculation_length={n_new}")
-        
-        logits_all, _ = self.model.tree_speculative_forward(
-            input_ids=padded_ids,
-            cache_ids=pad_cache,
-            spec_length=n_new,
+        # ---- NO padding for speculative decoder ----
+        input_ids  = draft_tensor               # shape (1, N)
+
+        # Spec‑decoder buffer length must equal spec_len
+        spec_len  = n_new                       # 1, 2, or 4
+        cache_vec = torch.arange(spec_len, dtype=torch.int32) + orig_nextpos
+
+        logger.info(f"[verify] input_ids.shape={input_ids.shape}, "
+                    f"cache_vec.shape={cache_vec.shape}, "
+                    f"spec_len={spec_len}")
+
+        # k = getattr(self.model.adapter.model, "unroll", 8)      # 8 in your build
+        # cache_vec = torch.full((k,), -1, dtype=torch.int32)
+        # cache_vec[0] = orig_nextpos                              # real start slot
+
+        # `speculative_forward` returns (N, V, BATCH) where BATCH = 1.
+        # Remove the trailing batch dimension so the tensor becomes (N, V).
+        logits_all = self.model.speculative_forward(
+            input_ids=input_ids,
+            cache_ids=cache_vec,     # (spec_len,) – matches device buffer
+            spec_length=spec_len,
         )
-        # tree_speculative_forward returns (B, N, V); drop batch dim
         if logits_all.dim() == 3:
-            logits_all = logits_all[0]           # → (N, V)
+            logits_all = logits_all.squeeze(-1)   # shape -> (N, V)
 
         logger.info(f"[verify] logits_all shape: {logits_all.shape}")
  
