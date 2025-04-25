@@ -270,7 +270,7 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
         self._sync_kv_pointer(sess)
         pad_id = self.eos_token_id if self.eos_token_id is not None else 0
         n_new = len(draft_tokens) + 1          # γ + 1 rows
-        bonus_placeholder = -1                 # never a real token
+        bonus_placeholder = self.tokenizer.pad_token_id or 0     # falls back to 0, never a real token
         input_ids = torch.tensor([draft_tokens + [bonus_placeholder]],
                                 dtype=sess.current_ids.dtype)
         spec_len  = n_new
