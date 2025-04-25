@@ -218,12 +218,20 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
         # Positions of these K new tokens start at current _next_pos
         cache_vec = torch.arange(len(tok_ids), dtype=torch.int32) + self.model._next_pos
 
-        # Determine fast‑path lengths from compiled speculative graphs.
-        # Fallback to the default list if attribute is missing.
-        spec_buckets = (self.model.decoder_lm_head_for_speculation.keys()
-                        if hasattr(self.model, "decoder_lm_head_for_speculation")
-                        else range(1, 10))
-        spec_ok = len(tok_ids) in {k[0] for k in spec_buckets}
+        # ------------------------------------------------------------------
+        # Figure out which speculation buckets were actually compiled.
+        # self.model is a NeuronHFAdapterWrap → .adapter → HFAdapter →
+        # .model (the underlying LlamaForSampling).
+        # ------------------------------------------------------------------
+        
+        inner = self.model.adapter.model
+        raw_keys = inner.decoder_lm_head_for_speculation.keys()
+        # Accept both (k, batch_size) and k-only keys
+        def _extract_k(k):
+            if isinstance(k, tuple):
+                return k[0]
+            return k
+        spec_ok = len(tok_ids) in {_extract_k(k) for k in raw_keys}
         assert spec_ok, f"speculative_forward not compiled for {len(tok_ids)} tokens"
 
         # ONE speculative_forward advances the cache and avoids the
