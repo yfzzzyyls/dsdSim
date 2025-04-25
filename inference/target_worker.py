@@ -237,9 +237,9 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
         spec_len  = n_new                       # 1, 2, or 4
         cache_vec = torch.arange(spec_len, dtype=torch.int32) + orig_nextpos
 
-        logger.info(f"[verify] input_ids.shape={input_ids.shape}, "
-                    f"cache_vec.shape={cache_vec.shape}, "
-                    f"spec_len={spec_len}")
+        # logger.info(f"[verify] input_ids.shape={input_ids.shape}, "
+        #             f"cache_vec.shape={cache_vec.shape}, "
+        #             f"spec_len={spec_len}")
 
         # k = getattr(self.model.adapter.model, "unroll", 8)      # 8 in your build
         # cache_vec = torch.full((k,), -1, dtype=torch.int32)
@@ -255,7 +255,7 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
         if logits_all.dim() == 3:
             logits_all = logits_all.squeeze(-1)   # shape -> (N, V)
 
-        logger.info(f"[verify] logits_all shape: {logits_all.shape}")
+        # logger.info(f"[verify] logits_all shape: {logits_all.shape}")
  
         # logits_all shape (ctx_estimate, V); keep first N rows for real tokens
         logits_all = logits_all[:n_new]
