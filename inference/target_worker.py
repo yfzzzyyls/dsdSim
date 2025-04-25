@@ -292,6 +292,7 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
     def VerifyDraftTokens(self, request, context):
         sid          = request.session_id
         draft_tokens = list(request.draft_tokens)
+        draft_probs  = list(request.draft_probs) if hasattr(request, "draft_probs") else []
 
         with self.lock:
             if sid not in self.sessions:
