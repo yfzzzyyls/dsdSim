@@ -105,6 +105,8 @@ def speculative_decode(
             # ---- Our improved numeric stability start ----
             # Temperature‑scale logits then apply classic nucleus (top‑p) filter
             logits = logits / current_temp
+            if tokenizer.bos_token_id is not None:
+                logits[int(tokenizer.bos_token_id)] = -1e9
             probs = torch.softmax(logits, dim=-1)
  
             # ---------- nucleus filter (fast top‑k) ----------
@@ -206,9 +208,20 @@ def speculative_decode(
             past_states        = past_states[:len(speculative_tokens) + 1]
         # --- Verify + commit in one RPC ---
         logger.info("Verify chunk len=%d tokens=%s probs=%s", len(speculative_tokens), speculative_tokens, speculative_probs)
-        commit_ids, accepted_count, target_finished = grpc_client.verify_draft_tokens(
-            stub, speculative_tokens, speculative_probs, session_id=session_id
-        )
+        # commit_ids, accepted_count, target_finished = grpc_client.verify_draft_tokens(
+        #     stub, speculative_tokens, speculative_probs, session_id=session_id
+        # )
+
+        try:
+            commit_ids, accepted_count, target_finished = grpc_client.verify_draft_tokens(
+                stub, speculative_tokens, speculative_probs, session_id=session_id
+            )
+        except StopIteration:
+            # Target has closed the stream (finished); end draft loop gracefully
+            logger.info("[session=%s] Target signalled completion; stopping draft loop.", session_id)
+            break
+
+
         accepted_tokens_total += accepted_count
         target_tokens_total   += len(commit_ids) - accepted_count
 
@@ -225,6 +238,9 @@ def speculative_decode(
         # Feed committed tokens back into the draft model (we have already
         # rolled back the KV pointer to the correct slot). 
         for tok in commit_ids:
+            # Drop BOS markers – they are only sequence delimiters
+            if tokenizer.bos_token_id is not None and tok == tokenizer.bos_token_id:
+                continue
             scratch_token[0, 0] = tok
             if profile:
                 _t0 = time.perf_counter()
