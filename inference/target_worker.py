@@ -28,7 +28,6 @@ class TargetSession:
         # pointer to the *next* KV slot
         self.cache_ids = torch.tensor([input_ids.shape[1]], dtype=torch.int32)
         self.pending_logits = None
-        
 
 class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
     def __init__(self, model_path, sequence_length=128, spec_length=None, temperature: float = 1.0, top_p: float = 0.9):
@@ -41,7 +40,6 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
         self._ctx_estimate = sequence_length
         self.sessions = {}  # session_id -> TargetSession
         self.lock = torch.multiprocessing.Lock()
-        self._vocab_size = len(self.tokenizer)
 
     # ------------------------------------------------------------------
     # Utility: right‑pad an (1, L) tensor with zeros to ctx_estimate
@@ -211,7 +209,7 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
         context‑bucket check that requires input length ≥ ctx_estimate.
         """
         logger.info("Commit raw tok_ids=%s", tok_ids)
-        tok_ids = [t for t in tok_ids if t != self.tokenizer.bos_token_id]
+        
         if not tok_ids:
             return
         
@@ -224,12 +222,13 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
         # ---------------------------------------------------------------
         # Strip any placeholder IDs before sanity checks
         # ---------------------------------------------------------------
+        tok_ids = [t for t in tok_ids if t > 0]
 
         # Sanity checks
         assert len(tok_ids) in bucket_lengths, \
             f"Commit length {len(tok_ids)} not compiled; buckets={sorted(bucket_lengths)}"
-        assert all(0 < t < self._vocab_size for t in tok_ids), \
-            f"OOV or placeholder token in commit_ids: {tok_ids} (vocav_size={self._vocab_size})"
+        assert all(0 < t < self.tokenizer.vocab_size for t in tok_ids), \
+            f"OOV or placeholder token in commit_ids: {tok_ids}"
 
         self._sync_kv_pointer(sess)
 
@@ -296,9 +295,7 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
         self._sync_kv_pointer(sess)
         pad_id = self.eos_token_id if self.eos_token_id is not None else 0
         n_new = len(draft_tokens) + 1          # γ + 1 rows
-        bonus_placeholder = self.eos_token_id
-        assert self.eos_token_id is not None, \
-            "Bonus placeholder must be set to a valid token ID"
+        bonus_placeholder = self.tokenizer.pad_token_id or 0     # falls back to 0, never a real token
         input_ids = torch.tensor([draft_tokens + [bonus_placeholder]],
                                 dtype=sess.current_ids.dtype)
         spec_len  = n_new
@@ -311,11 +308,13 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
         )
         if logits_all.dim() == 3:
             logits_all = logits_all.squeeze(-1)   # shape -> (N, V)
-        # The last row (index -1) corresponds to the bonus placeholder.
-        bonus_logits = logits_all[-1]        # row γ  → bonus/fallback
-        draft_logits = logits_all[:-1]       # first γ rows (one per draft token)
+        # logits_all shape (spec_len, V)
+        # bonus_logits = logits_all[-1]        # last row → bonus/fallback
+        logits_all   = logits_all[:-1]       # first γ rows
+        draft_logits = logits_all[:-1]
+        bonus_logits = logits_all[-1]
         with torch.no_grad():
-            row_probs   = torch.softmax(draft_logits.float(), dim=-1)
+            row_probs = torch.softmax(logits_all.float(), dim=-1)
             bonus_probs = torch.softmax(bonus_logits.float(), dim=-1)
         probs = [float(row_probs[i, tok].item()) for i, tok in enumerate(draft_tokens)]
         # ---------- restore snapshot ----------
@@ -378,15 +377,7 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
             logger.info("After commit, _next_pos=%d", int(self.model._next_pos))
 
 
-            # ------------------------------------------------------------------
-            # Filter out BOS (<|begin_of_text|>) and any placeholder / OOV ids
-            # **before** sending them back to the draft client.
-            # ------------------------------------------------------------------
-            safe_ids = [t for t in committed
-                        if 0 < t < self._vocab_size
-                        and t != self.tokenizer.bos_token_id]
-
-            return inference_pb2.VerifyResponse(committed_ids=safe_ids,
+            return inference_pb2.VerifyResponse(committed_ids=committed,
                                                 accepted_count=accepted_cnt,
                                                 finished=sess.finished)
 
