@@ -236,6 +236,9 @@ def speculative_decode(
             if tokenizer.eos_token_id is not None and tok == tokenizer.eos_token_id:
                 finished = True
 
+        logger.debug("ACCEPT cnt=%d  committed=%s",
+             accepted_count,
+             speculative_tokens[:accepted_count])
         # Propagate server‑side finished flag
         finished = finished or target_finished
 

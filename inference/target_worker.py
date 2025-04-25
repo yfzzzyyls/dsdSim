@@ -209,8 +209,16 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
         context‑bucket check that requires input length ≥ ctx_estimate.
         """
         logger.info("Commit raw tok_ids=%s", tok_ids)
+        
+        # ---- sanity checks (add these) ---------------------------------
+        # 1) bucket match
+        assert len(tok_ids) in bucket_lengths, \
+            f"Commit length {len(tok_ids)} not in compiled buckets {sorted(bucket_lengths)}"
 
-        tok_ids = [t for t in tok_ids if t > 0]   # drop placeholder
+        # 2) no placeholder / out-of-vocab IDs
+        assert all(0 < t < self.tokenizer.vocab_size for t in tok_ids), \
+            f"Found placeholder or OOV token in commit_ids: {tok_ids}"
+        # ----------------------------------------------------------------
         if not tok_ids:
             return
         self._sync_kv_pointer(sess)
@@ -355,6 +363,7 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
                 committed.append(bonus_id)
 
             # Bulk commit all tokens at once
+            logger.debug("FINAL commit_ids=%s", committed)
             self._commit_tokens_bulk(sess, committed)
             logger.info("After commit, _next_pos=%d", int(self.model._next_pos))
 
