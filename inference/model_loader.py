@@ -294,6 +294,11 @@ def compile_target_model(model_path: str,
     access the full distribution.  No other behavioural changes are
     introduced.
     """
+    # Compile γ + 1 buckets so verify pass includes the bonus‑token row
+    base_buckets = [1, 2, 4, 8]
+    spec_buckets = [g + 1 for g in base_buckets]      # -> [2, 3, 5, 9]
+    spec_buckets = [1, 2, 3, 5, 9]
+
     if spec_buckets is None:
         raise RuntimeError("spec_buckets must be provided for compile_target_model")
 
@@ -301,7 +306,6 @@ def compile_target_model(model_path: str,
                 f"(sequence_length={sequence_length},")
 
     tp_degree = int(os.environ.get("NEURON_RT_NUM_CORES", "2"))
-    # For now we only special‑case Llama; add other families as needed.
     neuron_cfg = NeuronConfig(is_eagle_target=False,
                           cast_logits_dtype="bfloat16")   # <- enables safe cast
     model = LlamaForSampling.from_pretrained(
@@ -310,7 +314,10 @@ def compile_target_model(model_path: str,
         amp                   = "bf16",
         n_positions           = sequence_length,
         context_length_estimate = sequence_length,
-        spec_length           = spec_buckets,
+        # Provide the *largest* bucket to the base model so positional buffers
+        # are sized correctly; per‑length graphs are added by
+        # enable_speculative_decoder() below.
+        spec_length           = max(spec_buckets),
         neuron_config         = neuron_cfg,
         tp_degree             = tp_degree,
         on_device_generation  = False,        # we need raw logits on host
@@ -321,23 +328,7 @@ def compile_target_model(model_path: str,
         use_cache             = True,
         trust_remote_code     = True,
     )
-    # ------------------------------------------------------------------
-    # WORK‑AROUND: LlamaForSampling._forward returns (logits, hidden)
-    # for Eagle‑target graphs.  The default _cast_logits expects a tensor
-    # and fails with AttributeError: 'tuple' object has no attribute 'to'.
-    # Replace it with a safe version that unwraps the logits.
-    # ------------------------------------------------------------------
-    # def _safe_cast(self, logits):
-    #     # logits is (logits_bsv, hidden) when Eagle target
-    #     if isinstance(logits, (tuple, list)):
-    #         log, hid = logits
-    #         # Neuron already gives bf16; no dtype conversion needed
-    #         return log, hid          # return BOTH tensors
-    #     return logits                # non-Eagle path (single tensor)
-    # model._cast_logits = types.MethodType(_safe_cast, model)
-
-    model.enable_speculative_decoder(spec_buckets) 
-
+    model.enable_speculative_decoder(spec_buckets)
     model.to_neuron()
 
     logger.info("Requested spec-length buckets: %s", spec_buckets)

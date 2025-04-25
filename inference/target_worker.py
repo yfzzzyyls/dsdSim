@@ -201,84 +201,77 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
                 results.append(inference_pb2.FinalizeBatchResult(session_id=sid, finished=sess.finished))
         return inference_pb2.FinalizeBatchResponse(results=results)
 
+    def _commit_tokens_bulk(self, sess, tok_ids):
+        """
+        Commit a list of tokens (accepted draft + bonus) in ONE Neuron
+        speculative_forward call so the KV cache advances in bulk.
+        We use `speculative_forward` (not plain forward) to bypass the
+        context‑bucket check that requires input length ≥ ctx_estimate.
+        """
+        if not tok_ids:
+            return
+        self._sync_kv_pointer(sess)
+
+        # (1, K) tensor of the new tokens
+        in_tensor = torch.tensor([tok_ids], dtype=sess.current_ids.dtype)
+
+        # Positions of these K new tokens start at current _next_pos
+        cache_vec = torch.arange(len(tok_ids), dtype=torch.int32) + self.model._next_pos
+
+        # Determine fast‑path lengths from compiled speculative graphs
+        spec_buckets = [k[0] for k in self.model.decoder_lm_head_for_speculation.keys()]
+        spec_ok = len(tok_ids) in spec_buckets
+
+        # ONE speculative_forward advances the cache and avoids the
+        # `context_length (…) shouldn't be smaller than estimate` error
+        _ = self.model.speculative_forward(
+            input_ids=in_tensor,
+            cache_ids=cache_vec,
+            spec_length=len(tok_ids),
+        )
+
+        # Update session‑side state
+        sess.cache_ids = torch.tensor([self.model._next_pos], dtype=torch.int32)
+        sess.current_ids = torch.cat([sess.current_ids, in_tensor], dim=1)
+        if self.eos_token_id is not None and any(t == self.eos_token_id for t in tok_ids):
+            sess.finished = True
+
     def _verify_single_step(self, sess: TargetSession, draft_tokens):
         """
-        Fast path: score all draft_tokens in ONE forward pass.
-
+        Fast path: score all draft_tokens and bonus in ONE forward pass.
         Returns
         -------
         probs : List[float]   – P_target(d_i | prefix + d_<i)   for each i
+        bonus_probs : tensor  – P_target(vocab) for bonus token
         """
         # ---------- short‑circuit ----------
         if not draft_tokens:
-            return []
+            return [], None
 
-        # ----- snapshot current pointer & logits -----
         orig_cache   = sess.cache_ids.clone()
         orig_nextpos = int(orig_cache.item())
         logits_next  = sess.pending_logits          # may be None
         sess.pending_logits = None                  # consume
-
-        # ----- sync model → session -----
         self._sync_kv_pointer(sess)
-
-        # (1, N) tensor holding the whole draft chunk
-        draft_tensor = torch.tensor(
-            [draft_tokens], dtype=sess.current_ids.dtype
-        )
-
-        # ---------- ONE model.forward ----------
-        # Build (1, N) input_ids for the draft chunk
-        n_new = len(draft_tokens)
-        draft_tensor = torch.tensor([draft_tokens], dtype=sess.current_ids.dtype)
-
-        # ---- NO padding for speculative decoder ----
-        input_ids  = draft_tensor               # shape (1, N)
-
-        # Spec‑decoder buffer length must equal spec_len
-        spec_len  = n_new                       # 1, 2, or 4
+        pad_id = self.eos_token_id if self.eos_token_id is not None else 0
+        n_new   = len(draft_tokens) + 1                      # γ + 1
+        input_ids = torch.tensor([draft_tokens + [pad_id]], dtype=sess.current_ids.dtype)
+        spec_len  = n_new
         cache_vec = torch.arange(spec_len, dtype=torch.int32) + orig_nextpos
-
-        # logger.info(f"[verify] input_ids.shape={input_ids.shape}, "
-        #             f"cache_vec.shape={cache_vec.shape}, "
-        #             f"spec_len={spec_len}")
-
-        # k = getattr(self.model.adapter.model, "unroll", 8)      # 8 in your build
-        # cache_vec = torch.full((k,), -1, dtype=torch.int32)
-        # cache_vec[0] = orig_nextpos                              # real start slot
-
-        # `speculative_forward` returns (N, V, BATCH) where BATCH = 1.
-        # Remove the trailing batch dimension so the tensor becomes (N, V).
         logits_all = self.model.speculative_forward(
             input_ids=input_ids,
-            cache_ids=cache_vec,     # (spec_len,) – matches device buffer
+            cache_ids=cache_vec,
             spec_length=spec_len,
         )
         if logits_all.dim() == 3:
             logits_all = logits_all.squeeze(-1)   # shape -> (N, V)
-
-        # logger.info(f"[verify] logits_all shape: {logits_all.shape}")
- 
-        # logits_all shape (ctx_estimate, V); keep first N rows for real tokens
-        logits_all = logits_all[:n_new]
-
-        # ---------- convert logits → probabilities for each draft token ----------
+        # logits_all shape (spec_len, V)
+        bonus_logits = logits_all[-1]        # last row → bonus/fallback
+        logits_all   = logits_all[:-1]       # first γ rows
         with torch.no_grad():
-            row_probs = torch.softmax(logits_all.float(), dim=-1)   # (N, V)
-        if row_probs.dim() == 1:
-            vocab_len = row_probs.size(0)
-            if vocab_len > max(draft_tokens):        # normal case → full vocab
-                probs = [float(row_probs[tok].item()) for tok in draft_tokens]
-            else:
-                # Fallback: model returned only N values (one per token).
-                # Treat them directly as P_target(draft_i | context).
-                probs = [float(row_probs[i].item()) for i in range(n_new)]
-        else:
-            probs = [float(row_probs[i, tok].item()) for i, tok in enumerate(draft_tokens)]
-
-        # keep logits of the *last* position so next call can reuse them
-        sess.pending_logits = logits_all[-1].clone()
-
+            row_probs = torch.softmax(logits_all.float(), dim=-1)
+            bonus_probs = torch.softmax(bonus_logits.float(), dim=-1)
+        probs = [float(row_probs[i, tok].item()) for i, tok in enumerate(draft_tokens)]
         # ---------- restore snapshot ----------
         self.model.cache_ids = orig_cache.clone()
         if hasattr(self.model, "_next_pos"):
@@ -286,8 +279,7 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
         sess.cache_ids = orig_cache
         assert int(self.model.cache_ids.item()) == int(sess.cache_ids.item()), \
             "KV desync detected on verify exit"
-
-        return probs
+        return probs, bonus_probs
 
     def VerifyDraftTokens(self, request, context):
         sid          = request.session_id
@@ -308,45 +300,34 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
             committed     = []
             accepted_cnt  = 0
 
-            # ---- ONE verification pass for the entire chunk ----
-            probs = self._verify_single_step(sess, draft_tokens)
-
-            # --------------------------------------------------------------
+            # ---- ONE verification pass for the entire chunk + bonus ----
+            probs, bonus_probs = self._verify_single_step(sess, draft_tokens)
             # Probabilistic acceptance:
-            #   • if p_target ≥ q_draft   → accept with prob 1
-            #   • else                    → accept with prob p_target / q_draft
-            # --------------------------------------------------------------
             for i, (tok, p_tgt) in enumerate(zip(draft_tokens, probs)):
                 q_draft = draft_probs[i] if i < len(draft_probs) else 0.0
-
-                if q_draft <= 0.0:  # fallback for missing/zero q
+                if q_draft <= 0.0:
                     accept = (p_tgt >= 1e-3)
                 elif p_tgt >= q_draft:
                     accept = True
                 else:
                     accept = random.random() < (p_tgt / q_draft)
-
                 if accept:
                     accepted_cnt += 1
-                    self._commit_token(sess, tok)
                     committed.append(tok)
                     if self.eos_token_id == tok:
                         break
                 else:
-                    # first rejection → commit a fallback token and stop
-                    fallback = self._generate_one_token(
-                        sess,
-                        temperature=self.temperature,
-                        top_p=self.top_p,
-                    )
-                    committed.append(fallback)
+                    # first rejection → sample bonus token from precomputed bonus_probs
+                    bonus_id = int(torch.multinomial(bonus_probs, 1).item())
+                    committed.append(bonus_id)
                     break
             else:
-                # all accepted → bonus token
-                bonus = self._generate_one_token(sess,
-                                                 temperature=self.temperature,
-                                                 top_p=self.top_p)
-                committed.append(bonus)
+                # all accepted → sample bonus token from bonus_probs
+                bonus_id = int(torch.multinomial(bonus_probs, 1).item())
+                committed.append(bonus_id)
+
+            # Bulk commit all tokens at once
+            self._commit_tokens_bulk(sess, committed)
 
             return inference_pb2.VerifyResponse(committed_ids=committed,
                                                 accepted_count=accepted_cnt,
@@ -449,18 +430,14 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
         return super().GenerateFull(request, context)
 
     def _generate_one_token(self, sess: TargetSession, temperature: float = 1.0, top_p: float = 0.9):
-        """
-        Sample one token from the target model’s distribution (temperature +
-        nucleus/top‑p).  This replaces the old greedy argmax, which caused the
-        same fallback tokens (e.g. “and”, token‑ID 323) to repeat and poison
-        the context.
-
-        Parameters
-        ----------
-        sess        : TargetSession
-        temperature : float  (default = 1.0)
-        top_p       : float  (default = 0.9)
-        """
+        # Fast‑path: if pending_logits is set, sample directly without a forward
+        if sess.pending_logits is not None:
+            probs = torch.softmax(sess.pending_logits.float() / max(1e-5, temperature), dim=-1)
+            token_id = int(torch.multinomial(probs, 1).item())
+            sess.pending_logits = None   # consume
+            # Advance KV in a lightweight call
+            self._commit_tokens_bulk(sess, [token_id])
+            return token_id
         self._sync_kv_pointer(sess)
         input_ids = sess.current_ids  # shape (1, L)
         out_ids = self.model.sample(
