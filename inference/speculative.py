@@ -156,6 +156,18 @@ def speculative_decode(
             break
 
         # 8) Verify tokens with target model
+        # --------------------------------------------------------------
+        # Ensure the speculative chunk length is one of the compiled
+        # buckets {1, 2, 4, 8}.  If we broke early (e.g. hit EOS or
+        # max_new_tokens) we may have a length like 3 or 5, which the
+        # target model cannot verify in a single pass.  Truncate to the
+        # largest supported γ ≤ current length.
+        # --------------------------------------------------------------
+        if len(speculative_tokens) not in valid_gammas:
+            allowed_len = max(g for g in valid_gammas if g < len(speculative_tokens))
+            speculative_tokens = speculative_tokens[:allowed_len]
+            speculative_probs  = speculative_probs[:allowed_len]
+            past_states        = past_states[:allowed_len + 1]  # keep matching ptrs
         # --- Verify + commit in one RPC ---
         commit_ids, accepted_count, target_finished = grpc_client.verify_draft_tokens(
             stub, speculative_tokens, session_id=session_id
