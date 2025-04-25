@@ -208,7 +208,9 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
         We use `speculative_forward` (not plain forward) to bypass the
         context‑bucket check that requires input length ≥ ctx_estimate.
         """
-        tok_ids = [t for t in tok_ids if t > 0]
+        logger.info("Commit raw tok_ids=%s", tok_ids)
+
+        tok_ids = [t for t in tok_ids if t > 0]   # drop placeholder
         if not tok_ids:
             return
         self._sync_kv_pointer(sess)
@@ -267,20 +269,25 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
         sess.pending_logits = None                  # consume
         self._sync_kv_pointer(sess)
         pad_id = self.eos_token_id if self.eos_token_id is not None else 0
-        n_new   = len(draft_tokens) + 1                      # γ + 1
-        input_ids = torch.tensor([draft_tokens + [pad_id]], dtype=sess.current_ids.dtype)
+        n_new = len(draft_tokens) + 1          # γ + 1 rows
+        bonus_placeholder = -1                 # never a real token
+        input_ids = torch.tensor([draft_tokens + [bonus_placeholder]],
+                                dtype=sess.current_ids.dtype)
         spec_len  = n_new
         cache_vec = torch.arange(spec_len, dtype=torch.int32) + orig_nextpos
+        logger.info("TARGET verify call K=%d input_ids=%s", input_ids.shape[1], input_ids.tolist())
         logits_all = self.model.speculative_forward(
             input_ids=input_ids,
             cache_ids=cache_vec,
-            spec_length=spec_len,
+            spec_length=n_new,
         )
         if logits_all.dim() == 3:
             logits_all = logits_all.squeeze(-1)   # shape -> (N, V)
         # logits_all shape (spec_len, V)
-        bonus_logits = logits_all[-1]        # last row → bonus/fallback
+        # bonus_logits = logits_all[-1]        # last row → bonus/fallback
         logits_all   = logits_all[:-1]       # first γ rows
+        draft_logits = logits_all[:-1]
+        bonus_logits = logits_all[-1]
         with torch.no_grad():
             row_probs = torch.softmax(logits_all.float(), dim=-1)
             bonus_probs = torch.softmax(bonus_logits.float(), dim=-1)
@@ -341,6 +348,8 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
 
             # Bulk commit all tokens at once
             self._commit_tokens_bulk(sess, committed)
+            logger.info("After commit, _next_pos=%d", int(self.model._next_pos))
+
 
             return inference_pb2.VerifyResponse(committed_ids=committed,
                                                 accepted_count=accepted_cnt,

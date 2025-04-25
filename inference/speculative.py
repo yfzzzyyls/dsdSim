@@ -193,7 +193,16 @@ def speculative_decode(
             speculative_tokens = speculative_tokens[:allowed_len]
             speculative_probs  = speculative_probs[:allowed_len]
             past_states        = past_states[:allowed_len + 1]  # keep matching ptrs
+        # ------------------------------------------------------------------
+        # Ensure that speculative_probs and past_states are consistent with
+        # speculative_tokens length.  This can become mismatched when we
+        # break early from the inner‑token loop (e.g. EOS or max_new_tokens).
+        # ------------------------------------------------------------------
+        if len(speculative_tokens) != len(speculative_probs):
+            speculative_probs  = speculative_probs[:len(speculative_tokens)]
+            past_states        = past_states[:len(speculative_tokens) + 1]
         # --- Verify + commit in one RPC ---
+        logger.info("Verify chunk len=%d tokens=%s probs=%s", len(speculative_tokens), speculative_tokens, speculative_probs)
         commit_ids, accepted_count, target_finished = grpc_client.verify_draft_tokens(
             stub, speculative_tokens, speculative_probs, session_id=session_id
         )
