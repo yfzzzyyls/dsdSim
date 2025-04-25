@@ -218,8 +218,12 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
         # Positions of these K new tokens start at current _next_pos
         cache_vec = torch.arange(len(tok_ids), dtype=torch.int32) + self.model._next_pos
 
-        # Determine fast‑path lengths from compiled speculative graphs
-        spec_buckets = [k[0] for k in self.model.decoder_lm_head_for_speculation.keys()]
+        # Determine fast‑path lengths from compiled speculative graphs.
+        # Fallback to the default list if attribute is missing.
+        if hasattr(self.model, "decoder_lm_head_for_speculation"):
+            spec_buckets = [k[0] for k in self.model.decoder_lm_head_for_speculation.keys()]
+        else:
+            spec_buckets = (1, 2, 3, 5, 9)
         spec_ok = len(tok_ids) in spec_buckets
 
         # ONE speculative_forward advances the cache and avoids the
