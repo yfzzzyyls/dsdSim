@@ -48,7 +48,7 @@ def run_model(
             token_id = int(output[0, -1])
 
         token_text = tokenizer.decode([token_id], clean_up_tokenization_spaces=True)
-        print(f"Token {i+1}: {repr(token_text)}", flush=True)
+        # print(f"Token {i+1}: {repr(token_text)}", flush=True)
         output_text += token_text
         new_token_tensor = torch.tensor([[token_id]], dtype=input_ids.dtype)
         input_ids = torch.cat([input_ids, new_token_tensor], dim=1)
