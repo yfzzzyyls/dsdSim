@@ -116,6 +116,7 @@ def speculative_decode(
             nucleus_probs = top_vals[:cut + 1]
             nucleus_probs = nucleus_probs / nucleus_probs.sum()
 
+
             # ---------- repetition penalty (1‑ to NGRAM_WINDOW‑gram) ----------
             # if recent_deque:
             #     # Build a flat list of recent output + current draft chunk
