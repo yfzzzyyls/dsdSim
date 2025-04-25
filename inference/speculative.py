@@ -163,7 +163,18 @@ def speculative_decode(
         accepted_tokens_total += accepted_count
         target_tokens_total   += len(commit_ids) - accepted_count
 
-        # Feed committed tokens back into the draft model so KV caches stay aligned
+        # --------------------------------------------------------------
+        # ROLLBACK draft KV pointer to the state *before* the first
+        # rejected token so we don't "leak" unused cache slots.
+        # past_states[0] is the pointer *before* emitting any speculative
+        # token; past_states[k] is after accepting k tokens.
+        # --------------------------------------------------------------
+        rollback_ptr = past_states[accepted_count].clone()
+        draft_model.cache_ids = rollback_ptr
+        draft_model._next_pos = int(rollback_ptr.item())
+
+        # Feed committed tokens back into the draft model (we have already
+        # rolled back the KV pointer to the correct slot). 
         for tok in commit_ids:
             scratch_token[0, 0] = tok
             if profile:
