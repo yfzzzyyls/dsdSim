@@ -193,9 +193,6 @@ def speculative_decode(
             speculative_tokens = speculative_tokens[:allowed_len]
             speculative_probs  = speculative_probs[:allowed_len]
             past_states        = past_states[:allowed_len + 1]  # keep matching ptrs
-            # --- rewind draft-model KV pointer so it matches the truncated chunk ---
-            draft_model.cache_ids = past_states[-1].clone()
-            draft_model._next_pos = int(draft_model.cache_ids.item())
         # ------------------------------------------------------------------
         # Ensure that speculative_probs and past_states are consistent with
         # speculative_tokens length.  This can become mismatched when we
