@@ -35,12 +35,12 @@ def speculative_decode(
     with full rollback of the draft model's past states.
     Extended to handle a session_id so multiple prompts can run concurrently on the server.
     """
-    valid_gammas = (1, 2, 4, 8)   # must match compiled buckets on target
+    valid_gammas = (1, 2, 4)   # must match compiled buckets on target
     # snap initial γ to the largest compiled bucket ≤ user request
     current_gamma = max(g for g in valid_gammas if g <= max(1, gamma))
-    gamma_max     = 8                      # hard ceiling
+    gamma_max     = 4                      # hard ceiling
     current_temp  = temperature            # draft temperature we can tweak
-    target_accept = 0.7                    # desired per‑loop acceptance rate
+    target_accept = 0.5                    # desired per‑loop acceptance rate
 
     logger.debug(
         f"[session={session_id}] Starting speculative_decode: "
@@ -183,7 +183,7 @@ def speculative_decode(
         # 8) Verify tokens with target model
         # --------------------------------------------------------------
         # Ensure the speculative chunk length is one of the compiled
-        # buckets {1, 2, 4, 8}.  If we broke early (e.g. hit EOS or
+        # buckets {1, 2, 4}.  If we broke early (e.g. hit EOS or
         # max_new_tokens) we may have a length like 3 or 5, which the
         # target model cannot verify in a single pass.  Truncate to the
         # largest supported γ ≤ current length.

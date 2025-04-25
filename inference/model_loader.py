@@ -295,8 +295,8 @@ def compile_target_model(model_path: str,
     introduced.
     """
     # Compile γ + 1 buckets so verify pass includes the bonus‑token row
-    max_gamma = 8
-    spec_buckets = list(range(1, max_gamma + 2))   # [1,2,3,4,5,6,7,8,9]
+    max_gamma = 4
+    spec_buckets = list(range(1, max_gamma + 2))   # [1,2,3,4,5]
 
     if spec_buckets is None:
         raise RuntimeError("spec_buckets must be provided for compile_target_model")
@@ -357,4 +357,4 @@ def load_target_model(model_path: str,
     """
     return compile_target_model(model_path,
                                 sequence_length=sequence_length,
-                                spec_buckets=[1, 2, 4, 8])
+                                spec_buckets=[1, 2, 4])
