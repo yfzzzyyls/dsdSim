@@ -6,6 +6,10 @@ import collections
 from grpc_comm import grpc_client
 
 logger = logging.getLogger(__name__)
+
+# Repetition‑penalty strength (0 < α ≤ 1).  Smaller → stronger penalty
+REP_PENALTY = 0.4
+NGRAM_WINDOW = 3    # penalise 1‑ to 3‑gram repeats
 if not logger.hasHandlers():
     h = logging.StreamHandler()
     h.setLevel(logging.INFO)
@@ -112,14 +116,35 @@ def speculative_decode(
             nucleus_probs = top_vals[:cut + 1]
             nucleus_probs = nucleus_probs / nucleus_probs.sum()
 
-            # # ---------- vectorised repetition penalty ----------
-            # recent_combined = list(recent_deque) + speculative_tokens
-            # if recent_combined:
-            #     recent_t = torch.tensor(recent_combined, device=nucleus_idx.device)
-            #     mask = (nucleus_idx.unsqueeze(1) == recent_t).any(dim=1)
-            #     if mask.any():
-            #         nucleus_probs = torch.where(mask, nucleus_probs * 0.4, nucleus_probs)
-            #         nucleus_probs = nucleus_probs / nucleus_probs.sum()
+            # ---------- repetition penalty (1‑ to NGRAM_WINDOW‑gram) ----------
+            if recent_deque:
+                # Build a flat list of recent output + current draft chunk
+                recent_ids = list(recent_deque) + speculative_tokens
+                # Penalise 1‑gram repeats first
+                recent1 = torch.tensor(recent_ids, device=nucleus_idx.device)
+                mask1   = (nucleus_idx.unsqueeze(1) == recent1).any(dim=1)
+
+                # Optional higher‑order n‑gram penalty (up to NGRAM_WINDOW)
+                mask_ngram = mask1.clone()
+                if len(recent_ids) >= 2 and NGRAM_WINDOW >= 2:
+                    for n in range(2, NGRAM_WINDOW + 1):
+                        if len(recent_ids) < n:
+                            break
+                        tail = recent_ids[-(n-1):]                # last n‑1 tokens
+                        # create tensor [tail + candidate] for each nucleus candidate
+                        cand = torch.cat([
+                            torch.tensor(tail, device=nucleus_idx.device).repeat(nucleus_idx.size(0), 1),
+                            nucleus_idx.unsqueeze(1)
+                        ], dim=1)
+                        # search n‑gram occurrences in recent_ids as sliding window
+                        recent_ng = torch.tensor(recent_ids, device=nucleus_idx.device)
+                        windows = recent_ng.unfold(0, n, 1)       # shape (L-n+1, n)
+                        match = (cand.unsqueeze(1) == windows).all(dim=2).any(dim=1)
+                        mask_ngram |= match
+
+                if mask_ngram.any():
+                    nucleus_probs = torch.where(mask_ngram, nucleus_probs * REP_PENALTY, nucleus_probs)
+                    nucleus_probs = nucleus_probs / nucleus_probs.sum()
             
             # sample a token from the renormalised nucleus
             sample_idx = torch.multinomial(nucleus_probs, 1).item()
