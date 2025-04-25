@@ -6,6 +6,7 @@ import time
 from inference import model_loader
 from transformers import AutoTokenizer
 from grpc_comm import inference_pb2, inference_pb2_grpc
+import random      # ← NEW
 
 logger = logging.getLogger(__name__)
 if not logger.hasHandlers():
@@ -115,8 +116,9 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
         results = []
         with self.lock:
             for seq in request.sequences:
-                sid = seq.session_id
-                draft_tokens = list(seq.draft_tokens)
+                sid          = request.session_id
+                draft_tokens = list(request.draft_tokens)
+                draft_probs  = list(request.draft_probs) if hasattr(request, "draft_probs") else []
 
                 # 1) Session validation
                 if sid not in self.sessions:
@@ -308,15 +310,29 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
             # ---- ONE verification pass for the entire chunk ----
             probs = self._verify_single_step(sess, draft_tokens)
 
-            for tok, p_target in zip(draft_tokens, probs):
-                if p_target >= 1e-3:                 # accept
+            # --------------------------------------------------------------
+            # Probabilistic acceptance:
+            #   • if p_target ≥ q_draft   → accept with prob 1
+            #   • else                    → accept with prob p_target / q_draft
+            # --------------------------------------------------------------
+            for i, (tok, p_tgt) in enumerate(zip(draft_tokens, probs)):
+                q_draft = draft_probs[i] if i < len(draft_probs) else 0.0
+
+                if q_draft <= 0.0:  # fallback for missing/zero q
+                    accept = (p_tgt >= 1e-3)
+                elif p_tgt >= q_draft:
+                    accept = True
+                else:
+                    accept = random.random() < (p_tgt / q_draft)
+
+                if accept:
                     accepted_cnt += 1
                     self._commit_token(sess, tok)
                     committed.append(tok)
                     if self.eos_token_id == tok:
                         break
                 else:
-                    # first rejection → immediately generate fallback then stop
+                    # first rejection → commit a fallback token and stop
                     fallback = self._generate_one_token(
                         sess,
                         temperature=self.temperature,

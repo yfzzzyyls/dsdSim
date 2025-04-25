@@ -170,7 +170,7 @@ def speculative_decode(
             past_states        = past_states[:allowed_len + 1]  # keep matching ptrs
         # --- Verify + commit in one RPC ---
         commit_ids, accepted_count, target_finished = grpc_client.verify_draft_tokens(
-            stub, speculative_tokens, session_id=session_id
+            stub, speculative_tokens, speculative_probs, session_id=session_id
         )
         accepted_tokens_total += accepted_count
         target_tokens_total   += len(commit_ids) - accepted_count
