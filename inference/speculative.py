@@ -189,7 +189,7 @@ def speculative_decode(
             speculative_probs.append(token_prob)
             
             prev_token_id = token_id
-            past_states.append(draft_model.cache_ids.clone())   # pointer to next slot
+            past_states.append(draft_model.cache_ids.clone())   # save pointer to next slot
             # Stop if end-of-sequence or max_new_tokens reached
             if tokenizer.eos_token_id is not None and token_id == tokenizer.eos_token_id:
                 finished = True
@@ -197,7 +197,14 @@ def speculative_decode(
             if tokens_generated + len(speculative_tokens) >= max_new_tokens:
                 break
  
-        logger.debug("[session=%s] Proposed tokens: %s", session_id, speculative_tokens)
+        # logger.debug("[session=%s] Proposed tokens: %s", session_id, speculative_tokens)
+        # --- show draft chunk as words instead of IDs -----------------
+        token_texts_dbg = [
+            tokenizer.decode([tid], clean_up_tokenization_spaces=False)
+            for tid in speculative_tokens
+        ]
+        logger.info("[session=%s] Proposed tokens (text)=%s  ids=%s",
+                    session_id, token_texts_dbg, speculative_tokens)
 
         # # If overshoot
         # if len(speculative_tokens) > 0 and tokens_generated > max_new_tokens:
@@ -213,17 +220,16 @@ def speculative_decode(
 
         # 8) Verify tokens with target model
         # --------------------------------------------------------------
-        # Ensure the speculative chunk length is one of the compiled
-        # buckets {1, 2, 4}.  If we broke early (e.g. hit EOS or
-        # max_new_tokens) we may have a length like 3 or 5, which the
-        # target model cannot verify in a single pass.  Truncate to the
-        # largest supported γ ≤ current length.
+        # Fast‑fail if the speculative chunk length is NOT one of the
+        # compiled γ buckets.  We no longer truncate; instead we raise to
+        # surface a configuration / logic error immediately.
         # --------------------------------------------------------------
         if len(speculative_tokens) not in valid_gammas:
-            allowed_len = max(g for g in valid_gammas if g < len(speculative_tokens))
-            speculative_tokens = speculative_tokens[:allowed_len]
-            speculative_probs  = speculative_probs[:allowed_len]
-            past_states        = past_states[:allowed_len + 1]  # keep matching ptrs
+            assert len(speculative_tokens) in valid_gammas, (
+                f"Speculative chunk length {len(speculative_tokens)} is not "
+                f"supported by the compiled target model; valid γ buckets = "
+                f"{valid_gammas}"
+            )
         # ------------------------------------------------------------------
         # Ensure that speculative_probs and past_states are consistent with
         # speculative_tokens length.  This can become mismatched when we
@@ -232,11 +238,13 @@ def speculative_decode(
         if len(speculative_tokens) != len(speculative_probs):
             speculative_probs  = speculative_probs[:len(speculative_tokens)]
             past_states        = past_states[:len(speculative_tokens) + 1]
+        
         # --- Verify + commit in one RPC ---
-        logger.info("Verify chunk len=%d tokens=%s probs=%s", len(speculative_tokens), speculative_tokens, speculative_probs)
+        logger.info("Verify chunk len=%d tokens=%s probs=%s", len(speculative_tokens), token_texts_dbg, speculative_probs)
         commit_ids, accepted_count, target_finished = grpc_client.verify_draft_tokens(
             stub, speculative_tokens, speculative_probs, session_id=session_id
         )
+
         accepted_tokens_total += accepted_count
         target_tokens_total   += len(commit_ids) - accepted_count
 
