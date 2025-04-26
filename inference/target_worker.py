@@ -68,8 +68,7 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
 
     def _sync_kv_pointer(self, sess: TargetSession):
         self.model.cache_ids = sess.cache_ids.clone()
-        if hasattr(self.model, "_next_pos"):
-            self.model._next_pos = int(sess.cache_ids.item())
+        self.model._next_pos = int(sess.cache_ids.item())
         # ---- sanity check ----
         assert int(self.model.cache_ids.item()) == int(sess.cache_ids.item()), \
             "Target KV cache_ids desynchronised after sync"
@@ -267,25 +266,32 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
         orig_cache   = sess.cache_ids.clone()
         orig_nextpos = int(orig_cache.item())
         self._sync_kv_pointer(sess)
-        pad_id = self.eos_token_id if self.eos_token_id is not None else 0
-        n_new = len(draft_tokens) + 1          # γ + 1 rows
-        bonus_placeholder = self.tokenizer.pad_token_id or 0     # falls back to 0, never a real token
+        spec_len = len(draft_tokens) + 1          # γ + 1 rows
+        bonus_placeholder = self.tokenizer.eos_token_id     # falls back to 0, never a real token
         input_ids = torch.tensor([draft_tokens + [bonus_placeholder]],
                                 dtype=sess.current_ids.dtype)
-        spec_len  = n_new
         cache_vec = torch.arange(spec_len, dtype=torch.int32) + orig_nextpos
-        logger.info("TARGET verify call K=%d input_ids=%s", input_ids.shape[1], input_ids.tolist())
+        logger.info("VERIFY cache_vec=%s  (shape=%s)", cache_vec.tolist(), list(cache_vec.shape))
+        assert cache_vec.numel() == spec_len, (
+            f"VERIFY cache_vec length {cache_vec.numel()} must equal spec_len {spec_len}"
+        )
+        # Decode draft tokens for readability; the final placeholder row is shown as "<bonus>"
+        token_texts = [self.tokenizer.decode([tid], clean_up_tokenization_spaces=False)
+                       for tid in draft_tokens] + ["<bonus>"]
+        logger.info("TARGET verify call K(gamma[%d] + 1)=%d tokens(text)=%s ids=%s",
+                    len(draft_tokens), input_ids.shape[1], token_texts, input_ids.tolist())
         logits_all = self.model.speculative_forward(
             input_ids=input_ids,
             cache_ids=cache_vec,
-            spec_length=n_new,
+            # start_ids = torch.tensor([0], dtype=torch.int32), # can pass multiple batches in the future
+            spec_length=spec_len,
         )
-        if logits_all.dim() == 3:
+        # (B, N, V)
+        if logits_all.dim() == 3: 
             logits_all = logits_all.squeeze(-1)   # shape -> (N, V)
         # logits_all shape (spec_len, V)
         # bonus_logits = logits_all[-1]        # last row → bonus/fallback
         logits_all   = logits_all[:-1]       # first γ rows
-        draft_logits = logits_all[:-1]
         bonus_logits = logits_all[-1]
         with torch.no_grad():
             row_probs = torch.softmax(logits_all.float(), dim=-1)
@@ -293,8 +299,7 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
         probs = [float(row_probs[i, tok].item()) for i, tok in enumerate(draft_tokens)]
         # ---------- restore snapshot ----------
         self.model.cache_ids = orig_cache.clone()
-        if hasattr(self.model, "_next_pos"):
-            self.model._next_pos = orig_nextpos
+        self.model._next_pos = orig_nextpos
         sess.cache_ids = orig_cache
         assert int(self.model.cache_ids.item()) == int(sess.cache_ids.item()), \
             "KV desync detected on verify exit"
