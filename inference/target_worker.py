@@ -7,6 +7,8 @@ from inference import model_loader
 from transformers import AutoTokenizer
 from grpc_comm import inference_pb2, inference_pb2_grpc
 import random      # ← NEW
+from transformers.generation import LogitsProcessorList, SuppressTokensLogitsProcessor
+
 
 logger = logging.getLogger(__name__)
 if not logger.hasHandlers():
@@ -184,30 +186,37 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
         context‑bucket check that requires input length ≥ ctx_estimate.
         """
 
-        # Decode IDs to human‑readable tokens for logging
-        token_texts = [self.tokenizer.decode([tid], clean_up_tokenization_spaces=False)
-                       for tid in tok_ids]
-        logger.info("Commit tokens (text)=%s  ids=%s", token_texts, tok_ids)
-
         if not tok_ids:
             return
         
+
+
         # ===============================================================
         # Discover the compiled speculation bucket sizes ONCE per call.
         # ===============================================================
-        inner = self.model.adapter.model
+        model = self.model.adapter.model
         bucket_lengths = {k[0] if isinstance(k, tuple) else int(k)
-                            for k in inner.decoder_lm_head_for_speculation.keys()}
+                            for k in model.decoder_lm_head_for_speculation.keys()}
+        
+        token_texts = [self.tokenizer.decode([tid], clean_up_tokenization_spaces=False)
+                for tid in tok_ids]
+        logger.info("Commit tokens (text)=%s  ids=%s", token_texts, tok_ids)
         # ---------------------------------------------------------------
         # Strip any placeholder IDs before sanity checks (special tokens like EOS, BOS, PAD, etc.)
         # ---------------------------------------------------------------
-        tok_ids = [t for t in tok_ids if 0 < t < self.tokenizer.vocab_size]
+        # tok_ids = [t for t in tok_ids if 0 < t < self.tokenizer.vocab_size]
 
         # Sanity checks
         assert len(tok_ids) in bucket_lengths, \
             f"Commit length {len(tok_ids)} not compiled; buckets={sorted(bucket_lengths)}"
-        assert all(0 < t < self.tokenizer.vocab_size for t in tok_ids), \
+        assert all(0 <= t < self.tokenizer.vocab_size for t in tok_ids), \
             f"OOV or placeholder token in commit_ids: {tok_ids}"
+
+        # ---------------------------------------------------------------
+        # token_texts = [self.tokenizer.decode([tid], clean_up_tokenization_spaces=False)
+        #         for tid in tok_ids]
+        # logger.info("Commit tokens after filter out BOS/EOS (text)=%s  ids=%s", token_texts, tok_ids)
+        # ---------------------------------------------------------------
 
         self._sync_kv_pointer(sess)
 
@@ -223,8 +232,7 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
         # .model (the underlying LlamaForSampling).
         # ------------------------------------------------------------------
 
-        inner = self.model.adapter.model
-        raw_keys = inner.decoder_lm_head_for_speculation.keys()
+        raw_keys = model.decoder_lm_head_for_speculation.keys()
         # Accept both (k, batch_size) and k-only keys
         def _extract_k(k):
             if isinstance(k, tuple):
@@ -252,8 +260,21 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
 
         if self.eos_token_id is not None and any(t == self.eos_token_id for t in tok_ids):
             sess.finished = True
-
-        logger.info("Committed %d tokens; _next_pos -> %d", len(tok_ids), new_next_pos)
+        
+        # --------------------------------------------------------------
+        # 9) Detailed commit log: committed tokens *and* full context words
+        # --------------------------------------------------------------
+        current_words = [
+            self.tokenizer.decode([tid], clean_up_tokenization_spaces=False)
+            for tid in sess.current_ids.squeeze(0).tolist()
+        ]
+        logger.info(
+            "Committed tokens (text)=%s  ids=%s; _next_pos -> %d | current_ids (text)=%s",
+            token_texts,
+            tok_ids,
+            new_next_pos,
+            current_words,
+        )
 
     def verify(self, sess: TargetSession, draft_tokens):
         """
@@ -275,14 +296,13 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
         input_ids = torch.tensor([draft_tokens + [bonus_placeholder]],
                                 dtype=sess.current_ids.dtype)
         cache_vec = torch.arange(spec_len, dtype=torch.int32) + orig_nextpos
-        logger.info("VERIFY cache_vec=%s  (shape=%s)", cache_vec.tolist(), list(cache_vec.shape))
         assert cache_vec.numel() == spec_len, (
             f"VERIFY cache_vec length {cache_vec.numel()} must equal spec_len {spec_len}"
         )
         # Decode draft tokens for readability; the final placeholder row is shown as "<bonus>"
         token_texts = [self.tokenizer.decode([tid], clean_up_tokenization_spaces=False)
                        for tid in draft_tokens] + ["<bonus>"]
-        logger.info("TARGET verify call K(gamma[%d] + 1)=%d tokens(text)=%s ids=%s",
+        logger.info("verify call K(gamma[%d] + 1)=%d tokens(text)=%s ids=%s",
                     len(draft_tokens), input_ids.shape[1], token_texts, input_ids.tolist())
         logits_all = self.model.speculative_forward(
             input_ids=input_ids,
@@ -294,8 +314,29 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
         if logits_all.dim() == 3:
             logits_all = logits_all.squeeze(-1)          # (N, V)
 
-        # Full soft‑max for *all* rows (γ draft rows + 1 bonus row)
-        row_probs   = torch.softmax(logits_all.float(), dim=-1)   # (N, V)
+        # ------------------------------------------------------------------
+        # Library-style masking of BOS / PAD with SuppressTokensLogitsProcessor
+        # ------------------------------------------------------------------
+        special_ids = []
+        for attr in ("bos_token_id", "pad_token_id"):
+            tid = getattr(self.tokenizer, attr, None)
+            if tid is not None:
+                special_ids.append(tid)
+
+        if special_ids:
+            processors = LogitsProcessorList(
+                [SuppressTokensLogitsProcessor(special_ids)]
+            )
+            # dummy_input_ids shape (N,1) – only the seq-len matters
+            dummy_input_ids = torch.zeros(
+                (logits_all.size(0), 1), dtype=torch.long, device=logits_all.device
+            )
+            logits_all = processors(dummy_input_ids, logits_all)
+        # ------------------------------------------------------------------
+        # ------------------------------------------------------------------
+
+        # Soft-max after masking
+        row_probs = torch.softmax(logits_all.float(), dim=-1)
 
         # Split draft rows and bonus row
         draft_probs = row_probs[:-1]      # (γ, V)
@@ -318,7 +359,7 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
         # Decode IDs → words for easier debugging
         draft_texts = [self.tokenizer.decode([tid], clean_up_tokenization_spaces=False)
                     for tid in draft_tokens]
-        logger.info("[session=%s] VERIFY received draft tokens (text)=%s  ids=%s",
+        logger.info("[session=%s] VerifyDraftTokens received draft tokens (text)=%s  ids=%s",
                     sid, draft_texts, draft_tokens)
         draft_probs  = list(request.draft_probs)
         assert draft_probs, (
@@ -328,7 +369,7 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
 
         with self.lock:
             if sid not in self.sessions:
-                logger.warning(f"[VerifyDraftTokens] Session {sid} not found.")
+                logger.error(f"[VerifyDraftTokens] Session {sid} not found.")
                 return inference_pb2.VerifyResponse(committed_ids=[],
                                                     accepted_count=0,
                                                     finished=True)
@@ -373,11 +414,17 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
                 # all accepted → sample bonus token from bonus_probs
                 bonus_id = int(torch.multinomial(bonus_probs, 1).item())
                 committed.append(bonus_id)
-
+                
+            # ---------------------------------------------------------------
             # Bulk commit all tokens at once
-            logger.debug("FINAL commit_ids=%s", committed)
+            commit_texts = [self.tokenizer.decode([tid], clean_up_tokenization_spaces=False)
+                            for tid in committed]
+            logger.info("target generate/verified tokens (text)=%s  ids=%s", commit_texts, committed)
+            # ---------------------------------------------------------------
+            # Commit all accepted tokens in one call
             self._commit_tokens_bulk(sess, committed)
-            logger.info("After commit, _next_pos=%d", int(self.model._next_pos))
+            # ---------------------------------------------------------------
+            logger.info("commmit response to draft: _next_pos=%d", int(self.model._next_pos))
 
             return inference_pb2.VerifyResponse(committed_ids=committed,
                                                 accepted_count=accepted_cnt,
