@@ -99,9 +99,6 @@ def speculative_decode(
         token_texts = [tokenizer.decode([tid], clean_up_tokenization_spaces=False)
                     for tid in speculative_tokens]
 
-        logger.info("[session=%s] Proposed tokens: %s", session_id, token_texts)
-        logger.info("[session=%s] Entering inner loop, tokens_generated=%d", session_id, tokens_generated)
-
         past_states = [draft_model.cache_ids]
         for _ in range(current_gamma):
             scratch_token[0, 0] = prev_token_id
@@ -197,15 +194,6 @@ def speculative_decode(
             if tokens_generated + len(speculative_tokens) >= max_new_tokens:
                 break
  
-        # logger.debug("[session=%s] Proposed tokens: %s", session_id, speculative_tokens)
-        # --- show draft chunk as words instead of IDs -----------------
-        token_texts_dbg = [
-            tokenizer.decode([tid], clean_up_tokenization_spaces=False)
-            for tid in speculative_tokens
-        ]
-        logger.info("[session=%s] Proposed tokens (text)=%s  ids=%s",
-                    session_id, token_texts_dbg, speculative_tokens)
-
         # # If overshoot
         # if len(speculative_tokens) > 0 and tokens_generated > max_new_tokens:
         #     overshoot = tokens_generated - max_new_tokens
@@ -240,7 +228,13 @@ def speculative_decode(
             past_states        = past_states[:len(speculative_tokens) + 1]
         
         # --- Verify + commit in one RPC ---
-        logger.info("Verify chunk len=%d tokens=%s probs=%s", len(speculative_tokens), token_texts_dbg, speculative_probs)
+                # logger.debug("[session=%s] Proposed tokens: %s", session_id, speculative_tokens)
+        # --- show draft chunk as words instead of IDs -----------------
+        token_texts_dbg = [
+            tokenizer.decode([tid], clean_up_tokenization_spaces=False)
+            for tid in speculative_tokens
+        ]
+        logger.info("[session=%s] Verify chunk len=%d tokens (text)=%s ids=%s probs=%s", session_id, len(speculative_tokens), token_texts_dbg, speculative_tokens, speculative_probs)
         commit_ids, accepted_count, target_finished = grpc_client.verify_draft_tokens(
             stub, speculative_tokens, speculative_probs, session_id=session_id
         )

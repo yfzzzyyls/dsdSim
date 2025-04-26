@@ -177,30 +177,6 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
         return inference_pb2.VerifyBatchResponse(results=results)
 
 
-    def FinalizeBatchTokens(self, request, context):
-        results = []
-        with self.lock:
-            for seq in request.sequences:
-                sid = seq.session_id
-                tokens = list(seq.tokens)
-                if sid not in self.sessions:
-                    logger.warning(f"Session {sid} not found in FinalizeBatchTokens.")
-                    results.append(inference_pb2.FinalizeBatchResult(session_id=sid, finished=True))
-                    continue
-                sess = self.sessions[sid]
-                if sess.finished:
-                    results.append(inference_pb2.FinalizeBatchResult(session_id=sid, finished=True))
-                    continue
-
-                # Accept these tokens into sess.current_ids
-                for t in tokens:
-                    new_tok = torch.tensor([[t]], dtype=sess.current_ids.dtype)
-                    sess.current_ids = torch.cat([sess.current_ids, new_tok], dim=1)
-                    if self.eos_token_id is not None and t == self.eos_token_id:
-                        sess.finished = True
-                results.append(inference_pb2.FinalizeBatchResult(session_id=sid, finished=sess.finished))
-        return inference_pb2.FinalizeBatchResponse(results=results)
-
     def _commit_tokens_bulk(self, sess, tok_ids):
         """
         Commit a list of tokens (accepted draft + bonus) in ONE Neuron
@@ -393,124 +369,10 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
         if self.eos_token_id == tok_id:
             sess.finished = True
 
-    def FinalizeTokens(self, request, context):
-        sid              = request.session_id
-        accepted_count   = request.accepted_count
-        draft_chunk_size = request.draft_chunk_size
-
-        with self.lock:
-            # ---------- session checks ----------
-            if sid not in self.sessions:
-                logger.warning(f"Session {sid} not found.")
-                return inference_pb2.FinalizeResponse(final_token=0, finished=True)
-
-            sess = self.sessions[sid]
-            if sess.finished:
-                return inference_pb2.FinalizeResponse(final_token=0, finished=True)
-
-            # ---------- retrieve last draft chunk ----------
-            chunk = sess.last_draft_chunk or []
-            accepted = chunk[:accepted_count]
-
-            # ---------- 1) commit accepted tokens ----------
-            for t in accepted:
-                sess.current_ids = torch.cat(
-                    [sess.current_ids,
-                     torch.tensor([[t]], dtype=sess.current_ids.dtype)],
-                    dim=1)
-                self._sync_kv_pointer(sess)
-                lgts, _ = self.model.forward(
-                    input_ids=torch.tensor([[t]], dtype=sess.current_ids.dtype),
-                    cache_ids=torch.tensor([self.model._next_pos], dtype=torch.int32),
-                )
-                sess.pending_logits = lgts[0] if lgts.dim()==2 else lgts
-                sess.cache_ids = torch.tensor([self.model._next_pos], dtype=torch.int32)
-                if self.eos_token_id is not None and t == self.eos_token_id:
-                    sess.finished = True
-
-            # ---------- 2) always generate ONE token from target ----------
-            # fallback_token = self._generate_one_token(sess)
-            start_t = time.perf_counter()
-            fallback_token = self._generate_one_token(
-                sess,
-                temperature=self.temperature,
-                top_p=self.top_p,
-            )
-            
-
-            # clear chunk for next round
-            sess.last_draft_chunk = None
-
-            # ---------- EOS handling ----------
-            if (
-                fallback_token != 0
-                and self.eos_token_id is not None
-                and fallback_token == self.eos_token_id
-            ):
-                sess.finished = True
-            # Log cumulative verification latency **once** when the session ends
-            if sess.finished:
-                logger.info("[session=%s] total verification latency: %.3f s",
-                            sid, sess.verification_time)
-
-            # ---------- periodic verification‑time log ----------
-            sess.finalize_calls += 1
-            should_log = (
-                sess.finished or
-                sess.finalize_calls % 10 == 0 or
-                (accepted_count == 0 and draft_chunk_size == 0)   # client flush / end
-            )
-            if should_log:
-                logger.info(
-                    "[session=%s] cumulative verification latency: %.3f s  calls=%d",
-                    sid, sess.verification_time, sess.finalize_calls
-                )
-
-            token_text = self.tokenizer.decode([fallback_token]).strip() if fallback_token != 0 else "<none>"
-            logger.debug(f"[Finalize] returning token_id={fallback_token} ‹{token_text}› to draft model")
-            return inference_pb2.FinalizeResponse(
-                final_token=fallback_token,
-                finished=sess.finished,
-            )
 
     def GenerateFull(self, request, context):
         # baseline target-only decoding, optional
         return super().GenerateFull(request, context)
-
-    def _generate_one_token(self, sess: TargetSession, temperature: float = 1.0, top_p: float = 0.9):
-        # Fast‑path: if pending_logits is set, sample directly without a forward
-        if sess.pending_logits is not None:
-            probs = torch.softmax(sess.pending_logits.float() / max(1e-5, temperature), dim=-1)
-            token_id = int(torch.multinomial(probs, 1).item())
-            sess.pending_logits = None   # consume
-            # Advance KV in a lightweight call
-            self._commit_tokens_bulk(sess, [token_id])
-            return token_id
-        self._sync_kv_pointer(sess)
-        input_ids = sess.current_ids  # shape (1, L)
-        out_ids = self.model.sample(
-            input_ids,
-            sequence_length=input_ids.shape[1] + 1,
-            temperature=temperature,
-            top_p=top_p,
-            do_sample=True,
-        )
-
-        token_id = int(out_ids[0, -1].item())
-
-        # Advance KV cache inside the Neuron model to reflect the new token
-        _, _ = self.model.forward(
-            input_ids=torch.tensor([[token_id]], dtype=sess.current_ids.dtype),
-            cache_ids=torch.tensor([self.model._next_pos], dtype=torch.int32)
-        )
-        sess.cache_ids = torch.tensor([self.model._next_pos], dtype=torch.int32)
-
-        # Append token to context
-        sess.current_ids = out_ids
-        if self.eos_token_id is not None and token_id == self.eos_token_id:
-            sess.finished = True
-        sess.tokens_generated += 1
-        return token_id
 
 
 def _extract_logits(outputs):
