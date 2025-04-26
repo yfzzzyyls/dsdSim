@@ -337,15 +337,22 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
             # ---- ONE verification pass for the entire chunk + bonus ----
             probs, bonus_probs = self.verify(sess, draft_tokens)
 
+            # Sanity‑check: we must have one q_draft per draft token
+            assert len(draft_probs) == len(draft_tokens), (
+                f"[session={sid}] Length mismatch: "
+                f"{len(draft_probs)} draft_probs vs {len(draft_tokens)} draft_tokens"
+            )
             # Probabilistic acceptance:
             for i, (tok, p_tgt) in enumerate(zip(draft_tokens, probs)):
-                q_draft = draft_probs[i] if i < len(draft_probs) else 0.0
-                if q_draft <= 0.0:
-                    accept = (p_tgt >= 1e-3)
-                elif p_tgt >= q_draft:
+                q_draft = draft_probs[i]
+                assert q_draft > 0.0, (
+                    f"[session={sid}] q_draft <= 0 for token index {i}: "
+                    f"draft_token={tok} q_draft={q_draft}"
+                )
+                if p_tgt >= q_draft:
                     accept = True
                 else:
-                    accept = random.random() < (p_tgt / q_draft)
+                    accept = ( random.random() < (p_tgt / q_draft) ) 
                 if accept:
                     accepted_cnt += 1
                     committed.append(tok)
