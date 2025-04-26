@@ -183,8 +183,12 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
         We use `speculative_forward` (not plain forward) to bypass the
         context‑bucket check that requires input length ≥ ctx_estimate.
         """
-        logger.info("Commit raw tok_ids=%s", tok_ids)
-        
+
+        # Decode IDs to human‑readable tokens for logging
+        token_texts = [self.tokenizer.decode([tid], clean_up_tokenization_spaces=False)
+                       for tid in tok_ids]
+        logger.info("Commit tokens (text)=%s  ids=%s", token_texts, tok_ids)
+
         if not tok_ids:
             return
         
@@ -195,9 +199,9 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
         bucket_lengths = {k[0] if isinstance(k, tuple) else int(k)
                             for k in inner.decoder_lm_head_for_speculation.keys()}
         # ---------------------------------------------------------------
-        # Strip any placeholder IDs before sanity checks
+        # Strip any placeholder IDs before sanity checks (special tokens like EOS, BOS, PAD, etc.)
         # ---------------------------------------------------------------
-        tok_ids = [t for t in tok_ids if t > 0]
+        tok_ids = [t for t in tok_ids if 0 < t < self.tokenizer.vocab_size]
 
         # Sanity checks
         assert len(tok_ids) in bucket_lengths, \
@@ -218,7 +222,7 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
         # self.model is a NeuronHFAdapterWrap → .adapter → HFAdapter →
         # .model (the underlying LlamaForSampling).
         # ------------------------------------------------------------------
-        
+
         inner = self.model.adapter.model
         raw_keys = inner.decoder_lm_head_for_speculation.keys()
         # Accept both (k, batch_size) and k-only keys
@@ -286,24 +290,27 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
             # start_ids = torch.tensor([0], dtype=torch.int32), # can pass multiple batches in the future
             spec_length=spec_len,
         )
-        # (B, N, V)
-        if logits_all.dim() == 3: 
-            logits_all = logits_all.squeeze(-1)   # shape -> (N, V)
-        # logits_all shape (spec_len, V)
-        # bonus_logits = logits_all[-1]        # last row → bonus/fallback
-        logits_all   = logits_all[:-1]       # first γ rows
-        bonus_logits = logits_all[-1]
-        with torch.no_grad():
-            row_probs = torch.softmax(logits_all.float(), dim=-1)
-            bonus_probs = torch.softmax(bonus_logits.float(), dim=-1)
-        probs = [float(row_probs[i, tok].item()) for i, tok in enumerate(draft_tokens)]
+        # (B, N, V)  → after squeeze  (N, V) where N = γ + 1
+        if logits_all.dim() == 3:
+            logits_all = logits_all.squeeze(-1)          # (N, V)
+
+        # Full soft‑max for *all* rows (γ draft rows + 1 bonus row)
+        row_probs   = torch.softmax(logits_all.float(), dim=-1)   # (N, V)
+
+        # Split draft rows and bonus row
+        draft_probs = row_probs[:-1]      # (γ, V)
+        bonus_probs = row_probs[-1]       # (V,)
+
+        # For the acceptance loop we need a scalar P_target for each draft token
+        probs = [float(draft_probs[i, tok].item())
+                 for i, tok in enumerate(draft_tokens)]
         # ---------- restore snapshot ----------
         self.model.cache_ids = orig_cache.clone()
         self.model._next_pos = orig_nextpos
         sess.cache_ids = orig_cache
         assert int(self.model.cache_ids.item()) == int(sess.cache_ids.item()), \
             "KV desync detected on verify exit"
-        return probs, bonus_probs
+        return probs, bonus_probs, row_probs
 
     def VerifyDraftTokens(self, request, context):
         sid          = request.session_id
@@ -335,7 +342,7 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
             accepted_cnt  = 0
 
             # ---- ONE verification pass for the entire chunk + bonus ----
-            probs, bonus_probs = self.verify(sess, draft_tokens)
+            probs, bonus_probs, row_probs = self.verify(sess, draft_tokens)
 
             # Sanity‑check: we must have one q_draft per draft token
             assert len(draft_probs) == len(draft_tokens), (
@@ -359,8 +366,7 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
                     if self.eos_token_id == tok:
                         break
                 else:
-                    # first rejection → sample bonus token from precomputed bonus_probs
-                    bonus_id = int(torch.multinomial(bonus_probs, 1).item())
+                    bonus_id = int(torch.multinomial(row_probs[i], 1).item())
                     committed.append(bonus_id)
                     break
             else:
@@ -372,7 +378,6 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
             logger.debug("FINAL commit_ids=%s", committed)
             self._commit_tokens_bulk(sess, committed)
             logger.info("After commit, _next_pos=%d", int(self.model._next_pos))
-
 
             return inference_pb2.VerifyResponse(committed_ids=committed,
                                                 accepted_count=accepted_cnt,
