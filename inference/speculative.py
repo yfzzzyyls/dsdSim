@@ -255,12 +255,9 @@ def speculative_decode(
         # Feed committed tokens back into the draft model (we have already
         # rolled back the KV pointer to the correct slot). 
         for tok in commit_ids:
-            scratch_token[0, 0] = tok
-            if profile:
-                _t0 = time.perf_counter()
-            _, _ = draft_model.forward(input_ids=scratch_token)
-            if profile:
-                timing["draft_forward_time"] += time.perf_counter() - _t0
+            # write at the true position
+            cache_id_tensor = torch.tensor([draft_model._next_pos], dtype=torch.int32)
+            _ = draft_model.forward(input_ids=scratch_token, cache_ids=cache_id_tensor)
             draft_model.cache_ids = torch.tensor([draft_model._next_pos], dtype=torch.int32)
             prev_token_id = tok
             output_tokens.append(tok)
