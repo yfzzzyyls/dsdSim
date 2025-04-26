@@ -242,16 +242,25 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
         spec_ok = len(tok_ids) in {_extract_k(k) for k in raw_keys}
         assert spec_ok, f"speculative_forward not compiled for {len(tok_ids)} tokens"
 
-        # Run a standard forward pass so that base._postprocess() refreshes the
-        # Python‑side cache pointer (self.model.cache_ids and self.model._next_pos).
+        # Save the original pointer before forward
+        orig_next_pos = int(self.model._next_pos)
+
+        # Run a standard forward pass. Neuron updates the device‑side pointer,
+        # but because we padded with ‑1 cache_ids the wrapper sees only the
+        # last *real* token and therefore stops one short.  Fix it manually.
         _ = self.model.forward(input_ids=in_tensor, cache_ids=cache_vec)
 
-        # Sanity: pointer must advance by len(tok_ids)
-        assert int(self.model._next_pos) == sess.current_ids.shape[1] + len(tok_ids), \
-            "KV pointer drift after padded forward"
+        # Manually bump wrapper pointer so it matches the device
+        new_next_pos = orig_next_pos + len(tok_ids)
+        self.model._next_pos = new_next_pos
+        self.model.cache_ids = torch.tensor([new_next_pos], dtype=torch.int32)
 
         # Keep the session pointer consistent with the model.
         sess.cache_ids = self.model.cache_ids.clone()
+
+        # Optionally assert pointer is correct
+        assert int(self.model._next_pos) == sess.current_ids.shape[1] + len(tok_ids), \
+            "KV pointer mismatch after manual bump"
 
         # Append committed ids to session's token history
         new_tok_tensor = torch.tensor([tok_ids], dtype=sess.current_ids.dtype)
@@ -410,6 +419,11 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
             )
             # Probabilistic acceptance:
             for i, (tok, p_tgt) in enumerate(zip(draft_tokens, probs)):
+                token_word = self.tokenizer.decode([tok], clean_up_tokenization_spaces=False)
+                logger.info(
+                    "[DEBUG accept] i=%d token='%s' id=%d  p_tgt=%.6f  q_draft=%.6f",
+                    i, token_word, tok, p_tgt, draft_probs[i]
+                )
                 q_draft = draft_probs[i]
                 assert q_draft > 0.0, (
                     f"[session={sid}] q_draft <= 0 for token index {i}: "
