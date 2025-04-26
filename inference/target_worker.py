@@ -158,7 +158,7 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
                     continue
 
                 # 2) Incremental verify using the session’s KV cache
-                target_probs = self._verify_single_step(sess, draft_tokens)
+                target_probs = self.verify(sess, draft_tokens)
 
                 # 3) Remember this chunk so FinalizeTokens can accept/rollback
                 sess.last_draft_chunk = draft_tokens
@@ -252,13 +252,13 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
 
         logger.info("Committed %d tokens; _next_pos -> %d", len(tok_ids), new_next_pos)
 
-    def _verify_single_step(self, sess: TargetSession, draft_tokens):
+    def verify(self, sess: TargetSession, draft_tokens):
         """
         Fast path: score all draft_tokens and bonus in ONE forward pass.
         Returns
         -------
-        probs : List[float]   – P_target(d_i | prefix + d_<i)   for each i
-        bonus_probs : tensor  – P_target(vocab) for bonus token
+        probs : List[float]   - P_target(d_i | prefix + d_<i)   for each i
+        bonus_probs : tensor  - P_target(vocab) for bonus token
         """
         # ---------- short‑circuit ----------
         if not draft_tokens:
@@ -266,8 +266,6 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
 
         orig_cache   = sess.cache_ids.clone()
         orig_nextpos = int(orig_cache.item())
-        logits_next  = sess.pending_logits          # may be None
-        sess.pending_logits = None                  # consume
         self._sync_kv_pointer(sess)
         pad_id = self.eos_token_id if self.eos_token_id is not None else 0
         n_new = len(draft_tokens) + 1          # γ + 1 rows
@@ -305,10 +303,20 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
     def VerifyDraftTokens(self, request, context):
         sid          = request.session_id
         draft_tokens = list(request.draft_tokens)
-        draft_probs  = list(request.draft_probs) if hasattr(request, "draft_probs") else []
+        # Decode IDs → words for easier debugging
+        draft_texts = [self.tokenizer.decode([tid], clean_up_tokenization_spaces=False)
+                    for tid in draft_tokens]
+        logger.info("[session=%s] VERIFY received draft tokens (text)=%s  ids=%s",
+                    sid, draft_texts, draft_tokens)
+        draft_probs  = list(request.draft_probs)
+        assert draft_probs, (
+            f"[session={sid}] VerifyDraftTokens received empty draft_probs for "
+            f"{len(draft_tokens)} draft_tokens"
+        )
 
         with self.lock:
             if sid not in self.sessions:
+                logger.warning(f"[VerifyDraftTokens] Session {sid} not found.")
                 return inference_pb2.VerifyResponse(committed_ids=[],
                                                     accepted_count=0,
                                                     finished=True)
@@ -322,7 +330,8 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
             accepted_cnt  = 0
 
             # ---- ONE verification pass for the entire chunk + bonus ----
-            probs, bonus_probs = self._verify_single_step(sess, draft_tokens)
+            probs, bonus_probs = self.verify(sess, draft_tokens)
+
             # Probabilistic acceptance:
             for i, (tok, p_tgt) in enumerate(zip(draft_tokens, probs)):
                 q_draft = draft_probs[i] if i < len(draft_probs) else 0.0

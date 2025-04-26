@@ -234,7 +234,7 @@ def speculative_decode(
             tokenizer.decode([tid], clean_up_tokenization_spaces=False)
             for tid in speculative_tokens
         ]
-        logger.info("[session=%s] Verify chunk len=%d tokens (text)=%s ids=%s probs=%s", session_id, len(speculative_tokens), token_texts_dbg, speculative_tokens, speculative_probs)
+        logger.info("[session=%s] Verify chunk len=%d proposed tokens (text)=%s ids=%s probs=%s", session_id, len(speculative_tokens), token_texts_dbg, speculative_tokens, speculative_probs)
         commit_ids, accepted_count, target_finished = grpc_client.verify_draft_tokens(
             stub, speculative_tokens, speculative_probs, session_id=session_id
         )
