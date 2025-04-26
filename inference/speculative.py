@@ -92,7 +92,13 @@ def speculative_decode(
         # The draft model proposes up to 'gamma' tokens
         speculative_tokens = []
         speculative_probs = []
-        logger.debug("[session=%s] Entering inner loop, tokens_generated=%d", session_id, tokens_generated)
+        # ---------- just before the debug call, print he actual word generated ----------
+        token_texts = [tokenizer.decode([tid], clean_up_tokenization_spaces=False)
+                    for tid in speculative_tokens]
+
+        logger.info("[session=%s] Proposed tokens: %s", session_id, token_texts)
+        logger.info("[session=%s] Entering inner loop, tokens_generated=%d", session_id, tokens_generated)
+        
         past_states = [draft_model.cache_ids]
         for _ in range(current_gamma):
             scratch_token[0, 0] = prev_token_id

@@ -64,7 +64,7 @@ def save_perf_stats(perf_stats: dict, file_prefix: str):
         logger.error(f"Failed to save performance data: {e}")
 
 
-def run_batched_prompt_file(
+def run_prompt_file(
     draft_model_name: str,
     target_host: str = "localhost",
     port: int = 50051,
@@ -86,7 +86,7 @@ def run_batched_prompt_file(
         logger.error("No valid lines in the prompt file.")
         return
 
-    logger.info(f"Loading draft model '{draft_model_name}' (sequence_length={sequence_length}) for batched decoding...")
+    logger.info(f"Loading draft model '{draft_model_name}' (sequence_length={sequence_length}) for speculative decoding...")
     if isinstance(draft_model_name, str):
         # draft_model_name is a path → load the model
         draft_model = load_model(
@@ -96,6 +96,7 @@ def run_batched_prompt_file(
         )
         model_path_str = draft_model_name
     else:
+        TypeError("draft_model_name must be a string (path).")
         # never happens in Neuron
         # already a model instance
         draft_model = draft_model_name
@@ -122,8 +123,9 @@ def run_batched_prompt_file(
     # For now, let's do one session per prompt, but handle them in a single pass.
 
     # Step 1) StartGeneration for each prompt
-    session_ids = []
-    for prompt in prompts:
+    session_ids = [] # list of session IDs
+    for prompt in prompts: # support multiple prompts
+        logger.info(f"Starting prefilling for prompt: '{prompt}'")
         sid = _gen_session_id()
         session_ids.append(sid)
         stub.StartGeneration(
@@ -147,7 +149,7 @@ def run_batched_prompt_file(
 
     # a loop in Python that calls speculative_decode for each prompt in sequence
     for i, prompt in enumerate(prompts):
-        logger.info(f"[BATCH] Decoding prompt {i}: {prompt}")
+        logger.info(f"Decoding prompt {i}: {prompt}")
         gen_text, perf_stats = speculative_decode(
             draft_model, tokenizer, stub,
             prompt, max_new_tokens, gamma,

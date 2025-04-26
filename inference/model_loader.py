@@ -302,7 +302,7 @@ def compile_target_model(model_path: str,
         raise RuntimeError("spec_buckets must be provided for compile_target_model")
 
     logger.info(f"[Target‑compile] Compiling '{model_path}' → Neuron "
-                f"(sequence_length={sequence_length},")
+                f"(sequence_length={sequence_length})")
 
     tp_degree = int(os.environ.get("NEURON_RT_NUM_CORES", "2"))
     neuron_cfg = NeuronConfig(is_eagle_target=False,
