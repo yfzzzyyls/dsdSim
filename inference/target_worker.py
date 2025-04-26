@@ -292,7 +292,7 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
         orig_nextpos = int(orig_cache.item())
         self._sync_kv_pointer(sess)
         spec_len = len(draft_tokens) + 1          # γ + 1 rows
-        bonus_placeholder = self.tokenizer.eos_token_id     # falls back to 0, never a real token
+        bonus_placeholder = 0    # falls back to 0, never a real token
         input_ids = torch.tensor([draft_tokens + [bonus_placeholder]],
                                 dtype=sess.current_ids.dtype)
         cache_vec = torch.arange(spec_len, dtype=torch.int32) + orig_nextpos
