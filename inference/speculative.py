@@ -3,6 +3,7 @@ import torch
 import logging
 import collections
 
+from transformers_neuronx import sampling
 from grpc_comm import grpc_client
 
 logger = logging.getLogger(__name__)
@@ -10,6 +11,8 @@ logger = logging.getLogger(__name__)
 # Repetition‑penalty strength (0 < α ≤ 1).  Smaller → stronger penalty
 REP_PENALTY = 0.4
 NGRAM_WINDOW = 3    # penalise 1‑ to 3‑gram repeats
+TOP_K = 512
+
 if not logger.hasHandlers():
     h = logging.StreamHandler()
     h.setLevel(logging.INFO)
@@ -98,7 +101,7 @@ def speculative_decode(
 
         logger.info("[session=%s] Proposed tokens: %s", session_id, token_texts)
         logger.info("[session=%s] Entering inner loop, tokens_generated=%d", session_id, tokens_generated)
-        
+
         past_states = [draft_model.cache_ids]
         for _ in range(current_gamma):
             scratch_token[0, 0] = prev_token_id
@@ -108,19 +111,41 @@ def speculative_decode(
             if profile:
                 timing["draft_forward_time"] += time.perf_counter() - _t0
             logits = logits.float()
+
             # ---- Our improved numeric stability start ----
             # Temperature‑scale logits then apply classic nucleus (top‑p) filter
+
+            # apply ngram filter
+            masked = sampling.filter_ngrams(
+                NGRAM_WINDOW,
+                torch.tensor(output_tokens + speculative_tokens).unsqueeze(0),
+                logits.unsqueeze(0),    # (1, V) expected
+                draft_model._next_pos
+            )
+
+            # apply temperature scaling
             logits = logits / current_temp
-            probs = torch.softmax(logits, dim=-1)
+
+            # apply top‑k and top‑p filtering
+            masked, candidate_idx = sampling.top_k_top_p_filtering(
+                logits.unsqueeze(0),             # (1, V) expected
+                top_k=TOP_K,
+                top_p=top_p
+            )
+
+            probs = torch.softmax(masked, dim=-1).squeeze(0)
+            sample_in_topk = torch.multinomial(probs, 1).item()
+            token_id   = int(candidate_idx[0, sample_in_topk])
+            token_prob = float(probs[sample_in_topk])
  
-            # ---------- nucleus filter (fast top‑k) ----------
-            k = min(512, probs.shape[-1])          # limit sort to top‑512
-            top_vals, top_idx = torch.topk(probs, k)         # O(V) → O(k log k)
-            cum_p = torch.cumsum(top_vals, dim=0)
-            cut = torch.searchsorted(cum_p, top_p, right=True).item()
-            nucleus_idx   = top_idx[:cut + 1]
-            nucleus_probs = top_vals[:cut + 1]
-            nucleus_probs = nucleus_probs / nucleus_probs.sum()
+            # # ---------- nucleus filter (fast top‑k) ----------
+            # k = min(512, probs.shape[-1])          # limit sort to top‑512
+            # top_vals, top_idx = torch.topk(probs, k)         # O(V) → O(k log k)
+            # cum_p = torch.cumsum(top_vals, dim=0)
+            # cut = torch.searchsorted(cum_p, top_p, right=True).item()
+            # nucleus_idx   = top_idx[:cut + 1]
+            # nucleus_probs = top_vals[:cut + 1]
+            # nucleus_probs = nucleus_probs / nucleus_probs.sum()
 
             # ---------- repetition penalty (1‑ to NGRAM_WINDOW‑gram) ----------
             # if recent_deque:
@@ -152,11 +177,11 @@ def speculative_decode(
             #         nucleus_probs = torch.where(mask_ngram, nucleus_probs * REP_PENALTY, nucleus_probs)
             #         nucleus_probs = nucleus_probs / nucleus_probs.sum()
             
-            # sample a token from the renormalised nucleus
-            sample_idx = torch.multinomial(nucleus_probs, 1).item()
-            token_id = int(nucleus_idx[sample_idx].item())
+            # # sample a token from the renormalised nucleus
+            # sample_idx = torch.multinomial(nucleus_probs, 1).item()
+            # token_id = int(nucleus_idx[sample_idx].item())
  
-            token_prob = float(nucleus_probs[sample_idx].item())  # probability under q_draft
+            # token_prob = float(nucleus_probs[sample_idx].item())  # probability under q_draft
             # ---- End numeric stability patch ----
 
             # store the token and its probability for later verification
