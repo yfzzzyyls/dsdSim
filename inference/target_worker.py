@@ -314,6 +314,10 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
         if logits_all.dim() == 3:
             logits_all = logits_all.squeeze(-1)          # (N, V)
 
+        # print the shape of the logits
+        logger.info("verify logits_all shape=%s", logits_all.shape)
+        # logits_all = _extract_logits_all(logits_all)
+
         # ------------------------------------------------------------------
         # Library-style masking of BOS / PAD with SuppressTokensLogitsProcessor
         # ------------------------------------------------------------------
@@ -362,6 +366,8 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
         logger.info("[session=%s] VerifyDraftTokens received draft tokens (text)=%s  ids=%s",
                     sid, draft_texts, draft_tokens)
         draft_probs  = list(request.draft_probs)
+        logger.info("[session=%s] draft_probs=%s", sid, draft_probs)
+
         assert draft_probs, (
             f"[session={sid}] VerifyDraftTokens received empty draft_probs for "
             f"{len(draft_tokens)} draft_tokens"
