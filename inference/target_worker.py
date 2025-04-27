@@ -304,32 +304,42 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
         spec_len      = len(spec_tokens)
 
         input_ids = torch.tensor([spec_tokens], dtype=sess.current_ids.dtype)
-        cache_vec = torch.arange(spec_len, dtype=torch.int32) + (orig_nextpos - 1)
+        cache_vec = torch.arange(spec_len, dtype=torch.int32) + orig_nextpos
+
+        # ------------------------------------
+        # ------------------------------------
         assert cache_vec.numel() == spec_len, (
-            f"VERIFY cache_vec length {cache_vec.numel()} must equal spec_len {spec_len}"
+            f"VERIFY cache_vec length {cache_vec.numel()} must equal spec token length {spec_len}"
         )
-        # Decode draft tokens for readability; the final placeholder row is shown as "<bonus>"
+        logger.info(
+            f"VERIFY cache_vec length {cache_vec.numel()} must equal spec token length {spec_len}"
+        )
+        # ------------------------------------
+        # ------------------------------------
         token_texts = [self.tokenizer.decode([tid], clean_up_tokenization_spaces=False)
-               for tid in spec_tokens[:-1]] + ["<bonus>"]
+               for tid in spec_tokens]
         logger.info("verify call K(gamma[%d] + 1)=%d tokens(text)=%s ids=%s",
                     len(draft_tokens), input_ids.shape[1], token_texts, input_ids.tolist())
+        #------------------------------------
+        # ------------------------------------
         
-        logger.info("KV before  spec_forward: %d", self.model._next_pos)
+        # logger.info("KV before  spec_forward: %d", self.model._next_pos)
         logits_all = self.model.speculative_forward(
             input_ids=input_ids,
             cache_ids=cache_vec,
             # start_ids = torch.tensor([0], dtype=torch.int32), # can pass multiple batches in the future
             spec_length=spec_len,
         )
-        logger.info("KV after   spec_forward: %d", self.model._next_pos)
+        # logger.info("KV after   spec_forward: %d", self.model._next_pos)
         # (B, N, V)  → after squeeze  (N, V) where N = γ + 1
         if logits_all.dim() == 3:
             logger.info(f"speculative_forward logits_all shape={logits_all.shape}")
             logits_all = logits_all.squeeze(-1)          # (N, V)
 
+        #-----------------------------------
         # print the shape of the logits
+        #-----------------------------------
         logger.info("verify logits_all shape=%s", logits_all.shape)
-        # logits_all = _extract_logits_all(logits_all)
 
         # ------------------------------------------------------------------
         # Library-style masking of BOS / PAD with SuppressTokensLogitsProcessor
@@ -349,8 +359,8 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
                 (logits_all.size(0), 1), dtype=torch.long, device=logits_all.device
             )
             logits_all = processors(dummy_input_ids, logits_all)
-        # ------------------------------------------------------------------
-        # ------------------------------------------------------------------
+        # ===========================================================
+        # ===========================================================
 
         # ---------- restore snapshot ----------
         self.model.cache_ids = orig_cache.clone()
