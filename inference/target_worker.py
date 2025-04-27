@@ -416,7 +416,7 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
             # all_row_probs = torch.roll(all_row_probs, shifts=1, dims=0)
 
             # Split draft rows and bonus row
-            target_row_probs = all_row_probs[1:]      # γ rows
+            target_row_probs = all_row_probs[:-1]      # γ rows
             bonus_row_probs = all_row_probs[-1]      # last row is bonus
 
             probs = [float(target_row_probs[i, tok].item())
