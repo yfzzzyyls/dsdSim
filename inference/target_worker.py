@@ -454,11 +454,6 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
             )
             # Probabilistic acceptance:
             for i, (tok, p_tgt) in enumerate(zip(draft_tokens, probs)):
-                token_word = self.tokenizer.decode([tok], clean_up_tokenization_spaces=False)
-                logger.info(
-                    "[DEBUG accept] i=%d draft token='%s' id=%d  p_tgt=%.6f  q_draft=%.6f",
-                    i, token_word, tok, p_tgt, draft_probs[i]
-                )
                 q_draft = draft_probs[i]
                 assert q_draft > 0.0, (
                     f"[session={sid}] q_draft <= 0 for token index {i}: "
@@ -474,14 +469,29 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
                     committed.append(tok)
                     if self.eos_token_id == tok:
                         break
+                    token_word = self.tokenizer.decode([tok], clean_up_tokenization_spaces=False)
+                    logger.info(
+                        "[DEBUG token accepted] i=%d draft token='%s' id=%d  p_tgt=%.6f  q_draft=%.6f",
+                        i, token_word, tok, p_tgt, draft_probs[i]
+                    )
                 else:
                     bonus_id = int(torch.multinomial(target_row_probs[i], 1).item())
                     committed.append(bonus_id)
+                    token_word = self.tokenizer.decode([tok], clean_up_tokenization_spaces=False)
+                    logger.info(
+                        "[DEBUG token rejected] i=%d bonus token='%s' id=%d  p_tgt=%.6f  q_draft=%.6f",
+                        i, token_word, tok, p_tgt, draft_probs[i]
+                    )
                     break
             else:
                 # all accepted → sample bonus token from bonus_probs
                 bonus_id = int(torch.multinomial(bonus_row_probs, 1).item())
                 committed.append(bonus_id)
+                token_word = self.tokenizer.decode([bonus_id], clean_up_tokenization_spaces=False)
+                logger.info(
+                    "[DEBUG all token accepted] i=%d bonus token='%s' id=%d  p_tgt=%.6f  q_draft=%.6f",
+                    i, token_word, tok, p_tgt, draft_probs[i]
+                )
                 
             # ---------------------------------------------------------------
             # Bulk commit all tokens at once
