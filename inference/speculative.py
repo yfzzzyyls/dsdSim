@@ -38,7 +38,7 @@ def speculative_decode(
     with full rollback of the draft model's past states.
     Extended to handle a session_id so multiple prompts can run concurrently on the server.
     """
-    valid_gammas = (1, 2, 4)   # must match compiled buckets on target
+    valid_gammas = (1, 2, 3, 4, 5)   # must match compiled buckets on target
     # snap initial γ to the largest compiled bucket ≤ user request
     current_gamma = max(g for g in valid_gammas if g <= max(1, gamma))
     gamma_max     = 4                      # hard ceiling
