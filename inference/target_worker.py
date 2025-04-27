@@ -376,7 +376,7 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
         # Decode IDs → words for easier debugging
         draft_texts = [self.tokenizer.decode([tid], clean_up_tokenization_spaces=False)
                     for tid in draft_tokens]
-        logger.info("[session=%s] VerifyDraftTokens received draft tokens (text)=%s  ids=%s",
+        logger.info("[session=%s] received draft tokens (text)=%s  ids=%s",
                     sid, draft_texts, draft_tokens)
         draft_probs  = list(request.draft_probs)
         logger.info("[session=%s] draft_probs=%s", sid, draft_probs)
@@ -407,21 +407,29 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
             # Soft-max after masking
             all_row_probs = torch.softmax(logits_all.float(), dim=-1)
 
-            # --- multinomial probe: sample one token from each row and log it ---
-            for r in range(all_row_probs.size(0)):
-                row_probs = all_row_probs[r]
-                sampled_id = int(torch.multinomial(row_probs, 1).item())
-                sampled_p  = float(row_probs[sampled_id].item())
-                sampled_tok = self.tokenizer.decode([sampled_id],
-                                                    clean_up_tokenization_spaces=False)
-                logger.info(
-                    "[DEBUG multinomial] row=%d  sampled_token='%s'  id=%d  p_row=%.6f",
-                    r,
-                    sampled_tok,
-                    sampled_id,
-                    sampled_p,
-                )
+            # --- multinomial probe: sample one token from each row, then log once ---
+            sampled_tokens = []
+            sampled_ids    = []
+            sampled_ps     = []
 
+            for r in range(all_row_probs.size(0)):
+                row_probs   = all_row_probs[r]
+                sampled_id  = int(torch.multinomial(row_probs, 1).item())
+                sampled_p   = float(row_probs[sampled_id].item())
+                sampled_tok = self.tokenizer.decode(
+                    [sampled_id], clean_up_tokenization_spaces=False
+                )
+                sampled_tokens.append(sampled_tok)
+                sampled_ids.append(sampled_id)
+                sampled_ps.append(sampled_p)
+
+            logger.info(
+                "[DEBUG multinomial] sampled_tokens=%s  ids=%s  p_rows=%s",
+                sampled_tokens,
+                sampled_ids,
+                ["{:.6f}".format(p) for p in sampled_ps],
+            )
+            
             # # Shift rows: old row-4 → row-0, old 0→1, old 1→2, old 2→3, old 3→4
             # all_row_probs = torch.roll(all_row_probs, shifts=1, dims=0)
 
@@ -475,9 +483,9 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
                         i, token_word, tok, p_tgt, draft_probs[i]
                     )
                 else:
-                    bonus_id = int(torch.multinomial(target_row_probs[i], 1).item())
+                    bonus_id = int(torch.multinomial(all_row_probs[i], 1).item())
                     committed.append(bonus_id)
-                    token_word = self.tokenizer.decode([tok], clean_up_tokenization_spaces=False)
+                    token_word = self.tokenizer.decode([bonus_id], clean_up_tokenization_spaces=False)
                     logger.info(
                         "[DEBUG token rejected] i=%d bonus token='%s' id=%d  p_tgt=%.6f  q_draft=%.6f",
                         i, token_word, tok, p_tgt, draft_probs[i]
