@@ -274,25 +274,25 @@ def speculative_decode(
         finished = finished or target_finished
 
         # ---------- adaptive γ and temperature (P‑controller) ----------
-        if current_gamma > 0:
-            loop_accept_rate = accepted_count / current_gamma
-            error = target_accept - loop_accept_rate
+        # if current_gamma > 0:
+        #     loop_accept_rate = accepted_count / current_gamma
+        #     error = target_accept - loop_accept_rate
 
-            # PID suggestion
-            desired_gamma = int(max(1, min(gamma_max,
-                                           current_gamma + 0.5 * error * current_gamma)))
-            # snap to nearest compiled bucket _not exceeding_ desired_gamma
-            new_gamma = max(g for g in valid_gammas if g <= desired_gamma)
-            if new_gamma != current_gamma:
-                logger.debug("[session=%s] Adjust γ %d → %d (acc_rate=%.2f, desired=%d)",
-                             session_id, current_gamma, new_gamma, loop_accept_rate, desired_gamma)
-            current_gamma = new_gamma
+        #     # PID suggestion
+        #     desired_gamma = int(max(1, min(gamma_max,
+        #                                    current_gamma + 0.5 * error * current_gamma)))
+        #     # snap to nearest compiled bucket _not exceeding_ desired_gamma
+        #     new_gamma = max(g for g in valid_gammas if g <= desired_gamma)
+        #     if new_gamma != current_gamma:
+        #         logger.debug("[session=%s] Adjust γ %d → %d (acc_rate=%.2f, desired=%d)",
+        #                      session_id, current_gamma, new_gamma, loop_accept_rate, desired_gamma)
+        #     current_gamma = new_gamma
 
-            new_temp = max(0.3, min(2.0, current_temp * (1 + 0.2 * error)))
-            if abs(new_temp - current_temp) > 1e-3:
-                logger.debug("[session=%s] Adjust draft temperature %.3f → %.3f",
-                             session_id, current_temp, new_temp)
-            current_temp = new_temp
+        #     new_temp = max(0.3, min(2.0, current_temp * (1 + 0.2 * error)))
+        #     if abs(new_temp - current_temp) > 1e-3:
+        #         logger.debug("[session=%s] Adjust draft temperature %.3f → %.3f",
+        #                      session_id, current_temp, new_temp)
+        #     current_temp = new_temp
 
         if target_finished or tokens_generated >= max_new_tokens:
             finished = True
