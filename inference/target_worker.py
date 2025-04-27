@@ -339,26 +339,26 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
         #-----------------------------------
         # print the shape of the logits
         #-----------------------------------
-        logger.info("verify logits_all shape=%s", logits_all.shape)
+        # logger.info("verify logits_all shape=%s", logits_all.shape)
 
         # ------------------------------------------------------------------
         # Library-style masking of BOS / PAD with SuppressTokensLogitsProcessor
         # ------------------------------------------------------------------
-        special_ids = []
-        for attr in ("bos_token_id", "pad_token_id"):
-            tid = getattr(self.tokenizer, attr, None)
-            if tid is not None:
-                special_ids.append(tid)
+        # special_ids = []
+        # for attr in ("bos_token_id", "pad_token_id"):
+        #     tid = getattr(self.tokenizer, attr, None)
+        #     if tid is not None:
+        #         special_ids.append(tid)
 
-        if special_ids:
-            processors = LogitsProcessorList(
-                [SuppressTokensLogitsProcessor(special_ids)]
-            )
-            # dummy_input_ids shape (N,1) – only the seq-len matters
-            dummy_input_ids = torch.zeros(
-                (logits_all.size(0), 1), dtype=torch.long, device=logits_all.device
-            )
-            logits_all = processors(dummy_input_ids, logits_all)
+        # if special_ids:
+        #     processors = LogitsProcessorList(
+        #         [SuppressTokensLogitsProcessor(special_ids)]
+        #     )
+        #     # dummy_input_ids shape (N,1) – only the seq-len matters
+        #     dummy_input_ids = torch.zeros(
+        #         (logits_all.size(0), 1), dtype=torch.long, device=logits_all.device
+        #     )
+        #     logits_all = processors(dummy_input_ids, logits_all)
         # ===========================================================
         # ===========================================================
 
@@ -403,39 +403,54 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
 
             # ---- ONE verification pass for the entire chunk + bonus ----
             logits_all = self.verify(sess, draft_tokens)
+            # ---- DEBUG: show draft chunk size, words, and token IDs ----
+            draft_size  = len(draft_tokens)
+            draft_words = [
+                self.tokenizer.decode([tid], clean_up_tokenization_spaces=False)
+                for tid in draft_tokens
+            ]
+            logger.info(
+                "[DEBUG draft chunk] size=%d  words=%s  ids=%s",
+                draft_size,
+                draft_words,
+                draft_tokens,
+            )
 
             # Soft-max after masking
             all_row_probs = torch.softmax(logits_all.float(), dim=-1)
-
-            # --- multinomial probe: sample one token from each row, then log once ---
-            sampled_tokens = []
-            sampled_ids    = []
-            sampled_ps     = []
-
-            for r in range(all_row_probs.size(0)):
-                row_probs   = all_row_probs[r]
-                sampled_id  = int(torch.multinomial(row_probs, 1).item())
-                sampled_p   = float(row_probs[sampled_id].item())
-                sampled_tok = self.tokenizer.decode(
-                    [sampled_id], clean_up_tokenization_spaces=False
-                )
-                sampled_tokens.append(sampled_tok)
-                sampled_ids.append(sampled_id)
-                sampled_ps.append(sampled_p)
-
-            logger.info(
-                "[DEBUG multinomial] sampled_tokens=%s  ids=%s  p_rows=%s",
-                sampled_tokens,
-                sampled_ids,
-                ["{:.6f}".format(p) for p in sampled_ps],
-            )
+            logger.info("all_row_probs shape=%s", all_row_probs.shape)
             
-            # # Shift rows: old row-4 → row-0, old 0→1, old 1→2, old 2→3, old 3→4
-            # all_row_probs = torch.roll(all_row_probs, shifts=1, dims=0)
+            # --------------------------------------------------
+            # multinomial probe: sample one token from each row, then log once ---
+            # --------------------------------------------------
+            # sampled_tokens = []
+            # sampled_ids    = []
+            # sampled_ps     = []
+
+            # for r in range(all_row_probs.size(0)):
+            #     row_probs   = all_row_probs[r]
+            #     sampled_id  = int(torch.multinomial(row_probs, 1).item())
+            #     sampled_p   = float(row_probs[sampled_id].item())
+            #     sampled_tok = self.tokenizer.decode(
+            #         [sampled_id], clean_up_tokenization_spaces=False
+            #     )
+            #     sampled_tokens.append(sampled_tok)
+            #     sampled_ids.append(sampled_id)
+            #     sampled_ps.append(sampled_p)
+
+            # logger.info(
+            #     "[DEBUG multinomial] sampled_tokens=%s  ids=%s  p_rows=%s",
+            #     sampled_tokens,
+            #     sampled_ids,
+            #     ["{:.6f}".format(p) for p in sampled_ps],
+            # )
+            # --------------------------------------------------
+            # --------------------------------------------------
+            # --------------------------------------------------
 
             # Split draft rows and bonus row
             target_row_probs = all_row_probs[:-1]      # γ rows
-            bonus_row_probs = all_row_probs[-1]      # last row is bonus
+            # bonus_row_probs = all_row_probs[-1]      # last row is bonus
 
             probs = [float(target_row_probs[i, tok].item())
                     for i, tok in enumerate(draft_tokens)]
@@ -450,8 +465,8 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
                 "probs=%d  bonus_row_probs=%s  target_row_probs=%s",
                 sid,
                 len(probs),
-                tuple(bonus_row_probs.shape) if hasattr(bonus_row_probs, "shape") else "n/a",
-                tuple(target_row_probs.shape) if hasattr(target_row_probs, "shape") else "n/a",
+                tuple(all_row_probs[-1].shape),
+                tuple(target_row_probs.shape),
             )
             # ----------------------------------------------------------------------
 
@@ -485,15 +500,16 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
                 else:
                     bonus_id = int(torch.multinomial(all_row_probs[i], 1).item())
                     committed.append(bonus_id)
+                    draft_token_word = self.tokenizer.decode([tok], clean_up_tokenization_spaces=False)
                     token_word = self.tokenizer.decode([bonus_id], clean_up_tokenization_spaces=False)
                     logger.info(
-                        "[DEBUG token rejected] i=%d bonus token='%s' id=%d  p_tgt=%.6f  q_draft=%.6f",
-                        i, token_word, tok, p_tgt, draft_probs[i]
+                        "[DEBUG token rejected] i=%d draft token='%s' bonus token='%s' id=%d  p_tgt=%.6f  q_draft=%.6f",
+                        i, draft_token_word, token_word, tok, p_tgt,  draft_probs[i]
                     )
                     break
             else:
                 # all accepted → sample bonus token from bonus_probs
-                bonus_id = int(torch.multinomial(bonus_row_probs, 1).item())
+                bonus_id = int(torch.multinomial(all_row_probs[-1], 1).item())
                 committed.append(bonus_id)
                 token_word = self.tokenizer.decode([bonus_id], clean_up_tokenization_spaces=False)
                 logger.info(
