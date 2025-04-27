@@ -323,6 +323,7 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
         logger.info("KV after   spec_forward: %d", self.model._next_pos)
         # (B, N, V)  → after squeeze  (N, V) where N = γ + 1
         if logits_all.dim() == 3:
+            logger.info(f"speculative_forward logits_all shape={logits_all.shape}")
             logits_all = logits_all.squeeze(-1)          # (N, V)
 
         # print the shape of the logits
@@ -350,23 +351,13 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
         # ------------------------------------------------------------------
         # ------------------------------------------------------------------
 
-        # Soft-max after masking
-        row_probs = torch.softmax(logits_all.float(), dim=-1)
-
-        # Split draft rows and bonus row
-        draft_probs = row_probs[:-1]      # (γ, V)
-        bonus_probs = row_probs[-1]       # (V,)
-
-        # For the acceptance loop we need a scalar P_target for each draft token
-        probs = [float(draft_probs[i, tok].item())
-                 for i, tok in enumerate(draft_tokens)]
         # ---------- restore snapshot ----------
         self.model.cache_ids = orig_cache.clone()
         self.model._next_pos = orig_nextpos
         sess.cache_ids = orig_cache
         assert int(self.model.cache_ids.item()) == int(sess.cache_ids.item()), \
             "KV desync detected on verify exit"
-        return probs, bonus_probs, row_probs
+        return logits_all
 
     def VerifyDraftTokens(self, request, context):
         sid          = request.session_id
@@ -400,15 +391,37 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
             accepted_cnt  = 0
 
             # ---- ONE verification pass for the entire chunk + bonus ----
-            probs, bonus_probs, row_probs = self.verify(sess, draft_tokens)
+            logits_all = self.verify(sess, draft_tokens)
+
+            # Soft-max after masking
+            all_row_probs = torch.softmax(logits_all.float(), dim=-1)
+
+            # # Shift rows: old row-4 → row-0, old 0→1, old 1→2, old 2→3, old 3→4
+            # all_row_probs = torch.roll(all_row_probs, shifts=1, dims=0)
+
+            # Split draft rows and bonus row
+            draft_row_probs = all_row_probs[:-1]      # (γ, V)
+            bonus_row_probs = all_row_probs[-1]       # (V,)
+
+            # For the acceptance loop we need a scalar P_target for each draft token
+            probs = []
+            j = 0
+            for draft_token_id in draft_tokens:
+                probs.append(float(draft_row_probs[j, draft_token_id].item()))
+                j += 1
+
+            # for i, tok in enumerate(draft_tokens):
+            #     # P_target(draft_token_i | prefix + draft_<i>)
+            #     probs.append(float(draft_row_probs[i, tok].item()))
+            
             # --- diagnostic shapes ------------------------------------------------
             logger.info(
                 "[session=%s] verify returned shapes: "
-                "probs=%d  bonus_probs=%s  row_probs=%s",
+                "probs=%d  bonus_row_probs=%s  draft_row_probs=%s",
                 sid,
                 len(probs),
-                tuple(bonus_probs.shape) if hasattr(bonus_probs, "shape") else "n/a",
-                tuple(row_probs.shape) if hasattr(row_probs, "shape") else "n/a",
+                tuple(bonus_row_probs.shape) if hasattr(bonus_row_probs, "shape") else "n/a",
+                tuple(draft_row_probs.shape) if hasattr(draft_row_probs, "shape") else "n/a",
             )
             # ----------------------------------------------------------------------
 
@@ -421,7 +434,7 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
             for i, (tok, p_tgt) in enumerate(zip(draft_tokens, probs)):
                 token_word = self.tokenizer.decode([tok], clean_up_tokenization_spaces=False)
                 logger.info(
-                    "[DEBUG accept] i=%d token='%s' id=%d  p_tgt=%.6f  q_draft=%.6f",
+                    "[DEBUG accept] i=%d draft token='%s' id=%d  p_tgt=%.6f  q_draft=%.6f",
                     i, token_word, tok, p_tgt, draft_probs[i]
                 )
                 q_draft = draft_probs[i]
@@ -433,18 +446,19 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
                     accept = True
                 else:
                     accept = ( random.random() < (p_tgt / q_draft) ) 
+
                 if accept == True:
                     accepted_cnt += 1
                     committed.append(tok)
                     if self.eos_token_id == tok:
                         break
                 else:
-                    bonus_id = int(torch.multinomial(row_probs[i], 1).item())
+                    bonus_id = int(torch.multinomial(draft_row_probs[i], 1).item())
                     committed.append(bonus_id)
                     break
             else:
                 # all accepted → sample bonus token from bonus_probs
-                bonus_id = int(torch.multinomial(bonus_probs, 1).item())
+                bonus_id = int(torch.multinomial(bonus_row_probs, 1).item())
                 committed.append(bonus_id)
                 
             # ---------------------------------------------------------------
