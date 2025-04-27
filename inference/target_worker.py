@@ -396,6 +396,21 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
             # Soft-max after masking
             all_row_probs = torch.softmax(logits_all.float(), dim=-1)
 
+            # --- multinomial probe: sample one token from each row and log it ---
+            for r in range(all_row_probs.size(0)):
+                row_probs = all_row_probs[r]
+                sampled_id = int(torch.multinomial(row_probs, 1).item())
+                sampled_p  = float(row_probs[sampled_id].item())
+                sampled_tok = self.tokenizer.decode([sampled_id],
+                                                    clean_up_tokenization_spaces=False)
+                logger.info(
+                    "[DEBUG multinomial] row=%d  sampled_token='%s'  id=%d  p_row=%.6f",
+                    r,
+                    sampled_tok,
+                    sampled_id,
+                    sampled_p,
+                )
+
             # # Shift rows: old row-4 → row-0, old 0→1, old 1→2, old 2→3, old 3→4
             # all_row_probs = torch.roll(all_row_probs, shifts=1, dims=0)
 
