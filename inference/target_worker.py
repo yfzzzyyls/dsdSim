@@ -213,18 +213,7 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
 
         # (1, K) tensor of the new (real) tokens
         in_tensor = torch.tensor([tok_ids], dtype=sess.current_ids.dtype)
-
-        # Right‑pad to ctx_estimate (=128) so context_length ≥ estimate
-        in_tensor = self._pad_ids(in_tensor)
-        pad_len   = in_tensor.shape[1] - len(tok_ids)
-
-        # cache_ids for the real tokens
         cache_vec = torch.arange(len(tok_ids), dtype=torch.int32) + self.model._next_pos
-        if pad_len > 0:
-            # For the padding positions we use ‑1, which Neuron treats as a
-            # "no‑op" slot (ignored by the decoder layers).
-            pad_cache = torch.full((pad_len,), -1, dtype=torch.int32)
-            cache_vec = torch.cat([cache_vec, pad_cache], dim=0)
 
         # ------------------------------------------------------------------
         # Figure out which speculation buckets were actually compiled.
@@ -243,10 +232,12 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
         # Save the original pointer before forward
         orig_next_pos = int(self.model._next_pos)
 
-        # Run a standard forward pass. Neuron updates the device‑side pointer,
-        # but because we padded with ‑1 cache_ids the wrapper sees only the
-        # last *real* token and therefore stops one short.  Fix it manually.
-        _ = self.model.forward(input_ids=in_tensor, cache_ids=cache_vec)
+        # Use speculative_forward to process all tokens and update the KV cache.
+        _ = self.model.speculative_forward(
+            input_ids=in_tensor,
+            cache_ids=cache_vec,
+            spec_length=len(tok_ids),
+        )
 
         # Manually bump wrapper pointer so it matches the device
         new_next_pos = orig_next_pos + len(tok_ids)
