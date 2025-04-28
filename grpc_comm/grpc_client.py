@@ -73,4 +73,9 @@ def verify_draft_tokens(stub, draft_tokens, draft_probs, session_id=0):
         draft_probs  = draft_probs,   # <<<
     )
     resp = stub.VerifyDraftTokens(request)
-    return list(resp.committed_ids), resp.accepted_count, resp.finished
+    return (
+        list(resp.committed_ids),
+        resp.accepted_count,
+        resp.verify_time_ms,
+        resp.finished,
+    )

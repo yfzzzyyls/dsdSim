@@ -2,6 +2,7 @@ import random
 import torch
 import logging
 import collections
+import time
 
 from transformers_neuronx import sampling
 from grpc_comm import grpc_client
@@ -83,13 +84,13 @@ def speculative_decode(
     accepted_tokens_total = 0
     target_tokens_total = 0
 
-    import time
     # detailed timing metrics
     timing = {
         "draft_forward_time":       0.0,   # local draft forwards
         "grpc_server_time":         0.0,   # Verify + Finalize wait
         "target_verification_time": 0.0,   # placeholder
         "rollback_time":            0.0,
+        "network_overhead_time":    0.0,
     }
     start_t = time.time()
 
@@ -191,9 +192,13 @@ def speculative_decode(
             for tid in speculative_tokens
         ]
         logger.debug("[session=%s] draft model proposed: chunk len=%d, proposed tokens (text)=%s, ids=%s, probs=%s", session_id, len(speculative_tokens), token_texts_dbg, speculative_tokens, speculative_probs)
-        commit_ids, accepted_count, target_finished = grpc_client.verify_draft_tokens(
+        t0_rpc = time.perf_counter()
+        commit_ids, accepted_count, verify_time_ms, target_finished = grpc_client.verify_draft_tokens(
             stub, speculative_tokens, speculative_probs, session_id=session_id
         )
+        rpc_roundtrip = time.perf_counter() - t0_rpc
+        timing["grpc_server_time"] += rpc_roundtrip
+        timing["target_verification_time"] += verify_time_ms / 1000.0  # ms → s
 
         # ------------------------------------------------------------------
         # Respect the remaining token budget so we never exceed max_new_tokens.
@@ -282,6 +287,8 @@ def speculative_decode(
     perf_stats = {}
     # Compute total tokens produced by both draft (accepted) and target
     total_output_tokens = accepted_tokens_total + target_tokens_total
+    # After loop: compute network overhead
+    timing["network_overhead_time"] = timing["grpc_server_time"] - timing["target_verification_time"]
     if profile:
         tokens_generated_total = total_output_tokens
         throughput = tokens_generated_total / total_time if total_time>0 else 0.0
@@ -294,11 +301,23 @@ def speculative_decode(
             "grpc_server_time":         timing["grpc_server_time"],
             "target_verification_time": timing["target_verification_time"],
             "rollback_time":            timing["rollback_time"],
+            "network_overhead_time":    timing["network_overhead_time"],
         })
 
     if total_output_tokens > 0:
         match_rate = accepted_tokens_total / total_output_tokens
         perf_stats["token_match_rate"] = match_rate
+
+    # Log latency and match rate at debug level to avoid duplicate console output at INFO
+    logger.debug(
+        f"Latency: {total_time:.2f}s, tokens generated: {total_output_tokens}, throughput: "
+        f"{(total_output_tokens / total_time) if total_time > 0 else 0.0:.2f} t/s"
+    )
+    if total_output_tokens > 0:
+        logger.debug(
+            f"Speculative decoding match rate: {match_rate:.2%} "
+            f"(Draft accepted: {accepted_tokens_total}, Target generated: {target_tokens_total})"
+        )
 
     logger.debug(
         f"[session={session_id}] Finished: generated_text='{generated_text[:120]}...'"

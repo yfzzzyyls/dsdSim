@@ -283,6 +283,7 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
         return logits_all
 
     def VerifyDraftTokens(self, request, context):
+        start_verify_t = time.perf_counter()
         sid          = request.session_id
         draft_tokens = list(request.draft_tokens)
         # Decode IDs → words for easier debugging
@@ -301,13 +302,17 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
         with self.lock:
             if sid not in self.sessions:
                 logger.error(f"[VerifyDraftTokens] Session {sid} not found.")
+                verify_time_ms = (time.perf_counter() - start_verify_t) * 1000.0
                 return inference_pb2.VerifyResponse(committed_ids=[],
                                                     accepted_count=0,
+                                                    verify_time_ms=verify_time_ms,
                                                     finished=True)
             sess = self.sessions[sid]
             if sess.finished or not draft_tokens:
+                verify_time_ms = (time.perf_counter() - start_verify_t) * 1000.0
                 return inference_pb2.VerifyResponse(committed_ids=[],
                                                     accepted_count=0,
+                                                    verify_time_ms=verify_time_ms,
                                                     finished=sess.finished)
 
             committed     = []
@@ -433,8 +438,10 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
             # ---------------------------------------------------------------
             logger.debug("commmit response to draft: _next_pos=%d", int(self.model._next_pos))
 
+            verify_time_ms = (time.perf_counter() - start_verify_t) * 1000.0
             return inference_pb2.VerifyResponse(committed_ids=committed,
                                                 accepted_count=accepted_cnt,
+                                                verify_time_ms=verify_time_ms,
                                                 finished=sess.finished)
 
     # helper used above

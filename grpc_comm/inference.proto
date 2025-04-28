@@ -75,6 +75,8 @@ message VerifyResponse {
   uint32 accepted_count = 2;
   // Generation finished?
   bool finished = 3;
+  // Time spent on the target side verifying this draft chunk (milliseconds)
+  float verify_time_ms = 4;
 }
 
 message FinalizeRequest {
