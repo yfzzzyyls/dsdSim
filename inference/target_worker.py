@@ -578,7 +578,7 @@ def run_server(model_path, port=50051, sequence_length=128,
                spec_length=None, profile=False,
                temperature: float = 1.0, top_p: float = 0.9):
     logging.basicConfig(level=logging.INFO)
-    logger.info(f"Loading target model from {model_path} seq_len={sequence_length}")
+    logger.info(f"Initializing target server with model: {model_path}")
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=16))
     servicer = SpeculativeServiceServicer(
         model_path,

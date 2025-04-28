@@ -116,6 +116,7 @@ def run_prompt_file(
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_source, use_fast=False)
     
     address = f"{target_host}:{port}"
+    logger.info(f"Connecting to target server at {address} (host={target_host}, port={port})...")
     channel = grpc.insecure_channel(address)
     stub = inference_pb2_grpc.SpeculativeServiceStub(channel)
 
@@ -168,174 +169,11 @@ def run_prompt_file(
 
     end_time = time.time()
     total_time = end_time - start_time
-    logger.info(f"Batched decode completed in {total_time:.2f}s.")
+    logger.info(f"Distributed speculative decode completed in {total_time:.2f}s.")
 
-    print("\n=== Final Outputs (BATCH approach) ===")
+    print("\n=== Final Outputs ===")
     for i, text in enumerate(final_texts):
         print(f"[Prompt {i} Output]:\n{text}\n")
-
-
-def run_client(draft_model_name: str,
-               target_host: str = "localhost",
-               port: int = 50051,
-               prompt: str = "",
-               target_tokenizer: str = None,
-               max_new_tokens: int = 50,
-               sequence_length: int = 128,
-               gamma: int = 4,
-               profile: bool = False,
-               no_target: bool = False,
-               top_p: float = 0.9,
-               temperature: float = 1.0):
-    # same as existing
-    logger.info(f"Loading draft model '{draft_model_name}' (sequence_length={sequence_length})...")
-    draft_model = load_model(
-        draft_model_name,
-        sequence_length=sequence_length,
-        spec_length=gamma
-    )
-    tokenizer_source = target_tokenizer or draft_model_name
-    tokenizer = AutoTokenizer.from_pretrained(tokenizer_source, use_fast=False)
-    if not prompt:
-        logger.error("No prompt provided.")
-        return
-    if no_target:
-        return _run_standalone_draft(draft_model, tokenizer, prompt, max_new_tokens, profile)
-    else:
-        address = f"{target_host}:{port}"
-        logger.info(f"Connecting to target server at {address}...")
-        channel = grpc.insecure_channel(address)
-        stub = inference_pb2_grpc.SpeculativeServiceStub(channel)
-        session_id = _gen_session_id()
-        stub.StartGeneration(
-            inference_pb2.StartRequest(
-                session_id=session_id,
-                prompt=prompt,
-                max_new_tokens=max_new_tokens,
-                gamma=gamma
-            )
-        )
-        logger.info(f"Starting speculative decoding (single) for prompt: '{prompt}'")
-        generated_text, perf_stats = speculative_decode(
-            draft_model, tokenizer, stub, prompt, max_new_tokens, gamma,
-            profile=profile, top_p=top_p, temperature=temperature,
-            session_id=session_id
-        )
-        full_output = prompt + generated_text
-        print("\n=== Final Output ===\n" + full_output)
-        if profile and perf_stats:
-            save_perf_stats(perf_stats, file_prefix="performance_speculative")
-        return full_output
-
-
-def _run_standalone_draft(draft_model, tokenizer, prompt, max_new_tokens, profile):
-    # same as existing
-    output_text = ""
-    input_ids = tokenizer(prompt, return_tensors='pt').input_ids
-    tokens_generated = 0
-    start_time = time.time() if profile else None
-    for i in range(max_new_tokens):
-        try:
-            output = draft_model.sample(input_ids, sequence_length=input_ids.shape[1] + 1)
-        except Exception as e:
-            logger.error(f"Draft model generation failed: {e}")
-            break
-        token_id = int(output[0, -1]) if not isinstance(output, (list, tuple)) else int(output[0][-1])
-        token_text = tokenizer.decode([token_id], clean_up_tokenization_spaces=False)
-        output_text += token_text
-        new_token_tensor = torch.tensor([[token_id]], dtype=input_ids.dtype)
-        input_ids = torch.cat([input_ids, new_token_tensor], dim=1)
-        tokens_generated += 1
-        if tokenizer.eos_token_id is not None and token_id == tokenizer.eos_token_id:
-            break
-    end_time = time.time() if profile else None
-    if profile and start_time is not None:
-        total_time = end_time - start_time
-        throughput = tokens_generated / total_time if total_time > 0 else float('inf')
-        logger.info(f"Draft model generation completed in {total_time:.2f} seconds. Throughput={throughput:.2f} t/s")
-    full_output = prompt + output_text
-    print("\n=== Final Output ===\n" + full_output)
-    return full_output
-
-
-def run_concurrent_clients(draft_model_name: str,
-                           target_host: str = "localhost",
-                           port: int = 50051,
-                           prompt_text_file: str = "",
-                           target_tokenizer: str = None,
-                           max_new_tokens: int = 50,
-                           sequence_length: int = 128,
-                           gamma: int = 4,
-                           profile: bool = False,
-                           no_target: bool = False,
-                           top_p: float = 0.9,
-                           temperature: float = 1.0):
-    # same as existing concurrency approach
-    if not os.path.exists(prompt_text_file):
-        logger.error(f"Prompt text file not found: {prompt_text_file}")
-        return
-    with open(prompt_text_file, 'r', encoding='utf-8') as f:
-        prompts = [line.strip() for line in f if line.strip()]
-    if not prompts:
-        logger.error("No valid lines in prompt file.")
-        return
-    logger.info(f"Loading draft model '{draft_model_name}' (sequence_length={sequence_length}) for concurrency...")
-    draft_model = load_model(
-        draft_model_name,
-        sequence_length=sequence_length,
-        spec_length=gamma
-    )
-    tokenizer_source = target_tokenizer or draft_model_name
-    tokenizer = AutoTokenizer.from_pretrained(tokenizer_source, use_fast=False)
-    address = f"{target_host}:{port}"
-    channel = None
-    stub = None
-    if not no_target:
-        logger.info(f"Connecting to target server at {address} for concurrency...")
-        channel = grpc.insecure_channel(address)
-        stub = inference_pb2_grpc.SpeculativeServiceStub(channel)
-    results = [None]*len(prompts)
-    threads = []
-
-    def worker(idx, prompt_text):
-        if no_target:
-            out = _run_standalone_draft(draft_model, tokenizer, prompt_text, max_new_tokens, profile)
-            results[idx] = out
-        else:
-            session_id = _gen_session_id()
-            stub.StartGeneration(
-                inference_pb2.StartRequest(
-                    session_id=session_id,
-                    prompt=prompt_text,
-                    max_new_tokens=max_new_tokens,
-                    gamma=gamma
-                )
-            )
-            logger.info(f"[Thread-{idx}] Starting speculative decoding with session_id={session_id}")
-            gen_text, perf_stats = speculative_decode(
-                draft_model, tokenizer, stub,
-                prompt_text, max_new_tokens, gamma,
-                profile=profile, top_p=top_p, temperature=temperature,
-                session_id=session_id
-            )
-            full_output = prompt_text + gen_text
-            results[idx] = full_output
-            if profile and perf_stats:
-                prefix = f"performance_speculative_prompt{idx}"
-                save_perf_stats(perf_stats, file_prefix=prefix)
-
-    for i, prompt_text in enumerate(prompts):
-        t = threading.Thread(target=worker, args=(i, prompt_text), daemon=True)
-        threads.append(t)
-        t.start()
-
-    for t in threads:
-        t.join()
-
-    print("\n=== Final Batched Outputs ===")
-    for i, text in enumerate(results):
-        print(f"\n[Prompt {i} Output]:\n{text}")
-
 
 def _gen_session_id():
     return int(uuid.uuid4()) & 0xFFFFFFFF
