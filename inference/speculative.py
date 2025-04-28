@@ -280,8 +280,10 @@ def speculative_decode(
     end_t = time.time()
     total_time = end_t - start_t
     perf_stats = {}
+    # Compute total tokens produced by both draft (accepted) and target
+    total_output_tokens = accepted_tokens_total + target_tokens_total
     if profile:
-        tokens_generated_total = accepted_tokens_total + target_tokens_total
+        tokens_generated_total = total_output_tokens
         throughput = tokens_generated_total / total_time if total_time>0 else 0.0
         perf_stats["total_time"] = total_time
         perf_stats["tokens_generated"] = tokens_generated_total
@@ -294,11 +296,8 @@ def speculative_decode(
             "rollback_time":            timing["rollback_time"],
         })
 
-    total_output_tokens = accepted_tokens_total + target_tokens_total
     if total_output_tokens > 0:
         match_rate = accepted_tokens_total / total_output_tokens
-        logger.info(f"Latency: {total_time:.2f} seconds")
-        logger.info(f"Speculative decoding match rate: {match_rate:.2%} (Draft accepted: {accepted_tokens_total}, Target generated: {target_tokens_total})\n")
         perf_stats["token_match_rate"] = match_rate
 
     logger.debug(

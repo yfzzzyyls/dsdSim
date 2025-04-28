@@ -167,13 +167,17 @@ def run_client(
         tgt = perf_stats.get("target_tokens_total", 0)
         gen_tokens = accepted + tgt
 
-        # Fall back to other counters if the above were not populated
-        if gen_tokens == 0:
-            gen_tokens = perf_stats.get("tokens_generated", 0)
-
         # Last‑resort heuristic: count tokens via tokenizer if everything else failed
         if gen_tokens == 0:
             gen_tokens = len(tokenizer.encode(gen_text, add_special_tokens=False))
+
+        # pretty print match-rate right before the per-prompt summary
+        match_rate_prompt = perf_stats.get("token_match_rate")
+        if match_rate_prompt is not None:
+            logger.info(
+                f"Speculative decoding match rate: {match_rate_prompt:.2%} "
+                f"(Draft accepted: {accepted}, Target generated: {tgt})"
+            )
 
         throughput_prompt = gen_tokens / latency_prompt if latency_prompt > 0 else 0.0
 
