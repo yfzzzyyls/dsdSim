@@ -279,7 +279,11 @@ def speculative_decode(
             finished = True
 
     # Build final text
-    generated_text = tokenizer.decode(output_tokens[-tokens_generated:]) if output_tokens else ""
+    generated_text = tokenizer.decode(
+            output_tokens[-tokens_generated:],
+            skip_special_tokens=True,               # ← strip EOS / PAD / BOS
+            clean_up_tokenization_spaces=False,
+        ) if output_tokens else ""
 
     # Performance stats
     end_t = time.time()
