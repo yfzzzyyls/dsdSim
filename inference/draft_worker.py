@@ -115,7 +115,10 @@ def run_client(
             "passing a pre-loaded draft model."
         )
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_source, use_fast=False)
-    
+
+    # start the loop
+    start_time = time.time()
+
     address = f"{target_host}:{port}"
     logger.info(f"Connecting to target server at {address} (host={target_host}, port={port})...")
     channel = grpc.insecure_channel(address)
@@ -144,10 +147,6 @@ def run_client(
     tokens_generated = [0]*len(prompts)
     accepted_counts = [0]*len(prompts)
     target_counts = [0]*len(prompts)
-
-    # do up to max_new_tokens steps in batch
-    import time
-    start_time = time.time()
 
     # a loop in Python that calls speculative_decode for each prompt in sequence
     for i, prompt in enumerate(prompts):
