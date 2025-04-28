@@ -135,52 +135,6 @@ def speculative_decode(
             token_id   = int(candidate_idx[0, sample_in_topk])
             token_prob = float(probs[sample_in_topk])
  
-            # # ---------- nucleus filter (fast top‑k) ----------
-            # k = min(512, probs.shape[-1])          # limit sort to top‑512
-            # top_vals, top_idx = torch.topk(probs, k)         # O(V) → O(k log k)
-            # cum_p = torch.cumsum(top_vals, dim=0)
-            # cut = torch.searchsorted(cum_p, top_p, right=True).item()
-            # nucleus_idx   = top_idx[:cut + 1]
-            # nucleus_probs = top_vals[:cut + 1]
-            # nucleus_probs = nucleus_probs / nucleus_probs.sum()
-
-            # ---------- repetition penalty (1‑ to NGRAM_WINDOW‑gram) ----------
-            # if recent_deque:
-            #     # Build a flat list of recent output + current draft chunk
-            #     recent_ids = list(recent_deque) + speculative_tokens
-            #     # Penalise 1‑gram repeats first
-            #     recent1 = torch.tensor(recent_ids, device=nucleus_idx.device)
-            #     mask1   = (nucleus_idx.unsqueeze(1) == recent1).any(dim=1)
-
-            #     # Optional higher‑order n‑gram penalty (up to NGRAM_WINDOW)
-            #     mask_ngram = mask1.clone()
-            #     if len(recent_ids) >= 2 and NGRAM_WINDOW >= 2:
-            #         for n in range(2, NGRAM_WINDOW + 1):
-            #             if len(recent_ids) < n:
-            #                 break
-            #             tail = recent_ids[-(n-1):]                # last n‑1 tokens
-            #             # create tensor [tail + candidate] for each nucleus candidate
-            #             cand = torch.cat([
-            #                 torch.tensor(tail, device=nucleus_idx.device).repeat(nucleus_idx.size(0), 1),
-            #                 nucleus_idx.unsqueeze(1)
-            #             ], dim=1)
-            #             # search n‑gram occurrences in recent_ids as sliding window
-            #             recent_ng = torch.tensor(recent_ids, device=nucleus_idx.device)
-            #             windows = recent_ng.unfold(0, n, 1)       # shape (L-n+1, n)
-            #             match = (cand.unsqueeze(1) == windows).all(dim=2).any(dim=1)
-            #             mask_ngram |= match
-
-            #     if mask_ngram.any():
-            #         nucleus_probs = torch.where(mask_ngram, nucleus_probs * REP_PENALTY, nucleus_probs)
-            #         nucleus_probs = nucleus_probs / nucleus_probs.sum()
-            
-            # # sample a token from the renormalised nucleus
-            # sample_idx = torch.multinomial(nucleus_probs, 1).item()
-            # token_id = int(nucleus_idx[sample_idx].item())
- 
-            # token_prob = float(nucleus_probs[sample_idx].item())  # probability under q_draft
-            # ---- End numeric stability patch ----
-
             # store the token and its probability for later verification
             speculative_tokens.append(token_id)
             speculative_probs.append(token_prob)
@@ -234,7 +188,7 @@ def speculative_decode(
             tokenizer.decode([tid], clean_up_tokenization_spaces=False)
             for tid in speculative_tokens
         ]
-        logger.info("[session=%s] Verify chunk len=%d proposed tokens (text)=%s ids=%s probs=%s", session_id, len(speculative_tokens), token_texts_dbg, speculative_tokens, speculative_probs)
+        logger.debug("[session=%s] draft model proposed: chunk len=%d, proposed tokens (text)=%s, ids=%s, probs=%s", session_id, len(speculative_tokens), token_texts_dbg, speculative_tokens, speculative_probs)
         commit_ids, accepted_count, target_finished = grpc_client.verify_draft_tokens(
             stub, speculative_tokens, speculative_probs, session_id=session_id
         )
@@ -322,7 +276,7 @@ def speculative_decode(
     if total_output_tokens > 0:
         match_rate = accepted_tokens_total / total_output_tokens
         logger.info(f"Latency: {total_time:.2f} seconds")
-        logger.info(f"Speculative decoding match rate: {match_rate:.2%} (Draft accepted: {accepted_tokens_total}, Target generated: {target_tokens_total})")
+        logger.info(f"Speculative decoding match rate: {match_rate:.2%} (Draft accepted: {accepted_tokens_total}, Target generated: {target_tokens_total})\n")
         perf_stats["token_match_rate"] = match_rate
 
     logger.debug(
