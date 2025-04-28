@@ -192,13 +192,19 @@ def speculative_decode(
             for tid in speculative_tokens
         ]
         logger.debug("[session=%s] draft model proposed: chunk len=%d, proposed tokens (text)=%s, ids=%s, probs=%s", session_id, len(speculative_tokens), token_texts_dbg, speculative_tokens, speculative_probs)
+        # ----- measure RPC round‑trip and split into network vs. verify compute -----
         t0_rpc = time.perf_counter()
         commit_ids, accepted_count, verify_time_ms, target_finished = grpc_client.verify_draft_tokens(
             stub, speculative_tokens, speculative_probs, session_id=session_id
         )
         rpc_roundtrip = time.perf_counter() - t0_rpc
-        timing["grpc_server_time"] += rpc_roundtrip
-        timing["target_verification_time"] += verify_time_ms / 1000.0  # ms → s
+
+        verify_sec   = verify_time_ms / 1000.0
+        # Network + (de)serialisation + client/server scheduling
+        network_sec  = max(0.0, rpc_roundtrip - verify_sec)
+
+        timing["grpc_server_time"]         += network_sec        # *just* the wire time
+        timing["target_verification_time"] += verify_sec
 
         # ------------------------------------------------------------------
         # Respect the remaining token budget so we never exceed max_new_tokens.
@@ -291,8 +297,8 @@ def speculative_decode(
     perf_stats = {}
     # Compute total tokens produced by both draft (accepted) and target
     total_output_tokens = accepted_tokens_total + target_tokens_total
-    # After loop: compute network overhead
-    timing["network_overhead_time"] = timing["grpc_server_time"] - timing["target_verification_time"]
+    # After loop: network overhead has already been isolated above
+    timing["network_overhead_time"] = timing["grpc_server_time"]
     if profile:
         tokens_generated_total = total_output_tokens
         throughput = tokens_generated_total / total_time if total_time>0 else 0.0
