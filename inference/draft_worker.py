@@ -37,7 +37,7 @@ def save_perf_stats(perf_stats: dict, file_prefix: str):
         header = ["total_time", "tokens_generated", "tokens_per_second",
                   "avg_token_time", "token_match_rate",
                   "draft_forward_time", "grpc_server_time",
-                  "target_verification_time", "rollback_time",
+                  "target_verification_time",
                   "network_overhead_time"]
 
         write_header = not os.path.exists(csv_path)
@@ -53,8 +53,7 @@ def save_perf_stats(perf_stats: dict, file_prefix: str):
                 fmt(perf_stats.get("draft_forward_time", 0.0)),
                 fmt(perf_stats.get("grpc_server_time", 0.0)),
                 fmt(perf_stats.get("target_verification_time", 0.0)),
-                fmt(perf_stats.get("rollback_time", 0.0)),
-                fmt(perf_stats.get("network_overhead_time", 0.0)),
+                fmt(perf_stats.get("network_overhead_time", 0.0))
             ]
             cf.write(",".join(str(x) for x in row) + "\n")
 
