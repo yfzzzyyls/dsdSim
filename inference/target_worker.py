@@ -47,26 +47,24 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
     # Utility: right‑pad an (1, L) tensor with zeros to ctx_estimate
     # ------------------------------------------------------------------
     def _pad_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
-        """
-        Neuron‑compiled forward graphs expect the input length to be
-        >= the compile‑time estimate (self._ctx_estimate, defaults to the
-        --sequence_length used at compile time).  If the supplied tensor
-        is shorter we right‑pad with zeros so its shape is (1, ctx_estimate).
- 
-        Parameters
-        ----------
-        input_ids : torch.Tensor   shape (1, L), dtype = same as model input
- 
-        Returns
-        -------
-        torch.Tensor  shape (1, max(L, ctx_estimate))
-        """
         seq_len = input_ids.shape[1]
-        if seq_len >= self._ctx_estimate:            # already long enough
-            return input_ids
+        if seq_len >= self._ctx_estimate:
+            return input_ids                   # long enough
         pad_len = self._ctx_estimate - seq_len
-        pad = torch.zeros((1, pad_len), dtype=input_ids.dtype, device=input_ids.device)
-        return torch.cat([input_ids, pad], dim=1)
+
+        # ① choose a *legal* pad-id
+        pad_id = self.tokenizer.pad_token_id
+        if pad_id is None:                    # just in case
+            pad_id = self.tokenizer.eos_token_id
+
+        # ② fill token pad with pad_id  (keep -1 only for cache_ids)
+        pad_tokens = torch.full(
+            (1, pad_len),
+            pad_id,
+            dtype=input_ids.dtype,
+            device=input_ids.device,
+        )
+        return torch.cat([input_ids, pad_tokens], dim=1)
 
     def _sync_kv_pointer(self, sess: TargetSession):
         self.model.cache_ids = sess.cache_ids.clone()
@@ -304,7 +302,7 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
         spec_len      = len(spec_tokens)
 
         input_ids = torch.tensor([spec_tokens], dtype=sess.current_ids.dtype)
-        cache_vec = torch.arange(spec_len, dtype=torch.int32) + orig_nextpos
+        cache_vec = torch.arange(spec_len, dtype=torch.int32) + orig_nextpos - 1
 
         # ------------------------------------
         # ------------------------------------
@@ -366,6 +364,7 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
         self.model.cache_ids = orig_cache.clone()
         self.model._next_pos = orig_nextpos
         sess.cache_ids = orig_cache
+        # self.model.adapter.model.reset_cache(orig_cache)   # hypothetical helper
         assert int(self.model.cache_ids.item()) == int(sess.cache_ids.item()), \
             "KV desync detected on verify exit"
         return logits_all
