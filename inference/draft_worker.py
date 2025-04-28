@@ -64,7 +64,7 @@ def save_perf_stats(perf_stats: dict, file_prefix: str):
         logger.error(f"Failed to save performance data: {e}")
 
 
-def run_prompt_file(
+def run_client(
     draft_model_name: str,
     target_host: str = "localhost",
     port: int = 50051,
@@ -151,12 +151,38 @@ def run_prompt_file(
     # a loop in Python that calls speculative_decode for each prompt in sequence
     for i, prompt in enumerate(prompts):
         logger.info(f"Decoding prompt {i}: {prompt}")
+        start_time_prompt = time.time()
         gen_text, perf_stats = speculative_decode(
             draft_model, tokenizer, stub,
             prompt, max_new_tokens, gamma,
             profile=profile, top_p=top_p, temperature=temperature,
             session_id=session_ids[i]
         )
+
+        # Calculate per‑prompt metrics
+        latency_prompt = time.time() - start_time_prompt
+
+        # Prefer explicit counts from speculative_decode
+        accepted = perf_stats.get("accepted_tokens_total", 0)
+        tgt = perf_stats.get("target_tokens_total", 0)
+        gen_tokens = accepted + tgt
+
+        # Fall back to other counters if the above were not populated
+        if gen_tokens == 0:
+            gen_tokens = perf_stats.get("tokens_generated", 0)
+
+        # Last‑resort heuristic: count tokens via tokenizer if everything else failed
+        if gen_tokens == 0:
+            gen_tokens = len(tokenizer.encode(gen_text, add_special_tokens=False))
+
+        throughput_prompt = gen_tokens / latency_prompt if latency_prompt > 0 else 0.0
+
+        logger.info(
+            f"Prompt[{i}] speculative decoding completed in {latency_prompt:.2f}s, "
+            f"tokens generated: {gen_tokens}, throughput: {throughput_prompt:.2f} t/s"
+        )
+        tokens_generated[i] = gen_tokens
+
         final_texts[i] = prompt + gen_text
         if perf_stats:
             accepted_counts[i] = perf_stats.get("accepted_tokens_total", 0)

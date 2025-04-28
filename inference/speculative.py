@@ -195,6 +195,22 @@ def speculative_decode(
             stub, speculative_tokens, speculative_probs, session_id=session_id
         )
 
+        # ------------------------------------------------------------------
+        # Respect the remaining token budget so we never exceed max_new_tokens.
+        # If the target returned more tokens than we can still emit, truncate
+        # the commit list *before* we touch any state‑tracking counters.
+        # ------------------------------------------------------------------
+        remaining_budget = max_new_tokens - tokens_generated
+        if remaining_budget <= 0:
+            finished = True
+            commit_ids = []
+        elif len(commit_ids) > remaining_budget:
+            commit_ids = commit_ids[:remaining_budget]
+            # clamp accepted_count as well
+            if accepted_count > len(commit_ids):
+                accepted_count = len(commit_ids)
+
+        # Now that commit_ids is final, update global counters
         accepted_tokens_total += accepted_count
         target_tokens_total   += len(commit_ids) - accepted_count
 
@@ -220,6 +236,9 @@ def speculative_decode(
             output_tokens.append(tok)
             recent_deque.append(tok)
             tokens_generated += 1
+            if tokens_generated >= max_new_tokens:
+                finished = True
+                break
             if tokenizer.eos_token_id is not None and tok == tokenizer.eos_token_id:
                 finished = True
 
