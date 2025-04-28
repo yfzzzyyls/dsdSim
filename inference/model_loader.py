@@ -15,7 +15,7 @@ import types
 # Fused Speculative Decoding is supported.
 # fsd = FusedSpeculativeDecoder(draft_model, target_model, spec_length)
 # fsd.to_neuron()  # Compile the fused speculative model
-
+SPEC_LENGTH_BUCKETS = [1, 2, 3, 4, 5]
 logger = logging.getLogger(__name__)
 
 class NeuronHFAdapterWrap(torch.nn.Module):
@@ -295,13 +295,9 @@ def compile_target_model(model_path: str,
     introduced.
     """
     # Compile γ + 1 buckets so verify pass includes the bonus‑token row
-    max_gamma = 4
-    spec_buckets = list(range(1, max_gamma + 2))   # [1,2,3,4,5]
+    spec_buckets = SPEC_LENGTH_BUCKETS
 
-    if spec_buckets is None:
-        raise RuntimeError("spec_buckets must be provided for compile_target_model")
-
-    logger.info(f"[Target‑compile] Compiling '{model_path}' → Neuron "
+    logger.info(f"[Target-compile] Compiling '{model_path}' -> Neuron "
                 f"(sequence_length={sequence_length})")
 
     tp_degree = int(os.environ.get("NEURON_RT_NUM_CORES", "2"))
@@ -356,5 +352,4 @@ def load_target_model(model_path: str,
     Convenience wrapper the *target* side should call instead of `load_model`.
     """
     return compile_target_model(model_path,
-                                sequence_length=sequence_length,
-                                spec_buckets=[1, 2, 4])
+                                sequence_length=sequence_length)

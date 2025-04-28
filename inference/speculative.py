@@ -5,6 +5,7 @@ import collections
 
 from transformers_neuronx import sampling
 from grpc_comm import grpc_client
+from inference.model_loader import SPEC_LENGTH_BUCKETS
 
 logger = logging.getLogger(__name__)
 
@@ -38,10 +39,11 @@ def speculative_decode(
     with full rollback of the draft model's past states.
     Extended to handle a session_id so multiple prompts can run concurrently on the server.
     """
-    valid_gammas = (1, 2, 3, 4, 5)   # must match compiled buckets on target
     # snap initial γ to the largest compiled bucket ≤ user request
+    # Derive valid gammas and gamma_max from the bucket list
+    valid_gammas = tuple(b - 1 for b in SPEC_LENGTH_BUCKETS if b > 1)
+    gamma_max    = max(valid_gammas)
     current_gamma = max(g for g in valid_gammas if g <= max(1, gamma))
-    gamma_max     = 4                      # hard ceiling
     current_temp  = temperature            # draft temperature we can tweak
     target_accept = 0.5                    # desired per‑loop acceptance rate
 
@@ -248,6 +250,7 @@ def speculative_decode(
         #                      session_id, current_temp, new_temp)
         #     current_temp = new_temp
 
+        # =======================================================================
         if target_finished or tokens_generated >= max_new_tokens:
             finished = True
 
