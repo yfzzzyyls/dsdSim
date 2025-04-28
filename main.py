@@ -21,7 +21,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 def main():
-    parser = argparse.ArgumentParser(description="Choral-Spec main launcher")
+    parser = argparse.ArgumentParser(description="choral-spec main launcher")
     parser.add_argument("--role", choices=["target", "draft", "verify_target", "verify_draft"], required=True,
                         help=("Role to run: 'target' for target server, 'draft' for draft client, "
                               "'verify_target' to run the target model standalone, "
@@ -54,7 +54,19 @@ def main():
                         help="Top-p for draft sampling (default 0.9)")
     parser.add_argument("--temperature", type=float, default=1.0,
                         help="Temperature for draft sampling (default 1.0)")
+    parser.add_argument("--debug", action="store_true",
+                        help="Enable verbose DEBUG logging (prints logger.debug lines)")
     args = parser.parse_args()
+
+    # -----------------------------------------------------------------
+    # Bump verbosity if --debug was requested.  This promotes *all*
+    # loggers (root + module children) from INFO → DEBUG at runtime.
+    # -----------------------------------------------------------------
+    if args.debug:
+        logging.getLogger().setLevel(logging.DEBUG)   # root logger
+        # Ensure the module‑level logger defined above follows suit
+        logger.setLevel(logging.DEBUG)
+        logger.debug("Global DEBUG logging enabled via --debug flag")
 
 
     if args.role == "target":
