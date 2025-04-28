@@ -111,7 +111,7 @@ def run_prompt_file(
     else:
         raise ValueError(
             "Cannot determine tokenizer_source: provide --target_tokenizer when "
-            "passing a pre‑loaded draft model."
+            "passing a pre-loaded draft model."
         )
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_source, use_fast=False)
     
