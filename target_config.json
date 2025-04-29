@@ -1,0 +1,12 @@
+
+
+{
+  "role": "target",
+  "model": "/home/ubuntu/models/llama-3.1-8b/",
+  "port": 50051,
+  "sequence_length": 160,
+  "profile": false,
+  "top_p": 0.9,
+  "temperature": 1.0,
+  "debug": false
+}
