@@ -34,11 +34,11 @@ def save_perf_stats(perf_stats: dict, file_prefix: str):
                 return f"0.0%({t:.3f})"
         
         # Append CSV row; write header if file does not exist
-        header = ["total_time", "tokens_generated", "tokens_per_second",
-                  "avg_token_time", "token_match_rate",
-                  "draft_forward_time", "grpc_server_time",
-                  "target_verification_time",
-                  "network_overhead_time"]
+        header = ["total_time","tokens_generated","tokens_per_second",
+                "avg_token_time","token_match_rate",
+                "target_prefill_time","draft_prefill_time",
+                "draft_generation_time","draft_kv_update_time",
+                "grpc_roundtrip_time","target_verification_time"]
 
         write_header = not os.path.exists(csv_path)
         with open(csv_path, "a", newline='') as cf:
@@ -46,14 +46,16 @@ def save_perf_stats(perf_stats: dict, file_prefix: str):
                 cf.write(",".join(header) + "\n")
             row = [
                 f"{total_time_val:.3f}",
-                perf_stats.get("tokens_generated", ""),
-                perf_stats.get("throughput", ""),
-                perf_stats.get("avg_token_time", ""),
-                perf_stats.get("token_match_rate", ""),
-                fmt(perf_stats.get("draft_forward_time", 0.0)),
-                fmt(perf_stats.get("grpc_server_time", 0.0)),
-                fmt(perf_stats.get("target_verification_time", 0.0)),
-                fmt(perf_stats.get("network_overhead_time", 0.0))
+                perf_stats.get("tokens_generated",""),
+                perf_stats.get("throughput",""),
+                perf_stats.get("avg_token_time",""),
+                perf_stats.get("token_match_rate",""),
+                perf_stats.get("target_prefill_time",""),
+                perf_stats.get("draft_prefill_time",""),
+                perf_stats.get("draft_generation_time",""),
+                perf_stats.get("draft_kv_update_time",""),
+                perf_stats.get("grpc_roundtrip_time",""),
+                perf_stats.get("target_verification_time",""),
             ]
             cf.write(",".join(str(x) for x in row) + "\n")
 
@@ -129,10 +131,12 @@ def run_client(
 
     # Step 1) StartGeneration for each prompt
     session_ids = [] # list of session IDs
+    session_prefill = {} # session_id -> time taken for prefill
     for prompt in prompts: # support multiple prompts
         logger.info(f"Starting prefilling for prompt: '{prompt}'")
         sid = _gen_session_id()
         session_ids.append(sid)
+        time_targetprefill = time.perf_counter()
         stub.StartGeneration(
             inference_pb2.StartRequest(
                 session_id=sid,
@@ -141,6 +145,8 @@ def run_client(
                 gamma=gamma
             )
         )
+        target_prefill_ms = (time.perf_counter() - time_targetprefill)
+        session_prefill[sid] = target_prefill_ms
 
     final_texts = [prompts[i] for i in range(len(prompts))]
     finished_mask = [False]*len(prompts)
@@ -158,10 +164,10 @@ def run_client(
             profile=profile, top_p=top_p, temperature=temperature,
             session_id=session_ids[i]
         )
-
         # Calculate per‑prompt metrics
         latency_prompt = time.time() - start_time_prompt
-
+        perf_stats["target_prefill_time"] = session_prefill[session_ids[i]]
+        perf_stats["total_time"] = latency_prompt
         # Prefer explicit counts from speculative_decode
         accepted = perf_stats.get("accepted_tokens_total", 0)
         tgt = perf_stats.get("target_tokens_total", 0)

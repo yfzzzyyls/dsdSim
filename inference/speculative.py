@@ -64,7 +64,9 @@ def speculative_decode(
     # Feed the prompt so Neuron caches 0…L‑1, then set pointer to NEXT index (=L)
     if prompt_ids.shape[-1] > 0:
        # build the KV cache for the prompt
+       time_draftprefill = time.perf_counter()
        _ = draft_model.forward(input_ids=prompt_ids)          # fills 0…L‑1
+       timing["draft_prefill_time"] += time.perf_counter() - time_draftprefill
        prompt_len = prompt_ids.shape[-1]
        # Overwrite cache pointer with a single‑index tensor [L]
        draft_model.cache_ids = torch.tensor([prompt_len], dtype=torch.int32)
@@ -86,14 +88,13 @@ def speculative_decode(
 
     # detailed timing metrics
     timing = {
-        "draft_forward_time":       0.0,   # local draft forwards
-        "grpc_server_time":         0.0,   # Verify + Finalize wait
-        "target_verification_time": 0.0,   # placeholder
-        "rollback_time":            0.0,
-        "network_overhead_time":    0.0,
+        "draft_prefill_time":       0.0,
+        "draft_generation_time":    0.0,
+        "draft_kv_update_time":     0.0,
+        "grpc_roundtrip_time":      0.0,   # verify RPC call including compute
+        "target_verification_time": 0.0,   # server-side compute only
     }
-    start_t = time.time()
-
+    
     while not finished and tokens_generated < max_new_tokens:
         # The draft model proposes up to 'gamma' tokens
         speculative_tokens = []
@@ -105,11 +106,9 @@ def speculative_decode(
         past_states = [draft_model.cache_ids]
         for _ in range(current_gamma):
             scratch_token[0, 0] = prev_token_id
-            if profile:
-                _t0 = time.perf_counter()
+            time_draftgen = time.perf_counter()
             logits, _ = draft_model.forward(input_ids=scratch_token)
-            if profile:
-                timing["draft_forward_time"] += time.perf_counter() - _t0
+            timing["draft_generation_time"] += time.perf_counter() - time_draftgen
             logits = logits.float()
 
             # ---- Our improved numeric stability start ----
@@ -193,17 +192,17 @@ def speculative_decode(
         ]
         logger.debug("[session=%s] draft model proposed: chunk len=%d, proposed tokens (text)=%s, ids=%s, probs=%s", session_id, len(speculative_tokens), token_texts_dbg, speculative_tokens, speculative_probs)
         # ----- measure RPC round‑trip and split into network vs. verify compute -----
-        t0_rpc = time.perf_counter()
+        time_roundtrip = time.perf_counter()
         commit_ids, accepted_count, verify_time_ms, target_finished = grpc_client.verify_draft_tokens(
             stub, speculative_tokens, speculative_probs, session_id=session_id
         )
-        rpc_roundtrip = time.perf_counter() - t0_rpc
+        rpc_roundtrip = time.perf_counter() - time_roundtrip
 
         verify_sec   = verify_time_ms / 1000.0
         # Network + (de)serialisation + client/server scheduling
         network_sec  = max(0.0, rpc_roundtrip - verify_sec)
 
-        timing["grpc_server_time"]         += network_sec        # *just* the wire time
+        timing["grpc_roundtrip_time"]      += network_sec
         timing["target_verification_time"] += verify_sec
 
         # ------------------------------------------------------------------
@@ -241,7 +240,9 @@ def speculative_decode(
             # write at the true position
             scratch_token[0, 0] = tok             # ← add this
             cache_id_tensor = torch.tensor([draft_model._next_pos], dtype=torch.int32)
+            time_draftkvupdate = time.perf_counter()
             _ = draft_model.forward(input_ids=scratch_token, cache_ids=cache_id_tensor)
+            timing["draft_kv_update_time"] += time.perf_counter() - time_draftkvupdate
             draft_model.cache_ids = torch.tensor([draft_model._next_pos], dtype=torch.int32)
             prev_token_id = tok
             output_tokens.append(tok)
@@ -292,13 +293,9 @@ def speculative_decode(
         ) if output_tokens else ""
 
     # Performance stats
-    end_t = time.time()
-    total_time = end_t - start_t
     perf_stats = {}
     # Compute total tokens produced by both draft (accepted) and target
     total_output_tokens = accepted_tokens_total + target_tokens_total
-    # After loop: network overhead has already been isolated above
-    timing["network_overhead_time"] = timing["grpc_server_time"]
     if profile:
         tokens_generated_total = total_output_tokens
         throughput = tokens_generated_total / total_time if total_time>0 else 0.0
