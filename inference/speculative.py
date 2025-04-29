@@ -52,6 +52,7 @@ def speculative_decode(
         f"[session={session_id}] Starting speculative_decode: "
         f"prompt='{prompt[:60]}...' max_new_tokens={max_new_tokens} gamma={gamma}"
     )
+
     # Initial setup: process prompt through draft model to initialize cache
     output_tokens = []
     draft_model.cache_ids = None
@@ -60,6 +61,17 @@ def speculative_decode(
     # pre-filling: Feed the entire prompt once so the draft model builds its KV cache
     prompt_ids = tokenizer(prompt, return_tensors='pt').input_ids
     prev_token_id = int(prompt_ids[0, -1].item()) if prompt_ids.shape[-1] > 0 else tokenizer.bos_token_id
+
+    # --------------------------------------------------------------
+    # Per‑stage timing buckets (all values in seconds)
+    # --------------------------------------------------------------
+    timing = {
+        "draft_prefill_time":       0.0,
+        "draft_generation_time":    0.0,
+        "draft_kv_update_time":     0.0,
+        "grpc_roundtrip_time":      0.0,   # pure network + (de)serialisation latency
+        "target_verification_time": 0.0,   # server‑side compute only
+    }
     
     # Feed the prompt so Neuron caches 0…L‑1, then set pointer to NEXT index (=L)
     if prompt_ids.shape[-1] > 0:
@@ -86,14 +98,6 @@ def speculative_decode(
     accepted_tokens_total = 0
     target_tokens_total = 0
 
-    # detailed timing metrics
-    timing = {
-        "draft_prefill_time":       0.0,
-        "draft_generation_time":    0.0,
-        "draft_kv_update_time":     0.0,
-        "grpc_roundtrip_time":      0.0,   # verify RPC call including compute
-        "target_verification_time": 0.0,   # server-side compute only
-    }
     
     while not finished and tokens_generated < max_new_tokens:
         # The draft model proposes up to 'gamma' tokens
@@ -298,28 +302,19 @@ def speculative_decode(
     total_output_tokens = accepted_tokens_total + target_tokens_total
     if profile:
         tokens_generated_total = total_output_tokens
-        throughput = tokens_generated_total / total_time if total_time>0 else 0.0
-        perf_stats["total_time"] = total_time
         perf_stats["tokens_generated"] = tokens_generated_total
-        perf_stats["throughput"] = throughput
-        perf_stats["avg_token_time"] = total_time / tokens_generated_total if tokens_generated_total>0 else 0.0
         perf_stats.update({
-            "draft_forward_time":       timing["draft_forward_time"],
-            "grpc_server_time":         timing["grpc_server_time"],
+            "draft_prefill_time":       timing["draft_prefill_time"],
+            "draft_generation_time":    timing["draft_generation_time"],
+            "draft_kv_update_time":     timing["draft_kv_update_time"],
+            "grpc_roundtrip_time":      timing["grpc_roundtrip_time"],
             "target_verification_time": timing["target_verification_time"],
-            "rollback_time":            timing["rollback_time"],
-            "network_overhead_time":    timing["network_overhead_time"],
         })
 
     if total_output_tokens > 0:
         match_rate = accepted_tokens_total / total_output_tokens
         perf_stats["token_match_rate"] = match_rate
 
-    # Log latency and match rate at debug level to avoid duplicate console output at INFO
-    logger.debug(
-        f"Latency: {total_time:.2f}s, tokens generated: {total_output_tokens}, throughput: "
-        f"{(total_output_tokens / total_time) if total_time > 0 else 0.0:.2f} t/s"
-    )
     if total_output_tokens > 0:
         logger.debug(
             f"Speculative decoding match rate: {match_rate:.2%} "

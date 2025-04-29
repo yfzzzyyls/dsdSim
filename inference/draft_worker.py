@@ -168,6 +168,10 @@ def run_client(
         latency_prompt = time.time() - start_time_prompt
         perf_stats["target_prefill_time"] = session_prefill[session_ids[i]]
         perf_stats["total_time"] = latency_prompt
+        tokens_generated_total = perf_stats.get("tokens_generated_total", 0)
+        throughput = tokens_generated_total / latency_prompt if latency_prompt>0 else 0.0
+        perf_stats["throughput"] = throughput
+        perf_stats["avg_token_time"] = latency_prompt / tokens_generated_total if tokens_generated_total>0 else 0.0
         # Prefer explicit counts from speculative_decode
         accepted = perf_stats.get("accepted_tokens_total", 0)
         tgt = perf_stats.get("target_tokens_total", 0)
