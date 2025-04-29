@@ -8,6 +8,7 @@ import torch
 from transformers import AutoTokenizer
 import json
 from datetime import datetime
+import sys
 # Enable Transformer optimizations *and* expose past_key_values to Python
 os.environ["NEURON_CC_FLAGS"] = "--model-type=transformer"
 os.environ["NEURON_RT_NUM_CORES"] = "2"
@@ -26,8 +27,38 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 def main():
-    parser = argparse.ArgumentParser(description="choral-spec main launcher")
-    parser.add_argument("--role", choices=["target", "draft", "verify_target", "verify_draft"], required=True,
+    # -----------------------------------------------------------------
+    # Optional JSON configuration file parsing
+    # We first parse only the --config argument (if present).  If the
+    # user supplied a JSON file, we load it and treat its key/value
+    # pairs as *defaults* for the full CLI parser.  Command‑line flags
+    # given after --config still override anything coming from the
+    # file, preserving normal precedence.
+    # -----------------------------------------------------------------
+    config_parser = argparse.ArgumentParser(add_help=False)
+    config_parser.add_argument("--config", type=str,
+                               help="Path to a JSON file containing CLI arguments")
+    config_args, remaining_argv = config_parser.parse_known_args()
+
+    config_defaults = {}
+    if config_args.config:
+        try:
+            with open(config_args.config, 'r') as f:
+                config_defaults = json.load(f)
+            logger.debug("Loaded configuration defaults from %s: %s",
+                         config_args.config, config_defaults)
+        except Exception as e:
+            logger.error("Failed to load --config file '%s': %s",
+                         config_args.config, e)
+            sys.exit(1)
+
+    parser = argparse.ArgumentParser(
+        parents=[config_parser],
+        description="choral-spec main launcher",
+    )
+    # Apply JSON defaults *before* adding the full set of arguments
+    parser.set_defaults(**config_defaults)
+    parser.add_argument("--role", choices=["target", "draft", "verify_target", "verify_draft"],
                         help=("Role to run: 'target' for target server, 'draft' for draft client, "
                               "'verify_target' to run the target model standalone, "
                               "'verify_draft' to run the draft model standalone"))
@@ -61,7 +92,13 @@ def main():
                         help="Temperature for draft sampling (default 1.0)")
     parser.add_argument("--debug", action="store_true",
                         help="Enable verbose DEBUG logging (prints logger.debug lines)")
-    args = parser.parse_args()
+    args = parser.parse_args(remaining_argv)
+
+    # Ensure --role is set either via CLI or the --config JSON
+    if not args.role:
+        logger.error("Argument --role is required (specify in the JSON config or on the command‑line).")
+        parser.print_help()
+        sys.exit(1)
 
     # -----------------------------------------------------------------
     # Bump verbosity if --debug was requested.  This promotes *all*
