@@ -46,26 +46,7 @@ def speculative_decode(
     gamma_max    = max(valid_gammas)
     current_gamma = max(g for g in valid_gammas if g <= max(1, gamma))
     current_temp  = temperature            # draft temperature we can tweak
-    # ------------------------------------------------------------------
-    # PID controller state and gains for adaptive γ and temperature.
-    # These values were chosen empirically and can be tuned per‑model.
-    # ------------------------------------------------------------------
-    integral_error = 0.0      # ∑ error (I‑term)
-    prev_error     = 0.0      # error_{t‑1} (for D‑term)
-
-    # PID gains for γ adaptation
-    KP_GAMMA, KI_GAMMA, KD_GAMMA = 0.5, 0.10, 0.25
-    # PID gains for draft‑temperature adaptation
-    KP_TEMP , KI_TEMP , KD_TEMP  = 0.2, 0.05, 0.10
-
-    # --- “How to tame it quickly” stabilisation constants ---
-    INTEGRAL_CLAMP      = 5.0      # anti‑wind‑up guard for ∑error
-    D_SMOOTH_ALPHA      = 0.20     # low‑pass filter for derivative term
-    TEMP_SMOOTH_ALPHA   = 0.20     # EMA smoothing for temperature updates
-    GAMMA_HYST          = 1        # only apply γ change if step ≥ this value
-
-    derivative_smooth   = 0.0      # initialised once outside the loop
-    target_accept = 0.7                    # desired per‑loop acceptance rate
+    target_accept = 0.5                    # desired per‑loop acceptance rate
 
     logger.debug(
         f"[session={session_id}] Starting speculative_decode: "
@@ -283,46 +264,22 @@ def speculative_decode(
         # Propagate server‑side finished flag
         finished = finished or target_finished
 
-        # ---------- adaptive γ and temperature (PID‑controller) ----------
+        # ---------- adaptive γ and temperature (P‑controller) ----------
         # if current_gamma > 0:
         #     loop_accept_rate = accepted_count / current_gamma
         #     error = target_accept - loop_accept_rate
 
-        #     # --- PID terms ---
-        #     # ----- anti‑wind‑up & derivative smoothing -----
-        #     integral_error = max(-INTEGRAL_CLAMP,
-        #                          min(INTEGRAL_CLAMP, integral_error + error))
-
-        #     raw_derivative = error - prev_error
-        #     derivative_smooth = (1.0 - D_SMOOTH_ALPHA) * derivative_smooth + D_SMOOTH_ALPHA * raw_derivative
-        #     prev_error = error
-
-        #     # --- PID control for γ -------------------------------------------------
-        #     pid_gamma = (KP_GAMMA * error +
-        #                  KI_GAMMA * integral_error +
-        #                  KD_GAMMA * derivative_smooth)
-
-        #     desired_gamma = int(max(1,
-        #                             min(gamma_max,
-        #                                 round(current_gamma + pid_gamma * current_gamma))))
-        #     # snap to nearest compiled bucket not exceeding desired_gamma
+        #     # PID suggestion
+        #     desired_gamma = int(max(1, min(gamma_max,
+        #                                    current_gamma + 0.5 * error * current_gamma)))
+        #     # snap to nearest compiled bucket _not exceeding_ desired_gamma
         #     new_gamma = max(g for g in valid_gammas if g <= desired_gamma)
-        #     if abs(new_gamma - current_gamma) < GAMMA_HYST:
-        #         new_gamma = current_gamma
         #     if new_gamma != current_gamma:
         #         logger.debug("[session=%s] Adjust γ %d → %d (acc_rate=%.2f, desired=%d)",
-        #                      session_id, current_gamma, new_gamma,
-        #                      loop_accept_rate, desired_gamma)
+        #                      session_id, current_gamma, new_gamma, loop_accept_rate, desired_gamma)
         #     current_gamma = new_gamma
 
-        #     # --- PID control for draft temperature -------------------------------
-        #     pid_temp = (KP_TEMP * error +
-        #                 KI_TEMP * integral_error +
-        #                 KD_TEMP * derivative_smooth)
-
-        #     desired_temp = current_temp * (1 + pid_temp)
-        #     desired_temp = max(0.3, min(2.0, desired_temp))     # hard clamp
-        #     new_temp = (1.0 - TEMP_SMOOTH_ALPHA) * current_temp + TEMP_SMOOTH_ALPHA * desired_temp
+        #     new_temp = max(0.3, min(2.0, current_temp * (1 + 0.2 * error)))
         #     if abs(new_temp - current_temp) > 1e-3:
         #         logger.debug("[session=%s] Adjust draft temperature %.3f → %.3f",
         #                      session_id, current_temp, new_temp)
