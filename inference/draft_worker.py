@@ -46,16 +46,16 @@ def save_perf_stats(perf_stats: dict, file_prefix: str):
                 cf.write(",".join(header) + "\n")
             row = [
                 f"{total_time_val:.3f}",
-                perf_stats.get("tokens_generated",""),
-                perf_stats.get("throughput",""),
-                perf_stats.get("avg_token_time",""),
-                perf_stats.get("token_match_rate",""),
-                perf_stats.get("target_prefill_time",""),
-                perf_stats.get("draft_prefill_time",""),
-                perf_stats.get("draft_generation_time",""),
-                perf_stats.get("draft_kv_update_time",""),
-                perf_stats.get("grpc_roundtrip_time",""),
-                perf_stats.get("target_verification_time",""),
+                perf_stats.get("tokens_generated", ""),
+                perf_stats.get("throughput", ""),
+                perf_stats.get("avg_token_time", ""),
+                perf_stats.get("token_match_rate", ""),
+                fmt(perf_stats.get("target_prefill_time", 0.0)),
+                fmt(perf_stats.get("draft_prefill_time", 0.0)),
+                fmt(perf_stats.get("draft_generation_time", 0.0)),
+                fmt(perf_stats.get("draft_kv_update_time", 0.0)),
+                fmt(perf_stats.get("grpc_roundtrip_time", 0.0)),
+                fmt(perf_stats.get("target_verification_time", 0.0)),
             ]
             cf.write(",".join(str(x) for x in row) + "\n")
 
@@ -168,7 +168,7 @@ def run_client(
         latency_prompt = time.time() - start_time_prompt
         perf_stats["target_prefill_time"] = session_prefill[session_ids[i]]
         perf_stats["total_time"] = latency_prompt
-        tokens_generated_total = perf_stats.get("tokens_generated_total", 0)
+        tokens_generated_total = perf_stats.get("tokens_generated", 0)
         throughput = tokens_generated_total / latency_prompt if latency_prompt>0 else 0.0
         perf_stats["throughput"] = throughput
         perf_stats["avg_token_time"] = latency_prompt / tokens_generated_total if tokens_generated_total>0 else 0.0
