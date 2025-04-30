@@ -107,11 +107,13 @@ def speculative_decode(
         token_texts = [tokenizer.decode([tid], clean_up_tokenization_spaces=False)
                     for tid in speculative_tokens]
 
-        past_states = [draft_model.cache_ids]
-        for _ in range(current_gamma):
+        # past_states = [draft_model.cache_ids]
+        for i in range(current_gamma):
             scratch_token[0, 0] = prev_token_id
-            time_draftgen = time.perf_counter()
-            logits, _ = draft_model.forward(input_ids=scratch_token)
+            next_pos = draft_model._next_pos + i
+            cache_vec = torch.tensor([next_pos], dtype=torch.int32)
+            time_draftgen = time.perf_counter()            
+            logits, _ = draft_model.forward(input_ids=scratch_token, cache_ids=cache_vec)
             timing["draft_generation_time"] += time.perf_counter() - time_draftgen
             logits = logits.float()
 
@@ -123,7 +125,7 @@ def speculative_decode(
                 NGRAM_WINDOW,
                 torch.tensor(output_tokens + speculative_tokens).unsqueeze(0),
                 logits.unsqueeze(0),    # (1, V) expected
-                draft_model._next_pos
+                next_pos
             )
 
             # apply temperature scaling
@@ -146,7 +148,7 @@ def speculative_decode(
             speculative_probs.append(token_prob)
             
             prev_token_id = token_id
-            past_states.append(draft_model.cache_ids.clone())   # save pointer to next slot
+            # past_states.append(draft_model.cache_ids + i)   # save pointer to next slot
             # Stop if end-of-sequence or max_new_tokens reached
             if tokenizer.eos_token_id is not None and token_id == tokenizer.eos_token_id:
                 finished = True
@@ -179,16 +181,16 @@ def speculative_decode(
                 f"{valid_gammas}"
             )
         # ------------------------------------------------------------------
-        # Ensure that speculative_probs and past_states are consistent with
-        # speculative_tokens length.  This can become mismatched when we
-        # break early from the inner‑token loop (e.g. EOS or max_new_tokens).
+        # Ensure speculative_probs is the same length as speculative_tokens.
+        # This can become mismatched when we break early from the inner loop
+        # (e.g. EOS or token‑budget exhaustion).  Truncate to the shorter
+        # length so we never advance _next_pos past the compiled context.
         # ------------------------------------------------------------------
-        if len(speculative_tokens) != len(speculative_probs):
-            speculative_probs  = speculative_probs[:len(speculative_tokens)]
-            past_states        = past_states[:len(speculative_tokens) + 1]
+        # if len(speculative_tokens) != len(speculative_probs):
+        #     speculative_probs = speculative_probs[:len(speculative_tokens)]
         
         # --- Verify + commit in one RPC ---
-                # logger.debug("[session=%s] Proposed tokens: %s", session_id, speculative_tokens)
+        # logger.debug("[session=%s] Proposed tokens: %s", session_id, speculative_tokens)
         # --- show draft chunk as words instead of IDs -----------------
         token_texts_dbg = [
             tokenizer.decode([tid], clean_up_tokenization_spaces=False)
@@ -214,10 +216,12 @@ def speculative_decode(
         # If the target returned more tokens than we can still emit, truncate
         # the commit list *before* we touch any state‑tracking counters.
         # ------------------------------------------------------------------
+        tokens_generated += len(commit_ids)
         remaining_budget = max_new_tokens - tokens_generated
         if remaining_budget <= 0:
             finished = True
             commit_ids = []
+            break
         elif len(commit_ids) > remaining_budget:
             commit_ids = commit_ids[:remaining_budget]
             # clamp accepted_count as well
@@ -226,7 +230,6 @@ def speculative_decode(
 
         # Now that commit_ids is final, update global counters
         accepted_tokens_total += accepted_count
-        target_tokens_total   += len(commit_ids) - accepted_count
 
         # --------------------------------------------------------------
         # ROLLBACK draft KV pointer to the state *before* the first
@@ -234,29 +237,51 @@ def speculative_decode(
         # past_states[0] is the pointer *before* emitting any speculative
         # token; past_states[k] is after accepting k tokens.
         # --------------------------------------------------------------
-        rollback_ptr = past_states[accepted_count].clone()
-        draft_model.cache_ids = rollback_ptr
-        draft_model._next_pos = int(rollback_ptr.item())
+        # rollback_ptr = past_states[accepted_count].clone()
+        # draft_model.cache_ids = rollback_ptr
+        # draft_model._next_pos = int(rollback_ptr.item())
 
-        # Feed committed tokens back into the draft model (we have already
-        # rolled back the KV pointer to the correct slot). 
-        for tok in commit_ids:
-            # write at the true position
-            scratch_token[0, 0] = tok             # ← add this
-            cache_id_tensor = torch.tensor([draft_model._next_pos], dtype=torch.int32)
-            time_draftkvupdate = time.perf_counter()
-            _ = draft_model.forward(input_ids=scratch_token, cache_ids=cache_id_tensor)
-            timing["draft_kv_update_time"] += time.perf_counter() - time_draftkvupdate
-            draft_model.cache_ids = torch.tensor([draft_model._next_pos], dtype=torch.int32)
-            prev_token_id = tok
-            output_tokens.append(tok)
-            recent_deque.append(tok)
-            tokens_generated += 1
-            if tokens_generated >= max_new_tokens:
-                finished = True
-                break
-            if tokenizer.eos_token_id is not None and tok == tokenizer.eos_token_id:
-                finished = True
+        # ---------------- Hierarchical KV cache update -----------------
+        # 1) Roll back the cache pointer so the *rejected* draft tokens
+        #    disappear from the device KV.  They occupy the range
+        #       [_next_pos - len(speculative_tokens), _next_pos)
+        #    so we rewind by (len(speculative_tokens) - accepted_count).
+
+        # 2) Forward exactly **one** token – the bonus token returned by
+        #    the target – because the accepted tokens' hidden‑states are
+        #    already resident in the KV cache.
+        # ---------------- Hierarchical KV cache update (pointer managed by driver) ----------------
+        # 1) Rewind the pointer so that rejected draft tokens disappear from the KV cache.
+        draft_model._next_pos += accepted_count
+        # keep cache_ids tensor in‑sync so we can reuse it without re‑alloc
+        draft_model.cache_ids[0] = draft_model._next_pos
+
+        # 2) Forward **one** bonus token; accepted tokens already occupy 0…A‑1.
+        bonus_id = commit_ids[-1]           # always present
+        scratch_token[0, 0] = bonus_id
+        cache_id_tensor = draft_model.cache_ids.clone()   # = [ _next_pos ]
+
+        t0 = time.perf_counter()
+        _ = draft_model.forward(input_ids=scratch_token,
+                                cache_ids=cache_id_tensor)
+        timing["draft_kv_update_time"] += time.perf_counter() - t0
+
+        # 3) Advance pointer past the newly‑written bonus token.
+        draft_model._next_pos += 1
+        draft_model.cache_ids[0] = draft_model._next_pos
+
+        # Record every token that will appear in the final text
+        prev_token_id = bonus_id
+        tok = bonus_id
+
+        # Record every token that will appear in the final text
+        output_tokens.extend(commit_ids)
+        recent_deque.extend(commit_ids)
+        if tokens_generated >= max_new_tokens:
+            finished = True
+            break
+        if tokenizer.eos_token_id is not None and tok == tokenizer.eos_token_id:
+            finished = True
 
         logger.debug("ACCEPT cnt=%d  committed=%s",
              accepted_count,

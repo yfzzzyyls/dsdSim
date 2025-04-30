@@ -77,71 +77,31 @@ class NeuronHFAdapterWrap(torch.nn.Module):
 
     def forward(self, input_ids, cache_ids=None, **kwargs):
         """
-        Neuron draft forward with explicit per‑call KV‑cache positions.
-        We maintain a cursor `_next_pos` so each incremental step passes
-        ONLY the positions of the *new* tokens.  This avoids the
-        “Tensor with N elements cannot be converted to Scalar” error.
+        Thin pass‑through to the underlying Neuron adapter.
+
+        All KV‑cache management (cache_ids and next_pos) is handled by the
+        caller.  This wrapper simply forwards the tensors and returns the
+        logits for the last token plus the same `cache_ids` object so
+        existing call‑sites that expect `(logits, pos_tensor)` keep working.
         """
-        B, L = input_ids.shape  # batch, new‑token count
-
-        # ------------------------------------------------------------------
-        # Decide which position tensor to pass for these L new tokens
-        # ------------------------------------------------------------------
-        if cache_ids is None:
-            if self._next_pos == 0:
-                # First (prompt‑priming) call – let Neuron allocate 0…L‑1
-                pos_tensor = None                    # Neuron fills it
-                next_pos_after = L
-            else:
-                # Incremental call – build positions [_next_pos, …]
-                pos_tensor = self._build_pos(self._next_pos, L, B)
-                next_pos_after = self._next_pos + L
-        else:
-            # Caller supplied explicit positions (e.g. during rollback)
-            pos_tensor = cache_ids
-            next_pos_after = int(cache_ids.max().item()) + 1
-
-        # If we are generating exactly one token (B==1, L==1), Neuron expects
-        # cache_ids to be 1‑D → torch.Size([1]); squeeze the batch dim.
-        if pos_tensor is not None and pos_tensor.ndim == 2 and pos_tensor.size(0) == 1 and pos_tensor.size(1) == 1:
-            pos_tensor = pos_tensor.squeeze(0)   # shape (1,)  – compatible with Neuron
-        # ------------------------------------------------------------------
-        # Run Neuron adapter
-        # ------------------------------------------------------------------
         out = self.adapter(input_ids=input_ids,
-                           cache_ids=pos_tensor,
+                           cache_ids=cache_ids,
                            return_dict=False,
                            **kwargs)
 
-        # ------------------------------------------------------------------
-        # Update internal cursor & cache pointer
-        # ------------------------------------------------------------------
-        self._next_pos = next_pos_after
-        if pos_tensor is None:
-            # Reconstruct positions 0…L‑1 for the prompt stage
-            # For prompt (B==1, L>1) keep 2‑D; for B==1, L==1 we can squeeze
-            pos_tensor = self._build_pos(0, L, B)
-            if pos_tensor.ndim == 2 and pos_tensor.size(0) == 1 and pos_tensor.size(1) == 1:
-                pos_tensor = pos_tensor.squeeze(0)
-        # self.cache_ids = pos_tensor if pos_tensor.ndim == 1 else pos_tensor.squeeze(0)
-        self.cache_ids = torch.tensor([self._next_pos], dtype=torch.int32)
-
-        # ------------------------------------------------------------------
-        # Unpack logits to 1‑D tensor
-        # ------------------------------------------------------------------
+        # Extract logits tensor
         if isinstance(out, (tuple, list)):
             logits = out[0]
         else:
             logits = out.logits if hasattr(out, "logits") else out
 
-        # KEEP THE FULL (B, L, V) TENSOR – verification code will
-        # select the rows it needs.
-        if logits.dim() == 3:
+        # Reduce shape to (V)
+        if logits.dim() == 3:       # (B, L, V)
             logits = logits[0, -1, :]
-        if logits.dim() == 2:
+        elif logits.dim() == 2:     # (B, V)
             logits = logits[0]
 
-        return logits, pos_tensor
+        return logits, cache_ids
 
     # ------------------------------------------------------------------
     # Convenience: greedy sampling so verify.py can run target model alone
