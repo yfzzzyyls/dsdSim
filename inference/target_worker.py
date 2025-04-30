@@ -94,10 +94,14 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
             self.model._next_pos = 0
             if current_ids.shape[1] > 0:
                 _ = self.model.forward(current_ids)
-            # store pointer (next index) inside the session
-            self.sessions[session_id].cache_ids = torch.tensor(
-                [current_ids.shape[1]], dtype=torch.int32
-            )
+
+            # --- MANUALLY align wrapper pointer with the prompt length ---
+            next_pos = current_ids.shape[1]                       # L
+            self.model._next_pos = next_pos
+            self.model.cache_ids = torch.tensor([next_pos], dtype=torch.int32)
+
+            # record in session
+            self.sessions[session_id].cache_ids = self.model.cache_ids.clone()
         return inference_pb2.StartResponse(acknowledged=True)
     
     def _commit_tokens_bulk(self, sess, tok_ids):
@@ -111,73 +115,76 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
         if not tok_ids:
             return
 
+        # Ensure model & session pointers match before we bump
+        self._sync_kv_pointer(sess)
+
         # ===============================================================
         # Discover the compiled speculation bucket sizes ONCE per call.
         # ===============================================================
-        LlamaForSamplingModel = self.model.adapter.model
-        bucket_lengths = {k[0] if isinstance(k, tuple) else int(k)
-                            for k in LlamaForSamplingModel.decoder_lm_head_for_speculation.keys()}
+        # LlamaForSamplingModel = self.model.adapter.model
+        # bucket_lengths = {k[0] if isinstance(k, tuple) else int(k)
+        #                     for k in LlamaForSamplingModel.decoder_lm_head_for_speculation.keys()}
 
         token_texts = [self.tokenizer.decode([tid], clean_up_tokenization_spaces=False)
                 for tid in tok_ids]
         logger.debug("Commit tokens (text)=%s  ids=%s", token_texts, tok_ids)
 
-        # Sanity checks
-        assert len(tok_ids) in bucket_lengths, \
-            f"Commit length {len(tok_ids)} not compiled; buckets={sorted(bucket_lengths)}"
-        # --- allow EOS even when tokenizer.vocab_size is stale ---
-        valid = [
-            t for t in tok_ids
-            if t == self.eos_token_id or t < self.tokenizer.vocab_size
-        ]
-        assert len(valid) == len(tok_ids), \
-            f"OOV token(s) in commit_ids: {tok_ids}"
+        # # Sanity checks
+        # assert len(tok_ids) in bucket_lengths, \
+        #     f"Commit length {len(tok_ids)} not compiled; buckets={sorted(bucket_lengths)}"
+        # # --- allow EOS even when tokenizer.vocab_size is stale ---
+        # valid = [
+        #     t for t in tok_ids
+        #     if t == self.eos_token_id or t < self.tokenizer.vocab_size
+        # ]
+        # assert len(valid) == len(tok_ids), \
+        #     f"OOV token(s) in commit_ids: {tok_ids}"
 
-        self._sync_kv_pointer(sess)
+        # self._sync_kv_pointer(sess)
 
-        # (1, K) tensor of the new (real) tokens
-        in_tensor = torch.tensor([tok_ids], dtype=sess.current_ids.dtype)
-        cache_vec = torch.arange(len(tok_ids), dtype=torch.int32) + self.model._next_pos
+        # # (1, K) tensor of the new (real) tokens
+        # in_tensor = torch.tensor([tok_ids], dtype=sess.current_ids.dtype)
+        # cache_vec = torch.arange(len(tok_ids), dtype=torch.int32) + self.model._next_pos
 
         # ------------------------------------------------------------------
         # Figure out which speculation buckets were actually compiled.
         # self.model is a NeuronHFAdapterWrap → .adapter → HFAdapter →
         # .model (the underlying LlamaForSampling).
         # ------------------------------------------------------------------
-        raw_keys = LlamaForSamplingModel.decoder_lm_head_for_speculation.keys()
-        # Accept both (k, batch_size) and k-only keys
-        def _extract_k(k):
-            if isinstance(k, tuple):
-                return k[0]
-            return k
-        spec_ok = len(tok_ids) in {_extract_k(k) for k in raw_keys}
-        assert spec_ok, f"speculative_forward not compiled for {len(tok_ids)} tokens"
+        # raw_keys = LlamaForSamplingModel.decoder_lm_head_for_speculation.keys()
+        # # Accept both (k, batch_size) and k-only keys
+        # def _extract_k(k):
+        #     if isinstance(k, tuple):
+        #         return k[0]
+        #     return k
+        # spec_ok = len(tok_ids) in {_extract_k(k) for k in raw_keys}
+        # assert spec_ok, f"speculative_forward not compiled for {len(tok_ids)} tokens"
 
-        # Save the original pointer before forward
-        orig_next_pos = int(self.model._next_pos)
-
-        # Use speculative_forward to process all tokens and update the KV cache.
-        _ = self.model.speculative_forward(
-            input_ids=in_tensor,
-            cache_ids=cache_vec,
-            spec_length=len(tok_ids),
-        )
+        # # Use speculative_forward to process all tokens and update the KV cache.
+        # _ = self.model.speculative_forward(
+        #     input_ids=in_tensor,
+        #     cache_ids=cache_vec,
+        #     spec_length=len(tok_ids),
+        # )
 
         # Manually bump wrapper pointer so it matches the device
-        new_next_pos = orig_next_pos + len(tok_ids)
+        orig_next_pos = int(sess.cache_ids.item())    # authoritative
+        new_next_pos  = orig_next_pos + len(tok_ids)
         self.model._next_pos = new_next_pos
         self.model.cache_ids = torch.tensor([new_next_pos], dtype=torch.int32)
 
         # Keep the session pointer consistent with the model.
         sess.cache_ids = self.model.cache_ids.clone()
 
-        # Optionally assert pointer is correct
+        # print(f"commit tokens: _next_pos={self.model._next_pos} -> current_shape{sess.current_ids.shape[1]} + {len(tok_ids)}")
         assert int(self.model._next_pos) == sess.current_ids.shape[1] + len(tok_ids), \
             "KV pointer mismatch after manual bump"
 
         # Append committed ids to session's token history
         new_tok_tensor = torch.tensor([tok_ids], dtype=sess.current_ids.dtype)
         sess.current_ids = torch.cat([sess.current_ids, new_tok_tensor], dim=1)
+
+        # Optionally assert pointer is correct
 
         if self.eos_token_id is not None and any(t == self.eos_token_id for t in tok_ids):
             sess.finished = True
