@@ -209,9 +209,15 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
         if not draft_tokens:
             return [], None
 
+        # ==========================================
+        # get the last commit KV cache position
+        # ==========================================
         orig_cache   = sess.cache_ids.clone()
         orig_nextpos = int(orig_cache.item())
-        self._sync_kv_pointer(sess)
+
+        # ==========================================
+        # set indices for speculative forward
+        # ==========================================
         prev_token_id = int(sess.current_ids[0, -1])
         spec_tokens   = [prev_token_id] + draft_tokens          # γ + 1 tokens
         spec_len      = len(spec_tokens)
@@ -273,13 +279,14 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
         #     logits_all = processors(dummy_input_ids, logits_all)
         # ===========================================================
 
-        # ---------- restore snapshot ----------
-        self.model.cache_ids = orig_cache.clone()
-        self.model._next_pos = orig_nextpos
-        sess.cache_ids = orig_cache
-        # self.model.adapter.model.reset_cache(orig_cache)   # hypothetical helper
-        assert int(self.model.cache_ids.item()) == int(sess.cache_ids.item()), \
-            "KV desync detected on verify exit"
+        # # ---------- restore snapshot ----------
+        # self.model.cache_ids = orig_cache.clone()
+        # self.model._next_pos = orig_nextpos
+        # sess.cache_ids = orig_cache
+        # # self.model.adapter.model.reset_cache(orig_cache)   # hypothetical helper
+        # assert int(self.model.cache_ids.item()) == int(sess.cache_ids.item()), \
+        #     "KV desync detected on verify exit"
+        
         return logits_all
 
     def VerifyDraftTokens(self, request, context):
