@@ -125,9 +125,11 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
         # bucket_lengths = {k[0] if isinstance(k, tuple) else int(k)
         #                     for k in LlamaForSamplingModel.decoder_lm_head_for_speculation.keys()}
 
-        token_texts = [self.tokenizer.decode([tid], clean_up_tokenization_spaces=False)
-                for tid in tok_ids]
-        logger.debug("Commit tokens (text)=%s  ids=%s", token_texts, tok_ids)
+        # #=================================================
+        # token_texts = [self.tokenizer.decode([tid], clean_up_tokenization_spaces=False)
+        #         for tid in tok_ids]
+        # logger.debug("Commit tokens (text)=%s  ids=%s", token_texts, tok_ids)
+        # #==================================================
 
         # # Sanity checks
         # assert len(tok_ids) in bucket_lengths, \
@@ -189,20 +191,20 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
         if self.eos_token_id is not None and any(t == self.eos_token_id for t in tok_ids):
             sess.finished = True
 
-        # --------------------------------------------------------------
-        # 9) Detailed commit log: committed tokens *and* full context words
-        # --------------------------------------------------------------
-        current_words = [
-            self.tokenizer.decode([tid], clean_up_tokenization_spaces=False)
-            for tid in sess.current_ids.squeeze(0).tolist()
-        ]
-        logger.debug(
-            "Committed tokens (text)=%s  ids=%s; _next_pos -> %d | current_ids (text)=%s",
-            token_texts,
-            tok_ids,
-            self.model._next_pos,
-            current_words,
-        )
+        # # --------------------------------------------------------------
+        # # 9) Detailed commit log: committed tokens *and* full context words
+        # # --------------------------------------------------------------
+        # current_words = [
+        #     self.tokenizer.decode([tid], clean_up_tokenization_spaces=False)
+        #     for tid in sess.current_ids.squeeze(0).tolist()
+        # ]
+        # logger.debug(
+        #     "Committed tokens (text)=%s  ids=%s; _next_pos -> %d | current_ids (text)=%s",
+        #     token_texts,
+        #     tok_ids,
+        #     self.model._next_pos,
+        #     current_words,
+        # )
 
     def verify(self, sess: TargetSession, draft_tokens):
         """
@@ -240,14 +242,14 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
         logger.debug(
             f"VERIFY cache_vec length {cache_vec.numel()} must equal spec token length {spec_len}"
         )
-        # ------------------------------------
-        # ------------------------------------
-        token_texts = [self.tokenizer.decode([tid], clean_up_tokenization_spaces=False)
-               for tid in spec_tokens]
-        logger.debug("verify call K(gamma[%d] + 1)=%d tokens(text)=%s ids=%s",
-                    len(draft_tokens), input_ids.shape[1], token_texts, input_ids.tolist())
-        #------------------------------------
-        # ------------------------------------
+        # # ------------------------------------
+        # # ------------------------------------
+        # token_texts = [self.tokenizer.decode([tid], clean_up_tokenization_spaces=False)
+        #        for tid in spec_tokens]
+        # logger.debug("verify call K(gamma[%d] + 1)=%d tokens(text)=%s ids=%s",
+        #             len(draft_tokens), input_ids.shape[1], token_texts, input_ids.tolist())
+        # #------------------------------------
+        # # ------------------------------------
         
         logits_all = self.model.speculative_forward(
             input_ids=input_ids,
@@ -300,11 +302,14 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
         start_verify_t = time.perf_counter()
         sid          = request.session_id
         draft_tokens = list(request.draft_tokens)
-        # Decode IDs → words for easier debugging
-        draft_texts = [self.tokenizer.decode([tid], clean_up_tokenization_spaces=False)
-                    for tid in draft_tokens]
-        logger.debug("[session=%s] received draft tokens (text)=%s  ids=%s",
-                    sid, draft_texts, draft_tokens)
+        # # ============================
+        # # Decode IDs → words for easier debugging
+        # draft_texts = [self.tokenizer.decode([tid], clean_up_tokenization_spaces=False)
+        #             for tid in draft_tokens]
+        # logger.debug("[session=%s] received draft tokens (text)=%s  ids=%s",
+        #             sid, draft_texts, draft_tokens)
+        # # ============================
+        
         draft_probs  = list(request.draft_probs)
         logger.debug("[session=%s] draft_probs=%s", sid, draft_probs)
 
@@ -334,19 +339,21 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
 
             # ---- ONE verification pass for the entire chunk + bonus ----
             logits_all = self.verify(sess, draft_tokens)
-            
-            # ---- DEBUG: show draft chunk size, words, and token IDs ----
-            draft_size  = len(draft_tokens)
-            draft_words = [
-                self.tokenizer.decode([tid], clean_up_tokenization_spaces=False)
-                for tid in draft_tokens
-            ]
-            logger.debug(
-                "[DEBUG draft chunk] size=%d  words=%s  ids=%s",
-                draft_size,
-                draft_words,
-                draft_tokens,
-            )
+
+            # # ===========================================
+            # # ---- DEBUG: show draft chunk size, words, and token IDs ----
+            # draft_size  = len(draft_tokens)
+            # draft_words = [
+            #     self.tokenizer.decode([tid], clean_up_tokenization_spaces=False)
+            #     for tid in draft_tokens
+            # ]
+            # logger.debug(
+            #     "[DEBUG draft chunk] size=%d  words=%s  ids=%s",
+            #     draft_size,
+            #     draft_words,
+            #     draft_tokens,
+            # )
+            # # ===========================================
 
             # Soft-max after masking
             all_row_probs = torch.softmax(logits_all.float(), dim=-1)
@@ -432,40 +439,48 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
                 row_idx    = accepted_cnt        # 0‑based
                 bonus_id   = int(torch.multinomial(all_row_probs[row_idx], 1).item())
                 committed.append(bonus_id)
+                # ============================
                 # DEBUG logging (single call)
-                if logger.isEnabledFor(logging.DEBUG):
-                    d_tok  = self.tokenizer.decode([draft_tokens[row_idx]], clean_up_tokenization_spaces=False)
-                    b_tok  = self.tokenizer.decode([bonus_id], clean_up_tokenization_spaces=False)
-                    logger.debug(
-                        "[DEBUG token rejected] i=%d draft token='%s' bonus token='%s' "
-                        "id=%d  p_tgt=%.6f  q_draft=%.6f",
-                        row_idx, d_tok, b_tok, draft_tokens[row_idx],
-                        p_tgt_t[row_idx], q_draft_t[row_idx]
-                    )
+                # if logger.isEnabledFor(logging.DEBUG):
+                #     d_tok  = self.tokenizer.decode([draft_tokens[row_idx]], clean_up_tokenization_spaces=False)
+                #     b_tok  = self.tokenizer.decode([bonus_id], clean_up_tokenization_spaces=False)
+                #     logger.debug(
+                #         "[DEBUG token rejected] i=%d draft token='%s' bonus token='%s' "
+                #         "id=%d  p_tgt=%.6f  q_draft=%.6f",
+                #         row_idx, d_tok, b_tok, draft_tokens[row_idx],
+                #         p_tgt_t[row_idx], q_draft_t[row_idx]
+                #     )
+                # ============================
             else:
                 # all accepted – sample bonus from last row (γ)
                 bonus_id = int(torch.multinomial(all_row_probs[-1], 1).item())
                 committed.append(bonus_id)
-                if logger.isEnabledFor(logging.DEBUG):
-                    b_tok = self.tokenizer.decode([bonus_id], clean_up_tokenization_spaces=False)
-                    logger.debug(
-                        "[DEBUG all token accepted] bonus token='%s' id=%d",
-                        b_tok, bonus_id
-                    )
+                # # ============================
+                # if logger.isEnabledFor(logging.DEBUG):
+                #     b_tok = self.tokenizer.decode([bonus_id], clean_up_tokenization_spaces=False)
+                #     logger.debug(
+                #         "[DEBUG all token accepted] bonus token='%s' id=%d",
+                #         b_tok, bonus_id
+                #     )
+                # # ============================
 
             # stop condition: if EOS was accepted
             if self.eos_token_id in committed:
                 sess.finished = True
                 
+            # # ---------------------------------------------------------------
+            # # Bulk commit all tokens at once
+            # commit_texts = [self.tokenizer.decode([tid], clean_up_tokenization_spaces=False)
+            #                 for tid in committed]
+            # logger.debug("target generate/verified tokens (text)=%s  ids=%s", commit_texts, committed)
             # ---------------------------------------------------------------
-            # Bulk commit all tokens at once
-            commit_texts = [self.tokenizer.decode([tid], clean_up_tokenization_spaces=False)
-                            for tid in committed]
-            logger.debug("target generate/verified tokens (text)=%s  ids=%s", commit_texts, committed)
-            # ---------------------------------------------------------------
+
+
+            # ==========================================
             # Commit all accepted tokens in one call
             self._commit_tokens_bulk(sess, committed)
-            # ---------------------------------------------------------------
+            # ==========================================
+            
             logger.debug("commmit response to draft: _next_pos=%d", int(self.model._next_pos))
 
             verify_time_ms = (time.perf_counter() - start_verify_t) * 1000.0

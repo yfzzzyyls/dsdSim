@@ -103,9 +103,9 @@ def speculative_decode(
         # The draft model proposes up to 'gamma' tokens
         speculative_tokens = []
         speculative_probs = []
-        # ---------- just before the debug call, print he actual word generated ----------
-        token_texts = [tokenizer.decode([tid], clean_up_tokenization_spaces=False)
-                    for tid in speculative_tokens]
+        # # ---------- just before the debug call, print he actual word generated ----------
+        # token_texts = [tokenizer.decode([tid], clean_up_tokenization_spaces=False)
+        #             for tid in speculative_tokens]
 
         # past_states = [draft_model.cache_ids]
         for i in range(current_gamma):
@@ -186,17 +186,19 @@ def speculative_decode(
         # (e.g. EOS or token‑budget exhaustion).  Truncate to the shorter
         # length so we never advance _next_pos past the compiled context.
         # ------------------------------------------------------------------
-        # if len(speculative_tokens) != len(speculative_probs):
-        #     speculative_probs = speculative_probs[:len(speculative_tokens)]
         
-        # --- Verify + commit in one RPC ---
-        # logger.debug("[session=%s] Proposed tokens: %s", session_id, speculative_tokens)
-        # --- show draft chunk as words instead of IDs -----------------
-        token_texts_dbg = [
-            tokenizer.decode([tid], clean_up_tokenization_spaces=False)
-            for tid in speculative_tokens
-        ]
-        logger.debug("[session=%s] draft model proposed: chunk len=%d, proposed tokens (text)=%s, ids=%s, probs=%s", session_id, len(speculative_tokens), token_texts_dbg, speculative_tokens, speculative_probs)
+        # # ====================================================================
+        # # --- Verify + commit in one RPC ---
+        # # logger.debug("[session=%s] Proposed tokens: %s", session_id, speculative_tokens)
+        # # --- show draft chunk as words instead of IDs -----------------
+        # token_texts_dbg = [
+        #     tokenizer.decode([tid], clean_up_tokenization_spaces=False)
+        #     for tid in speculative_tokens
+        # ]
+        # logger.debug("[session=%s] draft model proposed: chunk len=%d, proposed tokens (text)=%s, ids=%s, probs=%s", session_id, len(speculative_tokens), token_texts_dbg, speculative_tokens, speculative_probs)
+        # # ====================================================================
+
+
         # ----- measure RPC round‑trip and split into network vs. verify compute -----
         time_roundtrip = time.perf_counter()
         commit_ids, accepted_count, verify_time_ms, target_finished = grpc_client.verify_draft_tokens(
