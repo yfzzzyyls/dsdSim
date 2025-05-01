@@ -99,7 +99,6 @@ def speculative_decode(
     accepted_tokens_total = 0
     target_tokens_total = 0
 
-    
     while not finished and tokens_generated < max_new_tokens:
         # The draft model proposes up to 'gamma' tokens
         speculative_tokens = []
@@ -120,7 +119,6 @@ def speculative_decode(
 
             # ---- Our improved numeric stability start ----
             # Temperature‑scale logits then apply classic nucleus (top‑p) filter
-
             time_sample = time.perf_counter()
             # apply ngram filter
             masked = sampling.filter_ngrams(
@@ -177,18 +175,22 @@ def speculative_decode(
         # compiled γ buckets.  We no longer truncate; instead we raise to
         # surface a configuration / logic error immediately.
         # --------------------------------------------------------------
-        if len(speculative_tokens) not in valid_gammas:
-            assert len(speculative_tokens) in valid_gammas, (
-                f"Speculative chunk length {len(speculative_tokens)} is not "
-                f"supported by the compiled target model; valid γ buckets = "
-                f"{valid_gammas}"
-            )
-        # ------------------------------------------------------------------
+
+        # ==============================================================
+        # if len(speculative_tokens) not in valid_gammas:
+        #     assert len(speculative_tokens) in valid_gammas, (
+        #         f"Speculative chunk length {len(speculative_tokens)} is not "
+        #         f"supported by the compiled target model; valid γ buckets = "
+        #         f"{valid_gammas}"
+        #     )
+        # ============================================================
+
+        # ============================================================
         # Ensure speculative_probs is the same length as speculative_tokens.
         # This can become mismatched when we break early from the inner loop
         # (e.g. EOS or token‑budget exhaustion).  Truncate to the shorter
         # length so we never advance _next_pos past the compiled context.
-        # ------------------------------------------------------------------
+        # ============================================================
         
         # # ====================================================================
         # # --- Verify + commit in one RPC ---
@@ -254,14 +256,7 @@ def speculative_decode(
         #       [_next_pos - len(speculative_tokens), _next_pos)
         #    so we rewind by (len(speculative_tokens) - accepted_count).
 
-        # 2) Forward exactly **one** token – the bonus token returned by
-        #    the target – because the accepted tokens' hidden‑states are
-        #    already resident in the KV cache.
-        # ---------------- Hierarchical KV cache update (pointer managed by driver) ----------------
-        # 1) Rewind the pointer so that rejected draft tokens disappear from the KV cache.
-        draft_model._next_pos += accepted_count
-        # keep cache_ids tensor in‑sync so we can reuse it without re‑alloc
-        draft_model.cache_ids[0] = draft_model._next_pos
+
 
         # 2) Forward **one** bonus token; accepted tokens already occupy 0…A‑1.
         bonus_id = commit_ids[-1]           # always present
@@ -280,7 +275,7 @@ def speculative_decode(
         # ==============================================================
         # # 3) Advance pointer past the newly‑written bonus token.
         # this is used to update the KV cache ptr
-        draft_model._next_pos += 1
+        draft_model._next_pos += (accepted_count + 1)
         draft_model.cache_ids[0] = draft_model._next_pos
         # ==============================================================
 
