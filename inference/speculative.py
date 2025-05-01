@@ -115,7 +115,7 @@ def speculative_decode(
             time_draftgen = time.perf_counter()            
             logits, _ = draft_model.forward(input_ids=scratch_token, cache_ids=cache_vec)
             timing["draft_generation_time"] += time.perf_counter() - time_draftgen
-            logits = logits.float()
+            # logits = logits.float()
 
             # ---- Our improved numeric stability start ----
             # Temperature‑scale logits then apply classic nucleus (top‑p) filter
