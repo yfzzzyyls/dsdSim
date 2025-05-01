@@ -266,20 +266,23 @@ def speculative_decode(
         # 2) Forward **one** bonus token; accepted tokens already occupy 0…A‑1.
         bonus_id = commit_ids[-1]           # always present
         scratch_token[0, 0] = bonus_id
-        cache_id_tensor = draft_model.cache_ids.clone()   # = [ _next_pos ]
+        
+        # cache_id_tensor = draft_model.cache_ids.clone()   # = [ _next_pos ]
+        # t0 = time.perf_counter()
+        # _ = draft_model.forward(input_ids=scratch_token,
+        #                         cache_ids=cache_id_tensor)
+        # timing["draft_kv_update_time"] += time.perf_counter() - t0
 
-        t0 = time.perf_counter()
-        _ = draft_model.forward(input_ids=scratch_token,
-                                cache_ids=cache_id_tensor)
-        timing["draft_kv_update_time"] += time.perf_counter() - t0
-
-        # 3) Advance pointer past the newly‑written bonus token.
-        draft_model._next_pos += 1
-        draft_model.cache_ids[0] = draft_model._next_pos
-
-        # Record every token that will appear in the final text
+        # ============================================================
+        # set bonus id to the next beginning of generating new draft tokens
         prev_token_id = bonus_id
         tok = bonus_id
+        # ==============================================================
+        # # 3) Advance pointer past the newly‑written bonus token.
+        # this is used to update the KV cache ptr
+        draft_model._next_pos += 1
+        draft_model.cache_ids[0] = draft_model._next_pos
+        # ==============================================================
 
         # Record every token that will appear in the final text
         output_tokens.extend(commit_ids)
