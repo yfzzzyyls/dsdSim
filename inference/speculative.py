@@ -71,6 +71,7 @@ def speculative_decode(
         "draft_kv_update_time":     0.0,
         "grpc_roundtrip_time":      0.0,   # pure network + (de)serialisation latency
         "target_verification_time": 0.0,   # server‑side compute only
+        "sampling_filter_time":     0.0,   # time spent on n‑gram mask + top‑k/p filter
     }
     
     # Feed the prompt so Neuron caches 0…L‑1, then set pointer to NEXT index (=L)
@@ -120,6 +121,7 @@ def speculative_decode(
             # ---- Our improved numeric stability start ----
             # Temperature‑scale logits then apply classic nucleus (top‑p) filter
 
+            time_sample = time.perf_counter()
             # apply ngram filter
             masked = sampling.filter_ngrams(
                 NGRAM_WINDOW,
@@ -137,6 +139,7 @@ def speculative_decode(
                 top_k=TOP_K,
                 top_p=top_p
             )
+            timing["sampling_filter_time"] += time.perf_counter() - time_sample
 
             probs = torch.softmax(masked, dim=-1).squeeze(0)
             sample_in_topk = torch.multinomial(probs, 1).item()
@@ -338,6 +341,7 @@ def speculative_decode(
             "draft_kv_update_time":     timing["draft_kv_update_time"],
             "grpc_roundtrip_time":      timing["grpc_roundtrip_time"],
             "target_verification_time": timing["target_verification_time"],
+            "sampling_filter_time":     timing["sampling_filter_time"],
         })
 
     if total_output_tokens > 0:
