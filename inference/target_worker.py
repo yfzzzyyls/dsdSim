@@ -334,6 +334,7 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
 
             # ---- ONE verification pass for the entire chunk + bonus ----
             logits_all = self.verify(sess, draft_tokens)
+            
             # ---- DEBUG: show draft chunk size, words, and token IDs ----
             draft_size  = len(draft_tokens)
             draft_words = [
@@ -399,47 +400,62 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
                 f"[session={sid}] Length mismatch: "
                 f"{len(draft_probs)} draft_probs vs {len(draft_tokens)} draft_tokens"
             )
-            # Probabilistic acceptance:
-            for i, (tok, p_tgt) in enumerate(zip(draft_tokens, probs)):
-                q_draft = draft_probs[i]
-                assert q_draft > 0.0, (
-                    f"[session={sid}] q_draft <= 0 for token index {i}: "
-                    f"draft_token={tok} q_draft={q_draft}"
-                )
-                if p_tgt >= q_draft:
-                    accept = True
-                else:
-                    accept = ( random.random() < (p_tgt / q_draft) ) 
+            # ------------------------------------------------------------------
+            # Vectorised probabilistic acceptance (device‑resident, no Python loops)
+            # ------------------------------------------------------------------
+            device = target_row_probs.device            # stay on same device
+            draft_token_tensor = torch.tensor(draft_tokens, device=device)
 
-                if accept == True:
-                    accepted_cnt += 1
-                    committed.append(tok)
-                    if self.eos_token_id == tok:
-                        break
-                    token_word = self.tokenizer.decode([tok], clean_up_tokenization_spaces=False)
+            # p_tgt_t: gather target P(draft_token | prefix) directly from tensor
+            row_idx = torch.arange(len(draft_tokens), device=device)
+            p_tgt_t = target_row_probs[row_idx, draft_token_tensor]     # (γ,)
+
+            # q_draft comes from RPC as Python list – move to same device
+            q_draft_t = torch.tensor(draft_probs, device=device)
+
+            # Guard against zero probabilities to avoid NaNs
+            torch._assert((q_draft_t > 0).all(), "q_draft contains zeros")
+
+            ratio    = p_tgt_t / q_draft_t
+            rand_vec = torch.rand_like(ratio)
+            accept_vec = (p_tgt_t >= q_draft_t) | (rand_vec < ratio)
+
+            # index of first rejection; if none, len(draft_tokens)
+            reject_idx = (~accept_vec).nonzero(as_tuple=False)
+            first_rej  = int(reject_idx[0].item()) if reject_idx.numel() > 0 else len(draft_tokens)
+
+            accepted_cnt = first_rej
+            committed    = draft_tokens[:accepted_cnt]
+
+            if accepted_cnt < len(draft_tokens):
+                # one rejection → sample bonus from that row
+                row_idx    = accepted_cnt        # 0‑based
+                bonus_id   = int(torch.multinomial(all_row_probs[row_idx], 1).item())
+                committed.append(bonus_id)
+                # DEBUG logging (single call)
+                if logger.isEnabledFor(logging.DEBUG):
+                    d_tok  = self.tokenizer.decode([draft_tokens[row_idx]], clean_up_tokenization_spaces=False)
+                    b_tok  = self.tokenizer.decode([bonus_id], clean_up_tokenization_spaces=False)
                     logger.debug(
-                        "[DEBUG token accepted] i=%d draft token='%s' id=%d  p_tgt=%.6f  q_draft=%.6f",
-                        i, token_word, tok, p_tgt, draft_probs[i]
+                        "[DEBUG token rejected] i=%d draft token='%s' bonus token='%s' "
+                        "id=%d  p_tgt=%.6f  q_draft=%.6f",
+                        row_idx, d_tok, b_tok, draft_tokens[row_idx],
+                        p_tgt_t[row_idx], q_draft_t[row_idx]
                     )
-                else:
-                    bonus_id = int(torch.multinomial(all_row_probs[i], 1).item())
-                    committed.append(bonus_id)
-                    draft_token_word = self.tokenizer.decode([tok], clean_up_tokenization_spaces=False)
-                    token_word = self.tokenizer.decode([bonus_id], clean_up_tokenization_spaces=False)
-                    logger.debug(
-                        "[DEBUG token rejected] i=%d draft token='%s' bonus token='%s' id=%d  p_tgt=%.6f  q_draft=%.6f",
-                        i, draft_token_word, token_word, tok, p_tgt,  draft_probs[i]
-                    )
-                    break
             else:
-                # all accepted → sample bonus token from bonus_probs
+                # all accepted – sample bonus from last row (γ)
                 bonus_id = int(torch.multinomial(all_row_probs[-1], 1).item())
                 committed.append(bonus_id)
-                token_word = self.tokenizer.decode([bonus_id], clean_up_tokenization_spaces=False)
-                logger.debug(
-                    "[DEBUG all token accepted] i=%d bonus token='%s' id=%d  p_tgt=%.6f  q_draft=%.6f",
-                    i, token_word, tok, p_tgt, draft_probs[i]
-                )
+                if logger.isEnabledFor(logging.DEBUG):
+                    b_tok = self.tokenizer.decode([bonus_id], clean_up_tokenization_spaces=False)
+                    logger.debug(
+                        "[DEBUG all token accepted] bonus token='%s' id=%d",
+                        b_tok, bonus_id
+                    )
+
+            # stop condition: if EOS was accepted
+            if self.eos_token_id in committed:
+                sess.finished = True
                 
             # ---------------------------------------------------------------
             # Bulk commit all tokens at once
