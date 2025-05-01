@@ -37,7 +37,7 @@ def save_perf_stats(perf_stats: dict, file_prefix: str):
         header = ["total_time","tokens_generated","tokens_per_second",
                 "avg_token_time","token_match_rate",
                 "target_prefill_time","draft_prefill_time",
-                "draft_generation_time","draft_kv_update_time",
+                "draft_generation_time",
                 "grpc_roundtrip_time","target_verification_time",
                 "sampling_filter_time"]
 
@@ -54,7 +54,6 @@ def save_perf_stats(perf_stats: dict, file_prefix: str):
                 fmt(perf_stats.get("target_prefill_time", 0.0)),
                 fmt(perf_stats.get("draft_prefill_time", 0.0)),
                 fmt(perf_stats.get("draft_generation_time", 0.0)),
-                fmt(perf_stats.get("draft_kv_update_time", 0.0)),
                 fmt(perf_stats.get("grpc_roundtrip_time", 0.0)),
                 fmt(perf_stats.get("target_verification_time", 0.0)),
                 fmt(perf_stats.get("sampling_filter_time", 0.0)),

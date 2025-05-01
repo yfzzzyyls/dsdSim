@@ -68,7 +68,6 @@ def speculative_decode(
     timing = {
         "draft_prefill_time":       0.0,
         "draft_generation_time":    0.0,
-        "draft_kv_update_time":     0.0,
         "grpc_roundtrip_time":      0.0,   # pure network + (de)serialisation latency
         "target_verification_time": 0.0,   # server‑side compute only
         "sampling_filter_time":     0.0,   # time spent on n‑gram mask + top‑k/p filter
@@ -261,12 +260,6 @@ def speculative_decode(
         # 2) Forward **one** bonus token; accepted tokens already occupy 0…A‑1.
         bonus_id = commit_ids[-1]           # always present
         scratch_token[0, 0] = bonus_id
-        
-        # cache_id_tensor = draft_model.cache_ids.clone()   # = [ _next_pos ]
-        # t0 = time.perf_counter()
-        # _ = draft_model.forward(input_ids=scratch_token,
-        #                         cache_ids=cache_id_tensor)
-        # timing["draft_kv_update_time"] += time.perf_counter() - t0
 
         # ============================================================
         # set bonus id to the next beginning of generating new draft tokens
@@ -336,7 +329,6 @@ def speculative_decode(
         perf_stats.update({
             "draft_prefill_time":       timing["draft_prefill_time"],
             "draft_generation_time":    timing["draft_generation_time"],
-            "draft_kv_update_time":     timing["draft_kv_update_time"],
             "grpc_roundtrip_time":      timing["grpc_roundtrip_time"],
             "target_verification_time": timing["target_verification_time"],
             "sampling_filter_time":     timing["sampling_filter_time"],
