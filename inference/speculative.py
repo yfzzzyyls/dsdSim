@@ -13,7 +13,7 @@ logger = logging.getLogger(__name__)
 # Repetition‑penalty strength (0 < α ≤ 1).  Smaller → stronger penalty
 REP_PENALTY = 0.4
 NGRAM_WINDOW = 3    # penalise 1‑ to 3‑gram repeats
-TOP_K = 512
+TOP_K = 128
 
 if not logger.hasHandlers():
     h = logging.StreamHandler()
