@@ -128,7 +128,7 @@ You can also run either the draft or target model **standalone** (without specul
 To run the **target model** by itself on a prompt:
 
 ```
-python main.py --role verify_target --model /home/ubuntu/models/llama-3.1-8b --prompt "What is the difference between llama and alpaca?" --sequence_length 128 --max_new_tokens 64 --profile
+python main.py --role verify_target --model /home/ubuntu/models/llama-3.1-8b --prompt_text prompt.txt --sequence_length 128 --max_new_tokens 100 --profile
 ```
 
 This will load the 8B target model and generate 64 tokens continuing the prompt, printing each generated token as it arrives, followed by the full output text.
@@ -136,7 +136,7 @@ This will load the 8B target model and generate 64 tokens continuing the prompt,
 Similarly, to run the **draft model** by itself:
 
 ```
-python main.py --role verify_draft --model /home/ubuntu/models/llama-3.2-1b --prompt "Hi, how are you? Tell me about the difference between llama and alpaca." --sequence_length 640 --max_new_tokens 128 --profile
+python main.py --role verify_target --model /home/ubuntu/models/llama-3.2-1b --prompt_text prompt.txt --sequence_length 128 --max_new_tokens 100 --profile
 ```
 
 This will use the 1B draft model to generate text token-by-token for the given prompt.

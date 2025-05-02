@@ -37,8 +37,6 @@ def main():
                         help="Target model path (for draft role, used for tokenizer or loading compiled target model)")
     parser.add_argument("--draft_model", type=str,
                         help="Draft model path (alternative to --model for draft role)")
-    parser.add_argument("--prompt", type=str,
-                        help="Single prompt text for generation (used if --prompt_text is not provided)")
     parser.add_argument("--prompt_text", type=str,
                         help="Path to a text file containing multiple prompts (one per line) for concurrent/batch decoding.")
     parser.add_argument("--port", type=int, default=50051,
@@ -124,7 +122,15 @@ def main():
         if model_name is None:
             logger.error("Please specify --model for verify_target role")
             return
-        prompt_text = args.prompt or ""
+        if not args.prompt_text:
+            logger.error("--prompt_text must be provided for verify_target role (file with prompt).")
+            return
+        try:
+            with open(args.prompt_text, 'r', encoding='utf-8') as fp:
+                prompt_text = fp.readline().rstrip('\n')
+        except Exception as e:
+            logger.error(f"Failed to read prompt_text file: {e}")
+            return
         res = run_model(
             model_name,
             prompt=prompt_text,
@@ -147,7 +153,15 @@ def main():
         if model_name is None:
             logger.error("Please specify --model for verify_draft role")
             return
-        prompt_text = args.prompt or ""
+        if not args.prompt_text:
+            logger.error("--prompt_text must be provided for verify_draft role (file with prompt).")
+            return
+        try:
+            with open(args.prompt_text, 'r', encoding='utf-8') as fp:
+                prompt_text = fp.readline().rstrip('\n')
+        except Exception as e:
+            logger.error(f"Failed to read prompt_text file: {e}")
+            return
         res = run_model(
             model_name,
             prompt=prompt_text,
@@ -211,22 +225,17 @@ def run_model(
     logger.info(f"{role.capitalize()} model generation completed in {latency:.2f} seconds.")
     logger.info(f"Tokens generated: {tokens_generated}, Throughput: {throughput:.2f} t/s")
     if profile:
-        csv_file = f"performance_{role}_only_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
-        json_file = csv_file.replace(".csv", ".json")
+        csv_file = f"performance_{role}_only.csv"
+        header_needed = not os.path.exists(csv_file)
         try:
-            with open(csv_file, 'w', newline='') as f:
-                f.write("total_latency,tokens_generated,throughput,avg_token_time,token_match_rate\n")
+            with open(csv_file, 'a', newline='') as f:
+                if header_needed:
+                    f.write("total_latency,tokens_generated,throughput,avg_token_time,prompt_text\n")
                 avg_time = (latency / tokens_generated) if tokens_generated > 0 else 0.0
-                f.write(f"{latency:.6f},{tokens_generated},{throughput:.6f},{avg_time:.6f},N/A\n")
-            metrics = {
-                "total_latency": latency,
-                "tokens_generated": tokens_generated,
-                "throughput": throughput,
-                "token_match_rate": None
-            }
-            with open(json_file, 'w') as f:
-                json.dump(metrics, f, indent=2)
-            logger.info(f"Performance metrics saved to {csv_file} and {json_file}")
+                # Escape any internal commas in the prompt to keep CSV shape
+                safe_prompt = prompt.replace(',', ';')
+                f.write(f"{latency:.6f},{tokens_generated},{throughput:.6f},{avg_time:.6f},{safe_prompt}\n")
+            logger.info(f"Performance metrics saved to {csv_file}")
         except Exception as e:
             logger.error(f"Failed to save profiling data: {e}")
 
