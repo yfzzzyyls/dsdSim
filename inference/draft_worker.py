@@ -470,89 +470,75 @@ def run_client(
     channel = grpc.insecure_channel(address)
     stub = inference_pb2_grpc.SpeculativeServiceStub(channel)
 
-    # We'll create a single session_id for each prompt, or we can unify them.
-    # For now, let's do one session per prompt, but handle them in a single pass.
+    # Step 1) Single unified loop: create a session, prime the target, and immediately decode
+    session_ids = []
+    session_prefill = {}
+    final_texts = []
+    tokens_generated = []
+    accepted_counts = []
+    target_counts = []
 
-    # Step 1) StartGeneration for each prompt
-    session_ids = [] # list of session IDs
-    session_prefill = {} # session_id -> time taken for prefill
-    for prompt in prompts: # support multiple prompts
-        logger.info(f"Starting prefilling for prompt: '{prompt}'")
-        sid = _gen_session_id()
-        session_ids.append(sid)
-        time_targetprefill = time.perf_counter()
-        stub.StartGeneration(
-            inference_pb2.StartRequest(
-                session_id=sid,
-                prompt=prompt,
-                max_new_tokens=max_new_tokens,
-                gamma=gamma
-            )
+    logger.info(f"Processing prompt: {prompts[0]}")
+    sid = _gen_session_id()
+    session_ids.append(sid)
+
+    # Prime target session
+    t0 = time.perf_counter()
+    stub.StartGeneration(
+        inference_pb2.StartRequest(
+            session_id=sid,
+            prompt=prompts[0],
+            max_new_tokens=max_new_tokens,
+            gamma=gamma,
         )
-        target_prefill_ms = (time.perf_counter() - time_targetprefill)
-        session_prefill[sid] = target_prefill_ms
+    )
+    session_prefill[sid] = time.perf_counter() - t0
 
-    final_texts = [prompts[i] for i in range(len(prompts))]
-    finished_mask = [False]*len(prompts)
-    tokens_generated = [0]*len(prompts)
-    accepted_counts = [0]*len(prompts)
-    target_counts = [0]*len(prompts)
+    # Decode this prompt immediately
+    start_time_prompt = time.time()
+    gen_text, perf_stats = speculative_decode(
+        draft_model, tokenizer, stub,
+        prompts[0], max_new_tokens, gamma,
+        profile=profile, top_p=top_p, temperature=temperature,
+        session_id=sid
+    )
+    latency_prompt = time.time() - start_time_prompt
 
-    # a loop in Python that calls speculative_decode for each prompt in sequence
-    for i, prompt in enumerate(prompts):
-        logger.info(f"Decoding prompt {i}: {prompt}")
-        start_time_prompt = time.time()
-        gen_text, perf_stats = speculative_decode(
-            draft_model, tokenizer, stub,
-            prompt, max_new_tokens, gamma,
-            profile=profile, top_p=top_p, temperature=temperature,
-            session_id=session_ids[i]
-        )
-        # Calculate per‑prompt metrics
-        latency_prompt = time.time() - start_time_prompt
-        perf_stats["target_prefill_time"] = session_prefill[session_ids[i]]
-        perf_stats["total_time"] = latency_prompt
-        tokens_generated_total = perf_stats.get("tokens_generated", 0)
-        throughput = tokens_generated_total / latency_prompt if latency_prompt>0 else 0.0
-        perf_stats["throughput"] = throughput
-        perf_stats["avg_token_time"] = latency_prompt / tokens_generated_total if tokens_generated_total>0 else 0.0
-        # Prefer explicit counts from speculative_decode
-        accepted = perf_stats.get("accepted_tokens_total", 0)
-        tgt = perf_stats.get("target_tokens_total", 0)
-        gen_tokens = accepted + tgt
+    # Post‑process per‑prompt stats
+    perf_stats["target_prefill_time"] = session_prefill[sid]
+    perf_stats["total_time"] = latency_prompt
+    tokens_total = perf_stats.get("tokens_generated", 0)
+    throughput = tokens_total / latency_prompt if latency_prompt > 0 else 0.0
+    perf_stats["throughput"] = throughput
+    perf_stats["avg_token_time"] = latency_prompt / tokens_total if tokens_total > 0 else 0.0
 
-        # Last‑resort heuristic: count tokens via tokenizer if everything else failed
-        if gen_tokens == 0:
-            gen_tokens = len(tokenizer.encode(gen_text, add_special_tokens=False))
+    accepted = perf_stats.get("accepted_tokens_total", 0)
+    tgt = perf_stats.get("target_tokens_total", 0)
+    gen_tokens = accepted + tgt or len(tokenizer.encode(gen_text, add_special_tokens=False))
 
-        # pretty print match-rate right before the per-prompt summary
-        match_rate_prompt = perf_stats.get("token_match_rate")
-        if match_rate_prompt is not None:
-            logger.info(
-                f"Speculative decoding match rate: {match_rate_prompt:.2%} "
-                f"(Draft accepted: {accepted}, Target generated: {tgt})"
-            )
-
-        throughput_prompt = gen_tokens / latency_prompt if latency_prompt > 0 else 0.0
-
+    match_rate_prompt = perf_stats.get("token_match_rate")
+    if match_rate_prompt is not None:
         logger.info(
-            f"Prompt[{i}] speculative decoding completed in {latency_prompt:.2f}s, "
-            f"tokens generated: {gen_tokens}, throughput: {throughput_prompt:.2f} t/s"
+            f"Speculative decoding match rate: {match_rate_prompt:.2%} "
+            f"(Draft accepted: {accepted}, Target generated: {tgt})"
         )
-        tokens_generated[i] = gen_tokens
 
-        final_texts[i] = prompt + gen_text
-        if perf_stats:
-            accepted_counts[i] = perf_stats.get("accepted_tokens_total", 0)
-            target_counts[i] = perf_stats.get("target_tokens_total", 0)
-            if profile:
-                # Record prompt index so rows can be distinguished, but
-                # append all rows to a single CSV file.
-                perf_stats["prompt_id"] = i
-                save_perf_stats(perf_stats, file_prefix="performance_speculative")
+    throughput_prompt = gen_tokens / latency_prompt if latency_prompt > 0 else 0.0
+    logger.info(
+        f"speculative decoding completed in {latency_prompt:.2f}s, "
+        f"tokens generated: {gen_tokens}, throughput: {throughput_prompt:.2f} t/s"
+    )
 
-    end_time = time.time()
-    total_time = end_time - start_time
+    final_texts.append(prompts[0] + gen_text)
+    tokens_generated.append(gen_tokens)
+    accepted_counts.append(accepted)
+    target_counts.append(tgt)
+
+    if profile:
+        perf_stats["prompt_id"] = 0   # single‑prompt path
+        save_perf_stats(perf_stats, file_prefix="performance_speculative")
+
+    total_time = time.time() - start_time
     logger.info(f"Distributed speculative decode completed in {total_time:.2f}s.")
 
     print("\n=== Final Outputs ===")
