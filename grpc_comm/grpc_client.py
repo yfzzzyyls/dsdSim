@@ -34,30 +34,29 @@ def start_generation_batch(stub, prompt_id_tensor):
     return list(resp.session_ids)
 
 
-# sid_tok_prob_triplets : list[(sid, tok_tensor, prob_tensor)]
-def verify_batch_tokens(stub, sid_tok_prob_triplets):
-    # sid_tok_prob_triplets : list[(sid, tok_tensor, prob_tensor)]
-    seq_msgs = []
-    for sid, tok_t, prob_t in sid_tok_prob_triplets:
-        # tok_t / prob_t are dicts: {'data': flat_list, 'shape':[B, gamma]}
-        seq_msgs.append(
-            inference_pb2.DraftSequence(
-                session_id=sid,
-                draft_tokens=_make_i32(tok_t['data'], tok_t['shape']),
-                draft_probs=_make_f32(prob_t['data'], prob_t['shape']),
-            )
-        )
-    request  = inference_pb2.VerifyBatchRequest(sequences=seq_msgs)
-    response = stub.VerifyBatchTokens(request)
-    results  = []
-    for r in response.results:
-        results.append({
-            "session_id":      r.session_id,
-            "tokens_accepted": r.tokens_accepted,
-            "committed_ids":   list(r.committed_ids.data),
-            "finished":        r.finished,
-        })
-    return results
+def verify_batch_tokens(stub, session_id, tok_tensor, prob_tensor):
+    """
+    Send one DraftSequence that already contains the whole (B, γ) tensors.
+
+    Parameters
+    ----------
+    session_id : int
+        The single batched session-id returned by StartGenerationBatch.
+    tok_tensor / prob_tensor : dict
+        {'data': flat_list, 'shape': [B, γ]}  — output of _tensor_to_flat().
+    Returns
+    -------
+    VerifyResult protobuf message (first entry of VerifyBatchResponse).
+    """
+    seq = inference_pb2.DraftSequence(
+        session_id=session_id,
+        draft_tokens=_make_i32(tok_tensor["data"], tok_tensor["shape"]),
+        draft_probs=_make_f32(prob_tensor["data"], prob_tensor["shape"]),
+    )
+    resp = stub.VerifyBatchTokens(
+        inference_pb2.VerifyBatchRequest(sequences=[seq])
+    )
+    return resp.results[0] if resp.results else None
 
 
 def finalize_batch_tokens(stub, sequences):

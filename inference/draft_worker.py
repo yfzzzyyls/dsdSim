@@ -42,10 +42,9 @@ def _tensor_to_flat(t: torch.Tensor):
 def batched_speculative_decode(
     draft_model, tokenizer, stub, prompts,
     batch_input_ids, max_new_tokens, gamma,
-    *, profile=False, top_p=0.9, temperature=1.0, sid_list=None,
+    *, profile=False, top_p=0.9, temperature=1.0, session_id=None,
 ):
     B, L = batch_input_ids.shape
-    assert sid_list and len(sid_list) == B
 
     # 1) pre-fill
     draft_model.cache_ids = None
@@ -65,50 +64,86 @@ def batched_speculative_decode(
     gamma = max(g for g in valid_g if g <= max(1, gamma))
 
     while not finished.all():
-        # build triplets to verify
-        triplets = []
+        # ------------------------------------------------------------------
+        # 1) Draft proposes up to γ tokens per unfinished row
+        # ------------------------------------------------------------------
+        tok_rows  = []
+        prob_rows = []
         for b in range(B):
             if finished[b]:
-                tok_t  = torch.empty((1,0), dtype=torch.int64)
-                prob_t = torch.empty((1,0), dtype=torch.float32)
-            else:
-                toks, probs = [], []
-                prev = int(last_token[b])
-                for _ in range(gamma):
-                    scratch[0,0] = prev
-                    cache_vec = draft_model.cache_ids[b:b+1] + _
-                    logits,_ = draft_model.forward(scratch, cache_ids=cache_vec)
-                    logits = logits / temperature
-                    p = torch.softmax(logits.float(), dim=-1).squeeze(0)
-                    nid = int(torch.multinomial(p, 1))
-                    toks.append(nid);  probs.append(float(p[nid]))
-                    prev = nid
-                    if eos_tok is not None and nid == eos_tok: break
-                    if tokens_generated[b] + len(toks) >= max_new_tokens: break
-                tok_t  = torch.tensor(toks, dtype=torch.int64).unsqueeze(0)
-                prob_t = torch.tensor(probs,dtype=torch.float32).unsqueeze(0)
-            triplets.append((sid_list[b],
-                             _tensor_to_flat(tok_t),
-                             _tensor_to_flat(prob_t)))
+                tok_rows.append(torch.empty((0,), dtype=torch.int64))
+                prob_rows.append(torch.empty((0,), dtype=torch.float32))
+                continue
 
-        if all(len(t[1]["data"])==0 for t in triplets):
+            toks, probs = [], []
+            prev = int(last_token[b])
+            for _ in range(gamma):
+                scratch[0, 0] = prev
+                cache_vec = draft_model.cache_ids[b:b+1] + _
+                logits, _ = draft_model.forward(scratch, cache_ids=cache_vec)
+                logits = logits / temperature
+                p = torch.softmax(logits.float(), dim=-1).squeeze(0)
+                nid = int(torch.multinomial(p, 1).item())
+                toks.append(nid);  probs.append(float(p[nid]))
+                prev = nid
+                if eos_tok is not None and nid == eos_tok:
+                    break
+                if tokens_generated[b] + len(toks) >= max_new_tokens:
+                    break
+
+            tok_rows.append(torch.tensor(toks, dtype=torch.int64))
+            prob_rows.append(torch.tensor(probs, dtype=torch.float32))
+
+        # ---- exit if nobody produced a token --------------------------------
+        if all(row.numel() == 0 for row in tok_rows):
             break
 
-        results = grpc_client.verify_batch_tokens(stub, triplets)
+        # ------------------------------------------------------------------
+        # 2) Right-pad rows so they stack into (B, γ′) tensors
+        # ------------------------------------------------------------------
+        max_len = max(r.numel() for r in tok_rows)
+        pad_val = 0
+        tok_batch  = torch.full((B, max_len), pad_val, dtype=torch.int64)
+        prob_batch = torch.zeros((B, max_len), dtype=torch.float32)
+        for b in range(B):
+            k = tok_rows[b].numel()
+            if k:
+                tok_batch[b, :k]  = tok_rows[b]
+                prob_batch[b, :k] = prob_rows[b]
 
-        for res in results:
-            idx = sid_list.index(res["session_id"])
-            if finished[idx]: continue
-            commits = res["committed_ids"]
-            if not commits: continue
-            budget = max_new_tokens - tokens_generated[idx]
-            if len(commits) > budget: commits = commits[:budget]
-            out_bufs[idx].extend(commits)
-            tokens_generated[idx] += len(commits)
-            last_token[idx] = commits[-1]
-            draft_model.cache_ids[idx] += len(commits)
-            if eos_tok in commits or tokens_generated[idx] >= max_new_tokens:
-                finished[idx] = True
+        # ------------------------------------------------------------------
+        # 3) Verify whole batch in *one* RPC
+        # ------------------------------------------------------------------
+        result = grpc_client.verify_batch_tokens(
+            stub,
+            session_id,
+            _tensor_to_flat(tok_batch),      # Int32Tensor  (B, γ′)
+            _tensor_to_flat(prob_batch),     # FloatTensor (B, γ′)
+        )
+        # committed_ids is Int32Tensor → reshape to (B, K)
+        commit_t = torch.tensor(result.committed_ids.data,
+                                dtype=torch.int64).view(B, -1)    # (B, K)
+
+        # ------------------------------------------------------------------
+        # 4) Apply commits per row
+        # ------------------------------------------------------------------
+        K = commit_t.shape[1]
+        for b in range(B):
+            commits = [tid for tid in commit_t[b].tolist() if tid != 0]
+            if not commits or finished[b]:
+                continue
+
+            # trim to remaining budget
+            remain = max_new_tokens - tokens_generated[b].item()
+            commits = commits[:remain]
+
+            out_bufs[b].extend(commits)
+            tokens_generated[b] += len(commits)
+            last_token[b] = commits[-1]
+            draft_model.cache_ids[b] += len(commits)
+
+            if eos_tok in commits or tokens_generated[b] >= max_new_tokens:
+                finished[b] = True
 
     return [
         tokenizer.decode(buf, skip_special_tokens=True,
@@ -522,39 +557,56 @@ def run_client(
     # ------------------------------------------------------------------
     B = len(prompts)
     if B > batch_size:
-        logger.error(
-            "Prompt file contains %d lines, which exceeds the compiled "
-            "batch_size=%d.  Either trim the prompt file or re‑compile the "
-            "model with a larger --batch value.",
-            B, batch_size,
+        raise ValueError(
+            f"Prompt file contains {B} lines, which exceeds the compiled "
+            f"batch_size={batch_size}.  Either trim the prompt file or re-compile the "
+            f"model with a larger --batch value."
         )
-        return
+        # logger.error(
+        #     "Prompt file contains %d lines, which exceeds the compiled "
+        #     "batch_size=%d.  Either trim the prompt file or re‑compile the "
+        #     "model with a larger --batch value.",
+        #     B, batch_size,
+        # )
+        # return
 
     # ------------------------------------------------------------------
     # Tokenise all prompts together → (B, L) tensor  (right‑padded)
     # ------------------------------------------------------------------
-    tokenizer_tmp = AutoTokenizer.from_pretrained(
+    tokenizer_converter = AutoTokenizer.from_pretrained(
         target_tokenizer or draft_model_name,
         use_fast=False,
     )
-    batch_tok = tokenizer_tmp(
+
+    # ============================================================
+    # Tokenize all prompts together to get a single batch tensor
+    batch_tok = tokenizer_converter(
         prompts,
         return_tensors="pt",
         padding=True,      # right‑pad to max length across prompts
         truncation=False,  # never truncate – force caller to shorten
     )
     batch_input_ids = batch_tok["input_ids"]      # (B, L)
+    # ============================================================
+
     logger.info(
         "Prepared batch_input_ids tensor with shape %s (B=%d, L=%d)",
         tuple(batch_input_ids.shape),
         batch_input_ids.shape[0],
         batch_input_ids.shape[1],
     )
+
+    # ============================================================
+    # Check if the prompt tensor is empty
     if not prompts:
         logger.error("No valid lines in the prompt file.")
         return
+    # ============================================================
 
     logger.info(f"Loading draft model '{draft_model_name}' (sequence_length={sequence_length}) for speculative decoding...")
+
+    # ============================================================
+    # Load the draft model
     if isinstance(draft_model_name, str):
         # draft_model_name is a path → load the model
         draft_model = load_model(
@@ -571,6 +623,7 @@ def run_client(
         draft_model = draft_model_name
         # try to recover a path for tokenizer fallback
         model_path_str = getattr(getattr(draft_model, "config", None), "_name_or_path", None)
+    # ============================================================
 
     # Decide which tokenizer to load
     if target_tokenizer:
@@ -595,8 +648,7 @@ def run_client(
     # ---------- create batch sessions ----------
     prompt_tensor = _tensor_to_flat(batch_input_ids)
     sid_server = grpc_client.start_generation_batch(stub, prompt_tensor)
-    batch_sid = sid_server[0] if sid_server else _gen_session_id()   # one session for the batch
-    sid_list  = [batch_sid] * B
+    batch_sid  = sid_server[0] if sid_server else _gen_session_id()   # one id for all rows
 
     # ---------- run batched speculative decode ----------
     generated_texts = batched_speculative_decode(
@@ -604,7 +656,7 @@ def run_client(
         prompts, batch_input_ids,
         max_new_tokens, gamma,
         profile=profile, top_p=top_p, temperature=temperature,
-        sid_list=sid_list,
+        session_id=batch_sid,
     )
 
     for i, txt in enumerate(generated_texts):
