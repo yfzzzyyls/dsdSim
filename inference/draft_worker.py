@@ -6,15 +6,358 @@ import json
 import threading
 import uuid
 from datetime import datetime
-
 from grpc_comm import inference_pb2_grpc, inference_pb2, grpc_client
 from inference.model_loader import load_model
-from inference.speculative import speculative_decode
 from transformers import AutoTokenizer
 import torch
+import random
+import collections
+from transformers_neuronx import sampling
+from inference.model_loader import SPEC_LENGTH_BUCKETS
 
 logger = logging.getLogger(__name__)
 
+# Repetition‑penalty strength (0 < α ≤ 1).  Smaller → stronger penalty
+REP_PENALTY = 0.4
+NGRAM_WINDOW = 3    # penalise 1‑ to 3‑gram repeats
+TOP_K = 128
+
+if not logger.hasHandlers():
+    h = logging.StreamHandler()
+    h.setLevel(logging.INFO)
+    fmt = logging.Formatter('%(asctime)s %(levelname)s %(name)s: %(message)s')
+    h.setFormatter(fmt)
+    logger.addHandler(h)
+    logger.setLevel(logging.INFO)
+
+def speculative_decode(
+    draft_model,
+    tokenizer,
+    stub,
+    prompt,
+    max_new_tokens,
+    gamma,
+    profile=False,
+    top_p=0.9,
+    temperature=1.0,
+    session_id=0
+):
+    """
+    Perform probability-based speculative decoding using a draft model and a target model via gRPC,
+    with full rollback of the draft model's past states.
+    Extended to handle a session_id so multiple prompts can run concurrently on the server.
+    """
+    # snap initial γ to the largest compiled bucket ≤ user request
+    # Derive valid gammas and gamma_max from the bucket list
+    valid_gammas = tuple(b - 1 for b in SPEC_LENGTH_BUCKETS if b > 1)
+    gamma_max    = max(valid_gammas)
+    current_gamma = max(g for g in valid_gammas if g <= max(1, gamma))
+    current_temp  = temperature            # draft temperature we can tweak
+    target_accept = 0.5                    # desired per‑loop acceptance rate
+
+    logger.debug(
+        f"[session={session_id}] Starting speculative_decode: "
+        f"prompt='{prompt[:60]}...' max_new_tokens={max_new_tokens} gamma={gamma}"
+    )
+
+    # Initial setup: process prompt through draft model to initialize cache
+    output_tokens = []
+    draft_model.cache_ids = None
+    draft_model._next_pos = 0  # next position index in the KV cache
+
+    # pre-filling: Feed the entire prompt once so the draft model builds its KV cache
+    prompt_ids = tokenizer(prompt, return_tensors='pt').input_ids
+    prev_token_id = int(prompt_ids[0, -1].item()) if prompt_ids.shape[-1] > 0 else tokenizer.bos_token_id
+
+    # --------------------------------------------------------------
+    # Per‑stage timing buckets (all values in seconds)
+    # --------------------------------------------------------------
+    timing = {
+        "draft_prefill_time":       0.0,
+        "draft_generation_time":    0.0,
+        "grpc_roundtrip_time":      0.0,   # pure network + (de)serialisation latency
+        "target_verification_time": 0.0,   # server‑side compute only
+        "sampling_filter_time":     0.0,   # time spent on n‑gram mask + top‑k/p filter
+    }
+    
+    # Feed the prompt so Neuron caches 0…L‑1, then set pointer to NEXT index (=L)
+    if prompt_ids.shape[-1] > 0:
+       # build the KV cache for the prompt
+       time_draftprefill = time.perf_counter()
+       _ = draft_model.forward(input_ids=prompt_ids)          # fills 0…L‑1
+       timing["draft_prefill_time"] += time.perf_counter() - time_draftprefill
+       prompt_len = prompt_ids.shape[-1]
+       # Overwrite cache pointer with a single‑index tensor [L]
+       draft_model.cache_ids = torch.tensor([prompt_len], dtype=torch.int32)
+       draft_model._next_pos = prompt_len
+    else:
+       # no prompt given
+       prompt_len = 0
+       draft_model.cache_ids = torch.tensor([0], dtype=torch.int32)
+       draft_model._next_pos = 0
+
+    tokens_generated = 0
+    # reusable scratch tensor (1,1) for single-token forwards
+    scratch_token = torch.empty((1, 1), dtype=torch.int64)
+    # fixed-size deque for fast repetition penalty history
+    recent_deque  = collections.deque(maxlen=50)
+    finished = False
+    accepted_tokens_total = 0
+    target_tokens_total = 0
+
+    while not finished and tokens_generated < max_new_tokens:
+        # The draft model proposes up to 'gamma' tokens
+        speculative_tokens = []
+        speculative_probs = []
+        # # ---------- just before the debug call, print he actual word generated ----------
+        # token_texts = [tokenizer.decode([tid], clean_up_tokenization_spaces=False)
+        #             for tid in speculative_tokens]
+
+        # past_states = [draft_model.cache_ids]
+        for i in range(current_gamma):
+            scratch_token[0, 0] = prev_token_id
+            next_pos = draft_model._next_pos + i
+            cache_vec = torch.tensor([next_pos], dtype=torch.int32)
+            time_draftgen = time.perf_counter()            
+            logits, _ = draft_model.forward(input_ids=scratch_token, cache_ids=cache_vec)
+            timing["draft_generation_time"] += time.perf_counter() - time_draftgen
+            # logits = logits.float()
+
+            # ---- Our improved numeric stability start ----
+            # Temperature‑scale logits then apply classic nucleus (top‑p) filter
+            time_sample = time.perf_counter()
+            # apply ngram filter
+            masked = sampling.filter_ngrams(
+                NGRAM_WINDOW,
+                torch.tensor(output_tokens + speculative_tokens).unsqueeze(0),
+                logits.unsqueeze(0),    # (1, V) expected
+                next_pos
+            )
+
+            # apply temperature scaling
+            logits = logits / current_temp
+
+            # apply top‑k and top‑p filtering
+            masked, candidate_idx = sampling.top_k_top_p_filtering(
+                logits.unsqueeze(0),             # (1, V) expected
+                top_k=TOP_K,
+                top_p=top_p
+            )
+            timing["sampling_filter_time"] += time.perf_counter() - time_sample
+
+            probs = torch.softmax(masked, dim=-1).squeeze(0)
+            sample_in_topk = torch.multinomial(probs, 1).item()
+            token_id   = int(candidate_idx[0, sample_in_topk])
+            token_prob = float(probs[sample_in_topk])
+ 
+            # store the token and its probability for later verification
+            speculative_tokens.append(token_id)
+            speculative_probs.append(token_prob)
+            
+            prev_token_id = token_id
+            # past_states.append(draft_model.cache_ids + i)   # save pointer to next slot
+            # Stop if end-of-sequence or max_new_tokens reached
+            if tokenizer.eos_token_id is not None and token_id == tokenizer.eos_token_id:
+                finished = True
+                break
+            if tokens_generated + len(speculative_tokens) >= max_new_tokens:
+                break
+ 
+        # # If overshoot
+        # if len(speculative_tokens) > 0 and tokens_generated > max_new_tokens:
+        #     overshoot = tokens_generated - max_new_tokens
+        #     speculative_tokens = speculative_tokens[:-overshoot]
+        #     speculative_probs = speculative_probs[:-overshoot]
+        #     output_tokens = output_tokens[:-overshoot]
+        #     tokens_generated = max_new_tokens
+        #     finished = True
+
+        if not speculative_tokens:
+            break
+
+        # 8) Verify tokens with target model
+        # --------------------------------------------------------------
+        # Fast‑fail if the speculative chunk length is NOT one of the
+        # compiled γ buckets.  We no longer truncate; instead we raise to
+        # surface a configuration / logic error immediately.
+        # --------------------------------------------------------------
+
+        # ==============================================================
+        # if len(speculative_tokens) not in valid_gammas:
+        #     assert len(speculative_tokens) in valid_gammas, (
+        #         f"Speculative chunk length {len(speculative_tokens)} is not "
+        #         f"supported by the compiled target model; valid γ buckets = "
+        #         f"{valid_gammas}"
+        #     )
+        # ============================================================
+
+        # ============================================================
+        # Ensure speculative_probs is the same length as speculative_tokens.
+        # This can become mismatched when we break early from the inner loop
+        # (e.g. EOS or token‑budget exhaustion).  Truncate to the shorter
+        # length so we never advance _next_pos past the compiled context.
+        # ============================================================
+        
+        # # ====================================================================
+        # # --- Verify + commit in one RPC ---
+        # # logger.debug("[session=%s] Proposed tokens: %s", session_id, speculative_tokens)
+        # # --- show draft chunk as words instead of IDs -----------------
+        # token_texts_dbg = [
+        #     tokenizer.decode([tid], clean_up_tokenization_spaces=False)
+        #     for tid in speculative_tokens
+        # ]
+        # logger.debug("[session=%s] draft model proposed: chunk len=%d, proposed tokens (text)=%s, ids=%s, probs=%s", session_id, len(speculative_tokens), token_texts_dbg, speculative_tokens, speculative_probs)
+        # # ====================================================================
+
+
+        # ----- measure RPC round‑trip and split into network vs. verify compute -----
+        time_roundtrip = time.perf_counter()
+        commit_ids, accepted_count, verify_time_ms, target_finished = grpc_client.verify_draft_tokens(
+            stub, speculative_tokens, speculative_probs, session_id=session_id
+        )
+        rpc_roundtrip = time.perf_counter() - time_roundtrip
+
+        verify_sec   = verify_time_ms / 1000.0
+        # Network + (de)serialisation + client/server scheduling
+        network_sec  = max(0.0, rpc_roundtrip - verify_sec)
+
+        timing["grpc_roundtrip_time"]      += network_sec
+        timing["target_verification_time"] += verify_sec
+
+        # ------------------------------------------------------------------
+        # Respect the remaining token budget so we never exceed max_new_tokens.
+        # If the target returned more tokens than we can still emit, truncate
+        # the commit list *before* we touch any state‑tracking counters.
+        # ------------------------------------------------------------------
+        tokens_generated += len(commit_ids)
+        remaining_budget = max_new_tokens - tokens_generated
+        if remaining_budget <= 0:
+            finished = True
+            commit_ids = []
+            break
+        elif len(commit_ids) > remaining_budget:
+            commit_ids = commit_ids[:remaining_budget]
+            # clamp accepted_count as well
+            if accepted_count > len(commit_ids):
+                accepted_count = len(commit_ids)
+
+        # Now that commit_ids is final, update global counters
+        accepted_tokens_total += accepted_count
+        # Track how many tokens were generated by the target model this loop
+        target_tokens_total += max(0, len(commit_ids) - accepted_count)
+
+        # --------------------------------------------------------------
+        # ROLLBACK draft KV pointer to the state *before* the first
+        # rejected token so we don't "leak" unused cache slots.
+        # past_states[0] is the pointer *before* emitting any speculative
+        # token; past_states[k] is after accepting k tokens.
+        # --------------------------------------------------------------
+        # rollback_ptr = past_states[accepted_count].clone()
+        # draft_model.cache_ids = rollback_ptr
+        # draft_model._next_pos = int(rollback_ptr.item())
+
+        # ---------------- Hierarchical KV cache update -----------------
+        # 1) Roll back the cache pointer so the *rejected* draft tokens
+        #    disappear from the device KV.  They occupy the range
+        #       [_next_pos - len(speculative_tokens), _next_pos)
+        #    so we rewind by (len(speculative_tokens) - accepted_count).
+
+
+
+        # 2) Forward **one** bonus token; accepted tokens already occupy 0…A‑1.
+        bonus_id = commit_ids[-1]           # always present
+        scratch_token[0, 0] = bonus_id
+
+        # ============================================================
+        # set bonus id to the next beginning of generating new draft tokens
+        prev_token_id = bonus_id
+        tok = bonus_id
+        # ==============================================================
+        # # 3) Advance pointer past the newly‑written bonus token.
+        # this is used to update the KV cache ptr
+        draft_model._next_pos += (accepted_count + 1)
+        draft_model.cache_ids[0] = draft_model._next_pos
+        # ==============================================================
+
+        # Record every token that will appear in the final text
+        output_tokens.extend(commit_ids)
+        recent_deque.extend(commit_ids)
+        if tokens_generated >= max_new_tokens:
+            finished = True
+            break
+        if tokenizer.eos_token_id is not None and tok == tokenizer.eos_token_id:
+            finished = True
+
+        logger.debug("ACCEPT cnt=%d  committed=%s",
+             accepted_count,
+             speculative_tokens[:accepted_count])
+        # Propagate server‑side finished flag
+        finished = finished or target_finished
+
+        # ---------- adaptive γ and temperature (P‑controller) ----------
+        # if current_gamma > 0:
+        #     loop_accept_rate = accepted_count / current_gamma
+        #     error = target_accept - loop_accept_rate
+
+        #     # PID suggestion
+        #     desired_gamma = int(max(1, min(gamma_max,
+        #                                    current_gamma + 0.5 * error * current_gamma)))
+        #     # snap to nearest compiled bucket _not exceeding_ desired_gamma
+        #     new_gamma = max(g for g in valid_gammas if g <= desired_gamma)
+        #     if new_gamma != current_gamma:
+        #         logger.debug("[session=%s] Adjust γ %d → %d (acc_rate=%.2f, desired=%d)",
+        #                      session_id, current_gamma, new_gamma, loop_accept_rate, desired_gamma)
+        #     current_gamma = new_gamma
+
+        #     new_temp = max(0.3, min(2.0, current_temp * (1 + 0.2 * error)))
+        #     if abs(new_temp - current_temp) > 1e-3:
+        #         logger.debug("[session=%s] Adjust draft temperature %.3f → %.3f",
+        #                      session_id, current_temp, new_temp)
+        #     current_temp = new_temp
+
+        # =======================================================================
+        if target_finished or tokens_generated >= max_new_tokens:
+            finished = True
+
+    # Build final text
+    generated_text = tokenizer.decode(
+            output_tokens[-tokens_generated:],
+            skip_special_tokens=True,               # ← strip EOS / PAD / BOS
+            clean_up_tokenization_spaces=False,
+        ) if output_tokens else ""
+
+    # Performance stats
+    perf_stats = {}
+    # Compute total tokens produced by both draft (accepted) and target
+    total_output_tokens = accepted_tokens_total + target_tokens_total
+    if profile:
+        tokens_generated_total = total_output_tokens
+        perf_stats["tokens_generated"] = tokens_generated_total
+        perf_stats.update({
+            "draft_prefill_time":       timing["draft_prefill_time"],
+            "draft_generation_time":    timing["draft_generation_time"],
+            "grpc_roundtrip_time":      timing["grpc_roundtrip_time"],
+            "target_verification_time": timing["target_verification_time"],
+            "sampling_filter_time":     timing["sampling_filter_time"],
+        })
+
+    if total_output_tokens > 0:
+        match_rate = accepted_tokens_total / total_output_tokens
+        perf_stats["token_match_rate"] = match_rate
+
+    if total_output_tokens > 0:
+        logger.debug(
+            f"Speculative decoding match rate: {match_rate:.2%} "
+            f"(Draft accepted: {accepted_tokens_total}, Target generated: {target_tokens_total})"
+        )
+
+    logger.debug(
+        f"[session={session_id}] Finished: generated_text='{generated_text[:120]}...'"
+    )
+    # Make these counters available to callers even when profiling is off
+    perf_stats["accepted_tokens_total"] = accepted_tokens_total
+    perf_stats["target_tokens_total"] = target_tokens_total
+    return generated_text, perf_stats
 
 def save_perf_stats(perf_stats: dict, file_prefix: str):
     """
