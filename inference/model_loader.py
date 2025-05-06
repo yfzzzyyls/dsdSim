@@ -27,7 +27,6 @@ class NeuronHFAdapterWrap(torch.nn.Module):
         super().__init__()
         self.adapter = adapter
         self.cache_ids = None  # Initialize KV cache pointer storage
-        self._next_pos = 0  # next position index in the KV cache
         self.config = adapter.config
 
     # ------------------------------------------------------------------  

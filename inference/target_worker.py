@@ -1,3 +1,7 @@
+#
+# NOTE: If you update grpc_comm/inference.proto, re‑run:
+#   python -m grpc_tools.protoc -Igrpc_comm --python_out=grpc_comm --grpc_python_out=grpc_comm grpc_comm/inference.proto
+
 import logging
 import torch
 from concurrent import futures
@@ -91,9 +95,6 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
 
     def _sync_kv_pointer(self, sess: TargetSession):
         self.model.cache_ids = sess.cache_ids.clone()
-        # keep wrapper pointer at *max* position across batch
-        self.model._next_pos = int(sess.cache_ids.max().item())
-        # ---- sanity check ----
         assert torch.equal(self.model.cache_ids, sess.cache_ids), \
             "Target KV cache_ids desynchronised after sync"
 
@@ -113,12 +114,25 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
 
             # Prime Neuron KV
             self.model.cache_ids = None
-            self.model._next_pos = 0
-            if L > 0:
-                _ = self.model.forward(prompt_ids)
-            self.model.cache_ids = torch.tensor([L] * B, dtype=torch.int32)
-            self.model._next_pos = L
-            sess.cache_ids = self.model.cache_ids.clone()
+            # ==========================
+            # L must be > 0 for forward() to work
+            # Do not support L = 0 for now
+            # ==========================
+            assert (prompt_ids.shape[1] > 0, "Prompt length must be > 0")
+            _ = self.model.forward(prompt_ids)
+            # --------------------------------------------------------------
+            # Set `cache_ids` to the TRUE (unpadded) length of each row so
+            # the pointer always indicates the *next* free KV slot.
+            # --------------------------------------------------------------
+            # If the client supplied true lengths, respect them
+            if request.HasField("prompt_lens") and request.prompt_lens.data:
+                true_len = _tensor_i32(request.prompt_lens)  # (B,)
+            else:
+                pad_id = self.tokenizer.pad_token_id or self.tokenizer.eos_token_id
+                true_len = (prompt_ids != pad_id).sum(dim=1, dtype=torch.int32)
+
+            self.model.cache_ids = true_len.clone()   # authoritative per-row pointer
+            sess.cache_ids       = true_len.clone()
 
         # Return the single session-id that represents the whole batch
         return inference_pb2.StartBatchResponse(session_ids=[session_id])
@@ -147,8 +161,8 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
 
             # --- MANUALLY align wrapper pointer with the prompt length ---
             next_pos = current_ids.shape[1]                       # L
-            self.model._next_pos = next_pos
             self.model.cache_ids = torch.tensor([next_pos], dtype=torch.int32)
+            # _next_pos line removed
 
             # record in session
             self.sessions[session_id].cache_ids = self.model.cache_ids.clone()
@@ -183,7 +197,6 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
         # Advance pointers per row
         sess.cache_ids += lengths
         self.model.cache_ids = sess.cache_ids.clone()
-        self.model._next_pos = int(sess.cache_ids.max().item())
 
         # Append to current_ids
         sess.current_ids = torch.cat([sess.current_ids, padded], dim=1)

@@ -113,8 +113,12 @@ message GenerateResponse {
 // ------------------------------------------------------------------
 // Batch‑oriented start: send B prompts and get back B session IDs.
 // ------------------------------------------------------------------
+// ------------------------------------------------------------------
+// Batch‑oriented start: send B prompts (padded) and their true lengths
+// ------------------------------------------------------------------
 message StartBatchRequest {
-  Int32Tensor prompt_ids = 1;   // shape = [B, L]
+  Int32Tensor prompt_ids  = 1;   // shape = [B, L]  right‑padded
+  Int32Tensor prompt_lens = 2;   // shape = [B]     true lengths
 }
 
 message StartBatchResponse {

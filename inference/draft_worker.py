@@ -645,10 +645,17 @@ def run_client(
     channel = grpc.insecure_channel(address)
     stub = inference_pb2_grpc.SpeculativeServiceStub(channel)
 
+    # ============================================================
     # ---------- create batch sessions ----------
     prompt_tensor = _tensor_to_flat(batch_input_ids)
     sid_server = grpc_client.start_generation_batch(stub, prompt_tensor)
-    batch_sid  = sid_server[0] if sid_server else _gen_session_id()   # one id for all rows
+    # The server MUST return exactly one session‑id for the whole batch.
+    if not sid_server or len(sid_server) == 0:
+        raise RuntimeError("Target server returned no session_id for StartGenerationBatch()")
+
+    # for a single-session batch the server sends exactly one ID, so the list always has length 1.
+    batch_sid = sid_server[0]   # single authoritative session_id
+    # ============================================================
 
     # ---------- run batched speculative decode ----------
     generated_texts = batched_speculative_decode(
