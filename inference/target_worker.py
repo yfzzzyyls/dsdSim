@@ -394,3 +394,24 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
                 verify_time_ms=verify_time_ms,
                 finished=sess.finished,
             )
+        
+
+def run_server(model_path, port=50051, sequence_length=128,
+               spec_length=None, profile=False,
+               temperature: float = 1.0, top_p: float = 0.9):
+    logging.basicConfig(level=logging.INFO)
+    logger.info(f"Initializing target server with model: {model_path}")
+    server = grpc.server(futures.ThreadPoolExecutor(max_workers=16))
+    servicer = SpeculativeServiceServicer(
+        model_path,
+        sequence_length=sequence_length,
+        spec_length=spec_length,
+        temperature=temperature,
+        top_p=top_p,
+    )
+    inference_pb2_grpc.add_SpeculativeServiceServicer_to_server(servicer, server)
+    server_address = f"[::]:{port}"
+    logger.info(f"Target server starting on {server_address}")
+    server.add_insecure_port(server_address)
+    server.start()
+    server.wait_for_termination()
