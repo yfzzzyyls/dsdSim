@@ -30,6 +30,93 @@ if not logger.hasHandlers():
     logger.addHandler(h)
     logger.setLevel(logging.INFO)
 
+# ---------------------------------------------------------------------------
+# Helper: flatten tensors for gRPC payloads
+# ---------------------------------------------------------------------------
+def _tensor_to_flat(t: torch.Tensor):
+    return {"data": t.flatten().tolist(), "shape": list(t.shape)}
+
+# ---------------------------------------------------------------------------
+# Batched speculative decoding (B prompts at once)
+# ---------------------------------------------------------------------------
+def batched_speculative_decode(
+    draft_model, tokenizer, stub, prompts,
+    batch_input_ids, max_new_tokens, gamma,
+    *, profile=False, top_p=0.9, temperature=1.0, sid_list=None,
+):
+    B, L = batch_input_ids.shape
+    assert sid_list and len(sid_list) == B
+
+    # 1) pre-fill
+    draft_model.cache_ids = None
+    draft_model._next_pos = 0
+    _ = draft_model.forward(batch_input_ids)
+    draft_model.cache_ids = torch.tensor([L]*B, dtype=torch.int32)
+    draft_model._next_pos = L
+
+    eos_tok = tokenizer.eos_token_id
+    finished = torch.zeros(B, dtype=torch.bool)
+    out_bufs = [[] for _ in range(B)]
+    tokens_generated = torch.zeros(B, dtype=torch.int32)
+    last_token = batch_input_ids[:, -1].clone()
+
+    scratch = torch.empty((1,1), dtype=torch.int64)
+    valid_g = [b-1 for b in SPEC_LENGTH_BUCKETS if b > 1]
+    gamma = max(g for g in valid_g if g <= max(1, gamma))
+
+    while not finished.all():
+        # build triplets to verify
+        triplets = []
+        for b in range(B):
+            if finished[b]:
+                tok_t  = torch.empty((1,0), dtype=torch.int64)
+                prob_t = torch.empty((1,0), dtype=torch.float32)
+            else:
+                toks, probs = [], []
+                prev = int(last_token[b])
+                for _ in range(gamma):
+                    scratch[0,0] = prev
+                    cache_vec = draft_model.cache_ids[b:b+1] + _
+                    logits,_ = draft_model.forward(scratch, cache_ids=cache_vec)
+                    logits = logits / temperature
+                    p = torch.softmax(logits.float(), dim=-1).squeeze(0)
+                    nid = int(torch.multinomial(p, 1))
+                    toks.append(nid);  probs.append(float(p[nid]))
+                    prev = nid
+                    if eos_tok is not None and nid == eos_tok: break
+                    if tokens_generated[b] + len(toks) >= max_new_tokens: break
+                tok_t  = torch.tensor(toks, dtype=torch.int64).unsqueeze(0)
+                prob_t = torch.tensor(probs,dtype=torch.float32).unsqueeze(0)
+            triplets.append((sid_list[b],
+                             _tensor_to_flat(tok_t),
+                             _tensor_to_flat(prob_t)))
+
+        if all(len(t[1]["data"])==0 for t in triplets):
+            break
+
+        results = grpc_client.verify_batch_tokens(stub, triplets)
+
+        for res in results:
+            idx = sid_list.index(res["session_id"])
+            if finished[idx]: continue
+            commits = res["committed_ids"]
+            if not commits: continue
+            budget = max_new_tokens - tokens_generated[idx]
+            if len(commits) > budget: commits = commits[:budget]
+            out_bufs[idx].extend(commits)
+            tokens_generated[idx] += len(commits)
+            last_token[idx] = commits[-1]
+            draft_model.cache_ids[idx] += len(commits)
+            if eos_tok in commits or tokens_generated[idx] >= max_new_tokens:
+                finished[idx] = True
+
+    return [
+        tokenizer.decode(buf, skip_special_tokens=True,
+                         clean_up_tokenization_spaces=False)
+        for buf in out_bufs
+    ]
+
+
 def speculative_decode(
     draft_model,
     tokenizer,
@@ -430,6 +517,39 @@ def run_client(
         return
     with open(prompt_text_file, 'r', encoding='utf-8') as f:
         prompts = [line.strip() for line in f if line.strip()]
+    # ------------------------------------------------------------------
+    # Batch‑size guardrail: ensure #prompts ≤ compiled batch_size
+    # ------------------------------------------------------------------
+    B = len(prompts)
+    if B > batch_size:
+        logger.error(
+            "Prompt file contains %d lines, which exceeds the compiled "
+            "batch_size=%d.  Either trim the prompt file or re‑compile the "
+            "model with a larger --batch value.",
+            B, batch_size,
+        )
+        return
+
+    # ------------------------------------------------------------------
+    # Tokenise all prompts together → (B, L) tensor  (right‑padded)
+    # ------------------------------------------------------------------
+    tokenizer_tmp = AutoTokenizer.from_pretrained(
+        target_tokenizer or draft_model_name,
+        use_fast=False,
+    )
+    batch_tok = tokenizer_tmp(
+        prompts,
+        return_tensors="pt",
+        padding=True,      # right‑pad to max length across prompts
+        truncation=False,  # never truncate – force caller to shorten
+    )
+    batch_input_ids = batch_tok["input_ids"]      # (B, L)
+    logger.info(
+        "Prepared batch_input_ids tensor with shape %s (B=%d, L=%d)",
+        tuple(batch_input_ids.shape),
+        batch_input_ids.shape[0],
+        batch_input_ids.shape[1],
+    )
     if not prompts:
         logger.error("No valid lines in the prompt file.")
         return
@@ -472,79 +592,29 @@ def run_client(
     channel = grpc.insecure_channel(address)
     stub = inference_pb2_grpc.SpeculativeServiceStub(channel)
 
-    # Step 1) Single unified loop: create a session, prime the target, and immediately decode
-    session_ids = []
-    session_prefill = {}
-    final_texts = []
-    tokens_generated = []
-    accepted_counts = []
-    target_counts = []
+    # ---------- create batch sessions ----------
+    prompt_tensor = _tensor_to_flat(batch_input_ids)
+    sid_server = grpc_client.start_generation_batch(stub, prompt_tensor)
+    batch_sid = sid_server[0] if sid_server else _gen_session_id()   # one session for the batch
+    sid_list  = [batch_sid] * B
 
-    logger.info(f"Processing prompt: {prompts[0]}")
-    sid = _gen_session_id()
-    session_ids.append(sid)
-
-    # Prime target session
-    t0 = time.perf_counter()
-    stub.StartGeneration(
-        inference_pb2.StartRequest(
-            session_id=sid,
-            prompt=prompts[0],
-            max_new_tokens=max_new_tokens,
-            gamma=gamma,
-        )
-    )
-    session_prefill[sid] = time.perf_counter() - t0
-
-    # Decode this prompt immediately
-    start_time_prompt = time.time()
-    gen_text, perf_stats = speculative_decode(
+    # ---------- run batched speculative decode ----------
+    generated_texts = batched_speculative_decode(
         draft_model, tokenizer, stub,
-        prompts[0], max_new_tokens, gamma,
+        prompts, batch_input_ids,
+        max_new_tokens, gamma,
         profile=profile, top_p=top_p, temperature=temperature,
-        session_id=sid
-    )
-    latency_prompt = time.time() - start_time_prompt
-
-    # Post‑process per‑prompt stats
-    perf_stats["target_prefill_time"] = session_prefill[sid]
-    perf_stats["total_time"] = latency_prompt
-    tokens_total = perf_stats.get("tokens_generated", 0)
-    throughput = tokens_total / latency_prompt if latency_prompt > 0 else 0.0
-    perf_stats["throughput"] = throughput
-    perf_stats["avg_token_time"] = latency_prompt / tokens_total if tokens_total > 0 else 0.0
-
-    accepted = perf_stats.get("accepted_tokens_total", 0)
-    tgt = perf_stats.get("target_tokens_total", 0)
-    gen_tokens = accepted + tgt or len(tokenizer.encode(gen_text, add_special_tokens=False))
-
-    match_rate_prompt = perf_stats.get("token_match_rate")
-    if match_rate_prompt is not None:
-        logger.info(
-            f"Speculative decoding match rate: {match_rate_prompt:.2%} "
-            f"(Draft accepted: {accepted}, Target generated: {tgt})"
-        )
-
-    throughput_prompt = gen_tokens / latency_prompt if latency_prompt > 0 else 0.0
-    logger.info(
-        f"speculative decoding completed in {latency_prompt:.2f}s, "
-        f"tokens generated: {gen_tokens}, throughput: {throughput_prompt:.2f} t/s"
+        sid_list=sid_list,
     )
 
-    final_texts.append(prompts[0] + gen_text)
-    tokens_generated.append(gen_tokens)
-    accepted_counts.append(accepted)
-    target_counts.append(tgt)
-
-    if profile:
-        perf_stats["prompt_id"] = 0   # single‑prompt path
-        save_perf_stats(perf_stats, file_prefix="performance_speculative")
+    for i, txt in enumerate(generated_texts):
+        print(f"\n=== Output [{i}] ===\n{prompts[i]}{txt}\n")
 
     total_time = time.time() - start_time
     logger.info(f"Distributed speculative decode completed in {total_time:.2f}s.")
 
     print("\n=== Final Outputs ===")
-    for i, text in enumerate(final_texts):
+    for i, text in enumerate(generated_texts):
         print(f"[Prompt {i} Output]:\n{text}\n")
 
 def _gen_session_id():

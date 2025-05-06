@@ -35,6 +35,11 @@ class SpeculativeServiceStub(object):
         Args:
             channel: A grpc.Channel.
         """
+        self.StartGenerationBatch = channel.unary_unary(
+                '/specdecode.SpeculativeService/StartGenerationBatch',
+                request_serializer=inference__pb2.StartBatchRequest.SerializeToString,
+                response_deserializer=inference__pb2.StartBatchResponse.FromString,
+                _registered_method=True)
         self.StartGeneration = channel.unary_unary(
                 '/specdecode.SpeculativeService/StartGeneration',
                 request_serializer=inference__pb2.StartRequest.SerializeToString,
@@ -70,6 +75,12 @@ class SpeculativeServiceStub(object):
 class SpeculativeServiceServicer(object):
     """Speculative Decoding gRPC Service definition
     """
+
+    def StartGenerationBatch(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
 
     def StartGeneration(self, request, context):
         """Missing associated documentation comment in .proto file."""
@@ -113,6 +124,11 @@ class SpeculativeServiceServicer(object):
 
 def add_SpeculativeServiceServicer_to_server(servicer, server):
     rpc_method_handlers = {
+            'StartGenerationBatch': grpc.unary_unary_rpc_method_handler(
+                    servicer.StartGenerationBatch,
+                    request_deserializer=inference__pb2.StartBatchRequest.FromString,
+                    response_serializer=inference__pb2.StartBatchResponse.SerializeToString,
+            ),
             'StartGeneration': grpc.unary_unary_rpc_method_handler(
                     servicer.StartGeneration,
                     request_deserializer=inference__pb2.StartRequest.FromString,
@@ -154,6 +170,33 @@ def add_SpeculativeServiceServicer_to_server(servicer, server):
 class SpeculativeService(object):
     """Speculative Decoding gRPC Service definition
     """
+
+    @staticmethod
+    def StartGenerationBatch(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/specdecode.SpeculativeService/StartGenerationBatch',
+            inference__pb2.StartBatchRequest.SerializeToString,
+            inference__pb2.StartBatchResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
 
     @staticmethod
     def StartGeneration(request,

@@ -20,8 +20,8 @@ logger = logging.getLogger(__name__)
 
 class NeuronHFAdapterWrap(torch.nn.Module):
     """
-    Thin wrapper so .forward accepts input_ids, cache_ids=None
-    and returns (logits, cache_ids) packaged as CausalLMOutputWithPast.
+    Thin wrapper so .forward accepts batched input_ids of shape (B, L)
+    and **retains** batch/length dimensions in the returned logits.
     """
     def __init__(self, adapter):
         super().__init__()
@@ -79,28 +79,42 @@ class NeuronHFAdapterWrap(torch.nn.Module):
         """
         Thin pass‑through to the underlying Neuron adapter.
 
-        All KV‑cache management (cache_ids and next_pos) is handled by the
-        caller.  This wrapper simply forwards the tensors and returns the
-        logits for the last token plus the same `cache_ids` object so
-        existing call‑sites that expect `(logits, pos_tensor)` keep working.
-        """
-        out = self.adapter(input_ids=input_ids,
-                           cache_ids=cache_ids,
-                           return_dict=False,
-                           **kwargs)
+        Parameters
+        ----------
+        input_ids : LongTensor
+            Shape (B, L) where B is batch and L is token‑count.
+        cache_ids : IntTensor or None
+            KV‑cache pointer vector of shape (B,) indicating current
+            sequence lengths on device.
 
-        # Extract logits tensor
+        Returns
+        -------
+        logits : FloatTensor
+            • Shape (B, V) if L == 1  (one‑token forward)  
+            • Shape (B, L, V) for multi‑token calls  
+            where V is vocab size.
+        cache_ids : same object that was passed in (for compatibility)
+        """
+        out = self.adapter(
+            input_ids=input_ids,
+            cache_ids=cache_ids,
+            return_dict=False,
+            **kwargs,
+        )
+
+        # ----------------------------------------------
+        # Extract logits tensor from various return types
+        # ----------------------------------------------
         if isinstance(out, (tuple, list)):
             logits = out[0]
         else:
             logits = out.logits if hasattr(out, "logits") else out
 
-        # Reduce shape to (V)
-        if logits.dim() == 3:       # (B, L, V)
-            logits = logits[0, -1, :]
-        elif logits.dim() == 2:     # (B, V)
-            logits = logits[0]
-
+        # ------------------------------------------------------------------
+        # IMPORTANT CHANGE: **do NOT squeeze batch / length dims**.
+        # Leave logits as‑is so downstream code can handle batched tensors:
+        #   (B, L, V)  or  (B, V)  depending on input shape.
+        # ------------------------------------------------------------------
         return logits, cache_ids
 
     # ------------------------------------------------------------------

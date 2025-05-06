@@ -3,6 +3,21 @@ option py_generic_services = false;
 
 package specdecode;
 
+// ------------------------------------------------------------------
+// Generic N‑D tensor containers for int32 and float32 values.
+// `data` is a flat row‑major vector; `shape` describes dimensions.
+// Example: a (B, L) tensor has data.size() == B*L and shape = [B, L].
+// ------------------------------------------------------------------
+message Int32Tensor {
+  repeated int32  data  = 1;
+  repeated uint32 shape = 2;
+}
+
+message FloatTensor {
+  repeated float  data  = 1;
+  repeated uint32 shape = 2;
+}
+
 // A new StartRequest for multi-sequence batch is not required.
 // We keep the single StartRequest for single-session usage.
 message StartRequest {
@@ -17,9 +32,9 @@ message StartResponse {
 }
 
 message DraftSequence {
-  uint64 session_id = 1;
-  repeated int32  draft_tokens = 2;
-  repeated float  draft_probs  = 3;   // <<< NEW  proposal probs q(d_i|ctx)
+  uint64      session_id  = 1;
+  Int32Tensor draft_tokens = 2;   // shape = [γ] or [B, γ] if future batched
+  FloatTensor draft_probs  = 3;   // same shape as draft_tokens
 }
 
 message VerifyBatchRequest {
@@ -27,17 +42,16 @@ message VerifyBatchRequest {
 }
 
 message VerifyRequest {
-  uint64 session_id   = 1;
-  repeated int32 draft_tokens = 2;
-  repeated float draft_probs  = 3;    // <<< NEW
+  uint64      session_id  = 1;
+  Int32Tensor draft_tokens = 2;   // shape = [B, γ]
+  FloatTensor draft_probs  = 3;   // same shape
 }
 
-
 message VerifyResult {
-  uint64 session_id     = 1;
-  uint32 tokens_accepted = 2;
-  int32  target_token    = 3;
-  bool   finished        = 4;
+  uint64      session_id      = 1;
+  uint32      tokens_accepted = 2;   // accepted draft count
+  Int32Tensor committed_ids   = 3;   // committed draft + bonus (shape = [≤γ+1])
+  bool        finished        = 4;
 }
 
 message VerifyBatchResponse {
@@ -46,8 +60,8 @@ message VerifyBatchResponse {
 
 // For finalizing tokens on target side after acceptance.
 message FinalizeSequence {
-  uint64 session_id = 1;        // same session
-  repeated int32 tokens = 2;    // tokens accepted or forced by target
+  uint64      session_id = 1;
+  Int32Tensor tokens     = 2;   // shape = [K] committed tokens
 }
 
 message FinalizeBatchRequest {
@@ -66,7 +80,6 @@ message FinalizeBatchResponse {
 // The older single-sequence definitions are left for backward compatibility.
 // However, we can keep them or remove them if you prefer. For a safe drop-in,
 // we keep them, but the server and client can choose which to call.
-
 
 message VerifyResponse {
   // Tokens that actually became part of the sequence
@@ -97,8 +110,20 @@ message GenerateResponse {
   string output_text = 1;
 }
 
+// ------------------------------------------------------------------
+// Batch‑oriented start: send B prompts and get back B session IDs.
+// ------------------------------------------------------------------
+message StartBatchRequest {
+  Int32Tensor prompt_ids = 1;   // shape = [B, L]
+}
+
+message StartBatchResponse {
+  repeated uint64 session_ids = 1;  // size == B
+}
+
 // Speculative Decoding gRPC Service definition
 service SpeculativeService {
+  rpc StartGenerationBatch(StartBatchRequest) returns (StartBatchResponse);
   rpc StartGeneration(StartRequest) returns (StartResponse);
 
   // BATCH calls
