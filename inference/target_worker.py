@@ -32,9 +32,13 @@ class TargetSession:
         self.pending_logits = None
 
 class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
-    def __init__(self, model_path, sequence_length=128, spec_length=None, temperature: float = 1.0, top_p: float = 0.9):
-        self.model = model_loader.load_target_model(model_path,
-                                            sequence_length=sequence_length)
+    def __init__(self, model_path, sequence_length=128, spec_length=None,
+                 batch_size: int = 1, temperature: float = 1.0, top_p: float = 0.9):
+        self.model = model_loader.load_target_model(
+            model_path,
+            sequence_length=sequence_length,
+            batch_size=batch_size,
+        )
         self.temperature = temperature
         self.top_p = top_p
         self.tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=False)
@@ -543,7 +547,8 @@ def _extract_logits_all(outputs):
 
 def run_server(model_path, port=50051, sequence_length=128,
                spec_length=None, profile=False,
-               temperature: float = 1.0, top_p: float = 0.9):
+               temperature: float = 1.0, top_p: float = 0.9,
+               batch_size: int = 1):
     logging.basicConfig(level=logging.INFO)
     logger.info(f"Initializing target server with model: {model_path}")
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=16))
@@ -551,6 +556,7 @@ def run_server(model_path, port=50051, sequence_length=128,
         model_path,
         sequence_length=sequence_length,
         spec_length=spec_length,
+        batch_size=batch_size,
         temperature=temperature,
         top_p=top_p,
     )

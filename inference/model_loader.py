@@ -136,15 +136,21 @@ class NeuronHFAdapterWrap(torch.nn.Module):
 # Default sequence length (can be overridden by function arguments)
 DEFAULT_SEQUENCE_LENGTH = 128
 
-def load_model(model_path: str, sequence_length: int = DEFAULT_SEQUENCE_LENGTH, spec_length: int = None):
+def load_model(model_path: str,
+               sequence_length: int = DEFAULT_SEQUENCE_LENGTH,
+               spec_length: int | None = None,
+               batch_size: int = 1):
     """
     Load or compile a model for inference.
     """
     logger.info(f"Attempting to download/compile from source.")
-    model = compile_model(model_path, sequence_length=sequence_length, spec_length=spec_length)
+    model = compile_model(model_path, sequence_length=sequence_length, spec_length=spec_length, batch_size=batch_size)
     return model
 
-def compile_model(model_path: str, sequence_length: int = DEFAULT_SEQUENCE_LENGTH, spec_length: int = None):
+def compile_model(model_path: str,
+                  sequence_length: int = DEFAULT_SEQUENCE_LENGTH,
+                  spec_length: int | None = None,
+                  batch_size: int = 1):
     """
     Compile a model for AWS Neuron. Loads the model (from HF Hub or local checkpoint),
     compiles it to a TorchScript that can run on NeuronCores, and saves the compiled model
@@ -169,7 +175,7 @@ def compile_model(model_path: str, sequence_length: int = DEFAULT_SEQUENCE_LENGT
         logger.info(f"Compiling model using optimized LLaMA for Neuron ...")
         model = LlamaForSampling.from_pretrained(
             model_path,
-            batch_size=1,
+            batch_size=batch_size,
             amp='bf16',
             n_positions=sequence_length,
             context_length_estimate=sequence_length,
@@ -248,7 +254,8 @@ def compile_model(model_path: str, sequence_length: int = DEFAULT_SEQUENCE_LENGT
 
 def compile_target_model(model_path: str,
                          sequence_length: int = DEFAULT_SEQUENCE_LENGTH,
-                         spec_buckets: list[int] | None = None):
+                         spec_buckets: list[int] | None = None,
+                         batch_size: int = 1):
     """
     Compile the *target* model.  Differs from `compile_model` (used for
     the draft model) in that we always expose **all** logits for the
@@ -267,7 +274,7 @@ def compile_target_model(model_path: str,
                           cast_logits_dtype="bfloat16")   # <- enables safe cast
     model = LlamaForSampling.from_pretrained(
         model_path,
-        batch_size            = 1,
+        batch_size            = batch_size,
         amp                   = "bf16",
         n_positions           = sequence_length,
         context_length_estimate = sequence_length,
@@ -311,9 +318,11 @@ def compile_target_model(model_path: str,
 
 
 def load_target_model(model_path: str,
-                      sequence_length: int = DEFAULT_SEQUENCE_LENGTH):
+                      sequence_length: int = DEFAULT_SEQUENCE_LENGTH,
+                      batch_size: int = 1):
     """
     Convenience wrapper the *target* side should call instead of `load_model`.
     """
     return compile_target_model(model_path,
-                                sequence_length=sequence_length)
+                                sequence_length=sequence_length,
+                                batch_size=batch_size)

@@ -422,7 +422,8 @@ def run_client(
     gamma: int = 4,
     profile: bool = False,
     top_p: float = 0.9,
-    temperature: float = 1.0
+    temperature: float = 1.0,
+    batch_size: int = 1,
 ):
     if not os.path.exists(prompt_text_file):
         logger.error(f"Prompt text file not found: {prompt_text_file}")
@@ -439,7 +440,8 @@ def run_client(
         draft_model = load_model(
             draft_model_name,
             sequence_length=sequence_length,
-            spec_length=gamma
+            spec_length=gamma,
+            batch_size=batch_size
         )
         model_path_str = draft_model_name
     else:

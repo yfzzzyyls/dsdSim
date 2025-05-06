@@ -57,6 +57,8 @@ def main():
                         help="Top-p for draft sampling (default 0.9)")
     parser.add_argument("--temperature", type=float, default=1.0,
                         help="Temperature for draft sampling (default 1.0)")
+    parser.add_argument("--batch", type=int, default=1,
+                        help="Batch size used when compiling models (default: 1)")
     parser.add_argument("--debug", action="store_true",
                         help="Enable verbose DEBUG logging (prints logger.debug lines)")
     args = parser.parse_args()
@@ -87,6 +89,7 @@ def main():
             profile=args.profile,
             temperature=args.temperature,
             top_p=args.top_p,
+            batch_size=args.batch,
         )
 
     elif args.role == "draft":
@@ -111,7 +114,8 @@ def main():
                 gamma=args.gamma,
                 profile=args.profile,
                 top_p=args.top_p,
-                temperature=args.temperature
+                temperature=args.temperature,
+                batch_size=args.batch,
             )
         else:
             logger.error("No prompt text .txt file provided. Use --verify_target to run draft model independently.")
@@ -140,6 +144,7 @@ def main():
             profile=args.profile,
             temperature=args.temperature,
             top_p=args.top_p,
+            batch_size=args.batch,
         )
         if isinstance(res, tuple) and len(res) == 2:
             output_text, perf_stats = res
@@ -167,7 +172,10 @@ def main():
             prompt=prompt_text,
             max_tokens=args.max_new_tokens,
             sequence_length=args.sequence_length,
-            role="draft", profile=args.profile)
+            role="draft",
+            profile=args.profile,
+            batch_size=args.batch,
+        )
         if isinstance(res, tuple) and len(res) == 2:
             output_text, perf_stats = res
         else:
@@ -187,9 +195,10 @@ def run_model(
     profile: bool = False,
     temperature: float = 1.0,
     top_p: float = 0.9,
+    batch_size: int = 1,
 ):
     logger.info(f"Loading {role} model '{model_name}' for standalone generation (sequence_length={sequence_length})...")
-    HFmodel = load_model(model_name, sequence_length=sequence_length)
+    HFmodel = load_model(model_name, sequence_length=sequence_length, batch_size=batch_size)
     tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=False)
     if HFmodel is None:
         logger.error("Failed to load the model for verification.")
@@ -199,7 +208,6 @@ def run_model(
         return
 
     logger.info(f"Starting generation for prompt: {prompt!r}")
-
 
     input_ids = tokenizer(prompt, return_tensors='pt').input_ids
     start = time.time()
