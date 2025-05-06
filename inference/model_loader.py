@@ -181,6 +181,8 @@ def compile_model(model_path: str, sequence_length: int = DEFAULT_SEQUENCE_LENGT
             torchscript=True,
             use_cache=True,
             trust_remote_code=True,
+            fuse_qkv=True,
+            attention_layout="BSH"
         )
         model.to_neuron()
         # ------------------------------------------------------------------
@@ -277,11 +279,13 @@ def compile_target_model(model_path: str,
         tp_degree             = tp_degree,
         on_device_generation  = False,        # we need raw logits on host
         return_all_logits     = False,         # **key line – full distributions**
-        return_all_outputs    = True,   #  ← add this
+        return_all_outputs    = True,
         return_dict           = True,
         torchscript           = True,
         use_cache             = True,
         trust_remote_code     = True,
+        fuse_qkv              = True,
+        attention_layout      = "BSH",
     )
     model.enable_speculative_decoder(spec_buckets)
     model.to_neuron()
