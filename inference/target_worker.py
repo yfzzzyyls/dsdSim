@@ -323,8 +323,8 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
             device = tgt_row.device
 
             q_draft  = draft_prob_batch.to(device)             # (B, γ)
-            idx_b    = torch.arange(B, device=device).unsqueeze(1).repeat(1, gamma)
-            idx_g    = torch.arange(gamma, device=device)
+            idx_b    = torch.arange(B, device=device).unsqueeze(1).repeat(1, gamma) # (B, γ)
+            idx_g = torch.arange(gamma, device=device).unsqueeze(0).repeat(B, 1)  # (B, γ)
             p_tgt    = tgt_row[idx_b, idx_g, draft_tok_batch.to(device)]
 
             ratio    = p_tgt / q_draft

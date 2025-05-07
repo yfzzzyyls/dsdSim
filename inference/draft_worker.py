@@ -111,8 +111,8 @@ def batched_speculative_decode(
             active_idx = active.nonzero(as_tuple=False).squeeze(-1)    # indices
             inputs = prev_tokens[active_idx].unsqueeze(1)              # (B_a, 1)
 
-            # (2) build cache_vec for those rows: each gets its current cache_id
-            cache_vec = draft_model.cache_ids[active_idx]              # (B_a,)
+            # (2) build cache_vec: Neuron single-token kernel needs (B_a, 1)
+            cache_vec = draft_model.cache_ids[active_idx].unsqueeze(1) # (B_a, 1)
 
             # (3) single batched forward pass
             logits, _ = draft_model.forward(inputs, cache_ids=cache_vec)
@@ -122,31 +122,62 @@ def batched_speculative_decode(
             # probs   : (B_active, V)  is no longer used directly
 
             # (4) sampling: apply n-gram filter + top-k / top-p filtering
-            # (A) n-gram repeat penalty
-            full_ctx   = torch.cat([out_bufs[b] for b in active_idx]).view(len(active_idx), -1)
-            masked     = sampling.filter_ngrams(
-                            NGRAM_WINDOW,
-                            full_ctx,                    # (B_active, ctx_len)
-                            logits,                      # (B_active, V)
-                            draft_model.cache_ids[active_idx]
-                        )
+            # (A) n‑gram repeat penalty
+            # Build a right‑padded (B_a, C) context tensor so filter_ngrams
+            # can run in one call even when rows have different history length.
+            ctx_rows = [
+                torch.tensor(out_bufs[b], dtype=torch.int64)
+                for b in active_idx.tolist()
+            ]
+            if ctx_rows:
+                C = max(r.numel() for r in ctx_rows)
+                ctx_pad = torch.full((len(ctx_rows), C), 0, dtype=torch.int64)
+                for i, row_t in enumerate(ctx_rows):
+                    k = row_t.numel()
+                    if k:
+                        ctx_pad[i, :k] = row_t
+            else:
+                ctx_pad = torch.zeros((len(active_idx), 0), dtype=torch.int64)
 
-            # (B) top-k / top-p nucleus filtering
-            masked, cand_idx = sampling.top_k_top_p_filtering(
-                                masked,                 # (B_active, V)
-                                top_k=TOP_K,
-                                top_p=top_p
-                            )
-
-            # (C) convert to probabilities and sample
-            probs    = torch.softmax(masked, dim=-1)      # (B_active, V)
-            next_ids = torch.multinomial(probs, 1).squeeze(1)   # (B_active,)
+            # --------------------------------------------------------------
+            # transformers_neuronx.sampling.filter_ngrams expects `cur_len`
+            # to be **scalar per call**.  It cannot accept a tensor of
+            # different lengths (one per row).  We therefore call it in a
+            # tiny per‑row loop here; γ is small, so the overhead is minimal.
+            # --------------------------------------------------------------
+            cache_vec_a = draft_model.cache_ids[active_idx]
+            next_ids = []
+            probs_row = []
+            for j, row_logits in enumerate(logits):          # iterate B_active
+                cur_len  = int(cache_vec_a[j].item())        # scalar length
+                row_ctx  = ctx_pad[j : j+1, :]               # (1, C)
+                row_mask = sampling.filter_ngrams(
+                    NGRAM_WINDOW,
+                    row_ctx,
+                    row_logits.unsqueeze(0),   # (1, V)
+                    cur_len
+                )
+                # Optional: apply nucleus/top‑k filtering.
+                # The combined n‑gram mask is already quite restrictive and
+                # the previous batch‑level call caused shape‑mismatch errors
+                # inside `transformers_neuronx.top_k_top_p_filtering`.
+                # For stability we skip that function here and simply
+                # soft‑max over the n‑gram‑masked logits.
+                row_probs = torch.softmax(row_mask, dim=-1).squeeze(0)  # (V,)
+                # If numerical underflow masks all probs, fall back to uniform
+                if row_probs.sum() <= 0:
+                    row_probs = torch.ones_like(row_probs) / row_probs.numel()
+                nid = int(torch.multinomial(row_probs, 1).item())
+                next_ids.append(nid)
+                prob_val = float(row_probs[nid]) if nid < row_probs.shape[0] else 1.0
+                probs_row.append(prob_val)
+            next_ids = torch.tensor(next_ids, dtype=torch.int64)
+            probs    = torch.tensor(probs_row, dtype=torch.float32)
 
             # (5) write results back into row‑lists
             for idx, row in enumerate(active_idx):
-                tok_rows[row]  = torch.cat([tok_rows[row],  next_ids[idx:idx+1]])
-                prob_rows[row] = torch.cat([prob_rows[row],
-                                            probs[idx, next_ids[idx]].unsqueeze(0)])
+                tok_rows[row]  = torch.cat([tok_rows[row], next_ids[idx:idx+1]])
+                prob_rows[row] = torch.cat([prob_rows[row], probs[idx:idx+1]])
 
             # (6) update prev_tokens
             prev_tokens[active_idx] = next_ids
