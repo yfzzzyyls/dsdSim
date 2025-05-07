@@ -22,26 +22,15 @@ def create_stub(target_address):
 # BATCH-ORIENTED CLIENT CALLS
 # -----------------------------------------
 
-def start_generation_batch(stub, prompt_id_tensor):
+def start_generation_batch(stub, prompt_id_tensor, prompt_length_tensor):
     """
     prompt_id_tensor : dict {"data": flat_ids, "shape": [B, L]}
-    Automatically derives per‑row true lengths and sends them.
+    lens_tensor      : dict {"data": [true lengths], "shape": [B]}, or None to auto-derive
     """
-    B, L = prompt_id_tensor["shape"]
-    # Derive true lengths by counting non‑PAD zeros at row‑end (caller padded with 0)
-    row_lengths = []
-    row = []
-    data = prompt_id_tensor["data"]
-    for b in range(B):
-        row = data[b*L : (b+1)*L]
-        # assume PAD==0 for length calc (caller ensures)
-        true_len = L - next((i for i, t in enumerate(reversed(row)) if t != 0), L)
-        row_lengths.append(true_len)
-    lens_tensor = {"data": row_lengths, "shape": [B]}
-
+    assert prompt_length_tensor is not None, "prompt_len_tensor must be provided"
     req = inference_pb2.StartBatchRequest(
-        prompt_ids=_make_i32(prompt_id_tensor['data'], [B, L]),
-        prompt_lens=_make_i32(lens_tensor["data"], lens_tensor["shape"])
+        prompt_ids=_make_i32(prompt_id_tensor['data'], prompt_id_tensor['shape']),
+        prompt_lens=_make_i32(prompt_length_tensor["data"], prompt_length_tensor["shape"])
     )
     resp = stub.StartGenerationBatch(req)
     return list(resp.session_ids)

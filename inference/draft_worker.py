@@ -54,8 +54,14 @@ def batched_speculative_decode(
     # Use caller-supplied true_lengths when available; otherwise
     # fall back to counting non-pad tokens.
     # --------------------------------------------------------------
-    assert true_lengths, "true_lengths must be provided"
+    assert true_lengths is not None, "true_lengths must be provided"
     draft_model.cache_ids = true_lengths.clone()    # (B,) vector
+    # Sanity‑check: after pre‑fill the draft KV pointer must match the
+    # true prompt lengths for every row.  This should be identical to the
+    # session‑side pointer on the target immediately after its own pre‑fill.
+    assert torch.equal(draft_model.cache_ids, true_lengths), (
+        "Draft KV cache pointer desynchronised: cache_ids != true_lengths"
+    )
 
     eos_tok = tokenizer.eos_token_id
     finished = torch.zeros(B, dtype=torch.bool)
@@ -65,8 +71,19 @@ def batched_speculative_decode(
     last_token = batch_input_ids[:, -1].clone()
 
     scratch = torch.empty((1,1), dtype=torch.int64)
-    valid_g = [b-1 for b in SPEC_LENGTH_BUCKETS if b > 1]
-    gamma = max(g for g in valid_g if g <= max(1, gamma))
+    valid_g = [b - 1 for b in SPEC_LENGTH_BUCKETS if b > 1]   # γ values that were compiled
+    requested_gamma = max(1, gamma)                            # never allow γ < 1
+
+    if requested_gamma not in valid_g:
+        snapped_gamma = max(g for g in valid_g if g <= requested_gamma)
+        logger.warning(
+            "Requested gamma=%d is not supported by the compiled buckets %s; "
+            "using gamma=%d instead.",
+            requested_gamma, valid_g, snapped_gamma
+        )
+        gamma = snapped_gamma
+    else:
+        gamma = requested_gamma
 
     while not finished.all():
         # ------------------------------------------------------------------
@@ -94,10 +111,30 @@ def batched_speculative_decode(
             # (3) single batched forward pass
             logits, _ = draft_model.forward(inputs, cache_ids=cache_vec)
             logits = logits / temperature                              # (B_a, V)
-            probs  = torch.softmax(logits.float(), dim=-1)             # (B_a, V)
 
-            # (4) sample one token per active row
-            next_ids = torch.multinomial(probs, 1).squeeze(1)          # (B_a,)
+            # logits  : (B_active, V)  after temperature scaling
+            # probs   : (B_active, V)  is no longer used directly
+
+            # (4) sampling: apply n-gram filter + top-k / top-p filtering
+            # (A) n-gram repeat penalty
+            full_ctx   = torch.cat([output_buf[b] for b in active_idx]).view(len(active_idx), -1)
+            masked     = sampling.filter_ngrams(
+                            NGRAM_WINDOW,
+                            full_ctx,                    # (B_active, ctx_len)
+                            logits,                      # (B_active, V)
+                            draft_model.cache_ids[active_idx]
+                        )
+
+            # (B) top-k / top-p nucleus filtering
+            masked, cand_idx = sampling.top_k_top_p_filtering(
+                                masked,                 # (B_active, V)
+                                top_k=TOP_K,
+                                top_p=top_p
+                            )
+
+            # (C) convert to probabilities and sample
+            probs    = torch.softmax(masked, dim=-1)      # (B_active, V)
+            next_ids = torch.multinomial(probs, 1).squeeze(1)   # (B_active,)
 
             # (5) write results back into row‑lists
             for idx, row in enumerate(active_idx):
@@ -105,7 +142,7 @@ def batched_speculative_decode(
                 prob_rows[row] = torch.cat([prob_rows[row],
                                             probs[idx, next_ids[idx]].unsqueeze(0)])
 
-            # (6) advance per‑row cache pointers and prev_tokens
+            # (6) update prev_tokens
             prev_tokens[active_idx] = next_ids
 
             # (7) check stopping conditions per row
@@ -619,7 +656,19 @@ def run_client(
     )
 
     # ============================================================
-    # Tokenize all prompts together to get a single batch tensor
+    # Tokenise prompts twice:
+    #   (1) WITHOUT padding  → get true length of each prompt
+    #   (2)  WITH  padding   → get right‑padded (B, L) tensor for the model
+    # ============================================================
+
+    # (1) true per‑row lengths BEFORE padding
+    true_len_list = [
+        len(tokenizer_converter.encode(p, add_special_tokens=True))
+        for p in prompts
+    ]
+    true_lengths = torch.tensor(true_len_list, dtype=torch.int32)   # (B,)
+
+    # (2) build the padded batch‑input tensor
     batch_tok = tokenizer_converter(
         prompts,
         return_tensors="pt",
@@ -627,7 +676,6 @@ def run_client(
         truncation=False,  # never truncate – force caller to shorten
     )
     batch_input_ids = batch_tok["input_ids"]      # (B, L)
-    true_lengths = (batch_input_ids != 0).sum(dim=1, dtype=torch.int32)   # (B,)
     # ============================================================
 
     logger.info(
@@ -639,31 +687,30 @@ def run_client(
 
     # ============================================================
     # Check if the prompt tensor is empty
-    if not prompts:
-        logger.error("No valid lines in the prompt file.")
-        return
+    assert prompts, "Prompt list is empty. Please provide valid prompts."
     # ============================================================
 
     logger.info(f"Loading draft model '{draft_model_name}' (sequence_length={sequence_length}) for speculative decoding...")
 
     # ============================================================
     # Load the draft model
-    if isinstance(draft_model_name, str):
-        # draft_model_name is a path → load the model
-        draft_model = load_model(
-            draft_model_name,
-            sequence_length=sequence_length,
-            spec_length=gamma,
-            batch_size=batch_size
-        )
-        model_path_str = draft_model_name
-    else:
-        TypeError("draft_model_name must be a string (path).")
-        # never happens in Neuron
-        # already a model instance
-        draft_model = draft_model_name
-        # try to recover a path for tokenizer fallback
-        model_path_str = getattr(getattr(draft_model, "config", None), "_name_or_path", None)
+    assert isinstance(draft_model_name, str), (
+        f"draft_model_name must be a string (path), not {type(draft_model_name)}"
+    )
+    # if isinstance(draft_model_name, str):
+    # draft_model_name is a path → load the model
+    draft_model = load_model(
+        draft_model_name,
+        sequence_length=sequence_length,
+        spec_length=gamma,
+        batch_size=batch_size
+    )
+    model_path_str = draft_model_name
+    # else:
+    #     TypeError("draft_model_name must be a string (path).")
+    #     draft_model = draft_model_name
+    #     # try to recover a path for tokenizer fallback
+    #     model_path_str = getattr(getattr(draft_model, "config", None), "_name_or_path", None)
     # ============================================================
 
     # Decide which tokenizer to load
@@ -689,13 +736,14 @@ def run_client(
     # ============================================================
     # ---------- create batch sessions ----------
     prompt_tensor = _tensor_to_flat(batch_input_ids)
-    sid_server = grpc_client.start_generation_batch(stub, prompt_tensor)
+    length_tensor  = _tensor_to_flat(true_lengths)
+    sid_server = grpc_client.start_generation_batch(stub, prompt_tensor, length_tensor)
     # The server MUST return exactly one session‑id for the whole batch.
     if not sid_server or len(sid_server) == 0:
         raise RuntimeError("Target server returned no session_id for StartGenerationBatch()")
 
     # for a single-session batch the server sends exactly one ID, so the list always has length 1.
-    batch_sid = sid_server[0]   # single authoritative session_id
+    batch_session_sid = sid_server[0]   # single authoritative session_id
     # ============================================================
 
     # ---------- run batched speculative decode ----------
@@ -704,7 +752,7 @@ def run_client(
         prompts, batch_input_ids,
         max_new_tokens, gamma,
         profile=profile, top_p=top_p, temperature=temperature,
-        session_id=batch_sid,
+        session_id=batch_session_sid,
         true_lengths = true_lengths,   # (B,) vector of real prompt lengths
     )
 

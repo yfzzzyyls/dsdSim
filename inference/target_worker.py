@@ -114,6 +114,7 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
 
             # Prime Neuron KV
             self.model.cache_ids = None
+
             # ==========================
             # L must be > 0 for forward() to work
             # Do not support L = 0 for now
@@ -127,7 +128,6 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
             
             # The client supplied true lengths, respect them
             assert request.HasField("prompt_lens"), "prompt_lens must be provided by the client"
-            assert len(request.prompt_lens.shape) == 1, "prompt_lens must be a 1-D tensor"
 
             true_len = _tensor_i32(request.prompt_lens)  # (B,)
 
@@ -292,7 +292,6 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
         # ------------------------------------------------------------------
         # Inline fast‑path verification
         # ------------------------------------------------------------------
-        start_verify_t = time.perf_counter()
         with self.lock:
             if session_id not in self.sessions:
                 context.set_code(grpc.StatusCode.NOT_FOUND)
