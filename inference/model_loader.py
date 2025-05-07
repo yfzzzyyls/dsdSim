@@ -186,6 +186,10 @@ def compile_model(model_path: str,
     tp_degree = int(os.environ.get("NEURON_RT_NUM_CORES", "2"))
     if model_type.lower() == "llama" or "llama" in model_path.lower():
         logger.info(f"Compiling model using optimized LLaMA for Neuron ...")
+        # Enable 2‑D cache‑id layout so batched single‑token calls can pass
+        # a vector of cache pointers without hitting `.item()` errors in
+        # decoder.forward_single().
+        neuron_cfg = NeuronConfig(use_2d_cache_ids=True)
         model = LlamaForSampling.from_pretrained(
             model_path,
             batch_size=batch_size,
@@ -193,6 +197,7 @@ def compile_model(model_path: str,
             n_positions=sequence_length,
             context_length_estimate=sequence_length,
             spec_length = spec_length,
+            neuron_config = neuron_cfg,
             tp_degree=tp_degree,
             on_device_generation=False,
             return_all_logits=True,
@@ -261,7 +266,7 @@ def compile_model(model_path: str,
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
         tokenizer.pad_token_id = tokenizer.eos_token_id
-        logger.info("Non‑Neuron path: loaded model & tokenizer; skipping on‑disk save because we re‑compile on every run.")
+        logger.info("Non-Neuron path: loaded model & tokenizer; skipping on‑disk save because we re‑compile on every run.")
         return model
     
 
@@ -283,8 +288,11 @@ def compile_target_model(model_path: str,
                 f"(sequence_length={sequence_length})")
 
     tp_degree = int(os.environ.get("NEURON_RT_NUM_CORES", "2"))
-    neuron_cfg = NeuronConfig(is_eagle_target=False,
-                          cast_logits_dtype="bfloat16")   # <- enables safe cast
+    neuron_cfg = NeuronConfig(
+        is_eagle_target=False,
+        cast_logits_dtype="bfloat16",
+        use_2d_cache_ids=True,          # allow batch vector cache pointers
+    )
     model = LlamaForSampling.from_pretrained(
         model_path,
         batch_size            = batch_size,

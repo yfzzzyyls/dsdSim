@@ -48,17 +48,14 @@ def batched_speculative_decode(
     B, L = batch_input_ids.shape
 
     # 1) pre-fill
-    draft_model.cache_ids = None
-    _ = draft_model.forward(batch_input_ids)
     # --------------------------------------------------------------
-    # Use caller-supplied true_lengths when available; otherwise
-    # fall back to counting non-pad tokens.
+    # Pre-fill exactly like the target: call .forward() once with
+    # cache_ids=None, then set the per-row KV pointer to true_lengths.
     # --------------------------------------------------------------
     assert true_lengths is not None, "true_lengths must be provided"
-    draft_model.cache_ids = true_lengths.clone()    # (B,) vector
-    # Sanity‑check: after pre‑fill the draft KV pointer must match the
-    # true prompt lengths for every row.  This should be identical to the
-    # session‑side pointer on the target immediately after its own pre‑fill.
+
+    _ = draft_model.forward(batch_input_ids)   # let Neuron assign 0…L-1
+    draft_model.cache_ids = true_lengths.clone()   # (B,) next-free slot per row
     assert torch.equal(draft_model.cache_ids, true_lengths), (
         "Draft KV cache pointer desynchronised: cache_ids != true_lengths"
     )
@@ -117,7 +114,7 @@ def batched_speculative_decode(
 
             # (4) sampling: apply n-gram filter + top-k / top-p filtering
             # (A) n-gram repeat penalty
-            full_ctx   = torch.cat([output_buf[b] for b in active_idx]).view(len(active_idx), -1)
+            full_ctx   = torch.cat([out_bufs[b] for b in active_idx]).view(len(active_idx), -1)
             masked     = sampling.filter_ngrams(
                             NGRAM_WINDOW,
                             full_ctx,                    # (B_active, ctx_len)
@@ -650,10 +647,21 @@ def run_client(
     # ------------------------------------------------------------------
     # Tokenise all prompts together → (B, L) tensor  (right‑padded)
     # ------------------------------------------------------------------
-    tokenizer_converter = AutoTokenizer.from_pretrained(
+    batch_tokenizer = AutoTokenizer.from_pretrained(
         target_tokenizer or draft_model_name,
         use_fast=False,
     )
+    # ------------------------------------------------------------------
+    # Ensure the tokenizer has a PAD token and remap padding in the *tensor*
+    # (not the tokenizer vocab) to ID 0.  We store the original pad ID so
+    # we can swap it out after tokenisation.
+    # ------------------------------------------------------------------
+    if batch_tokenizer.pad_token_id is None:
+        batch_tokenizer.add_special_tokens({"pad_token": "[PAD]"})
+
+    original_pad_id = batch_tokenizer.pad_token_id
+    # We won’t change pad_token_id yet; we first need to tokenise so we can
+    # find every occurrence of the old pad ID in the tensor.
 
     # ============================================================
     # Tokenise prompts twice:
@@ -663,21 +671,22 @@ def run_client(
 
     # (1) true per‑row lengths BEFORE padding
     true_len_list = [
-        len(tokenizer_converter.encode(p, add_special_tokens=True))
+        len(batch_tokenizer.encode(p, add_special_tokens=True))
         for p in prompts
     ]
     true_lengths = torch.tensor(true_len_list, dtype=torch.int32)   # (B,)
 
     # (2) build the padded batch‑input tensor
-    batch_tok = tokenizer_converter(
+    batch_tok = batch_tokenizer(
         prompts,
         return_tensors="pt",
         padding=True,      # right‑pad to max length across prompts
         truncation=False,  # never truncate – force caller to shorten
     )
     batch_input_ids = batch_tok["input_ids"]      # (B, L)
-    # ============================================================
-
+    # Replace old pad ID with 0 in the tensor, then make 0 the official PAD ID
+    batch_input_ids[batch_input_ids == original_pad_id] = 0
+    batch_tokenizer.pad_token_id = 0
     logger.info(
         "Prepared batch_input_ids tensor with shape %s (B=%d, L=%d)",
         tuple(batch_input_ids.shape),
@@ -697,8 +706,6 @@ def run_client(
     assert isinstance(draft_model_name, str), (
         f"draft_model_name must be a string (path), not {type(draft_model_name)}"
     )
-    # if isinstance(draft_model_name, str):
-    # draft_model_name is a path → load the model
     draft_model = load_model(
         draft_model_name,
         sequence_length=sequence_length,
@@ -706,12 +713,6 @@ def run_client(
         batch_size=batch_size
     )
     model_path_str = draft_model_name
-    # else:
-    #     TypeError("draft_model_name must be a string (path).")
-    #     draft_model = draft_model_name
-    #     # try to recover a path for tokenizer fallback
-    #     model_path_str = getattr(getattr(draft_model, "config", None), "_name_or_path", None)
-    # ============================================================
 
     # Decide which tokenizer to load
     if target_tokenizer:
