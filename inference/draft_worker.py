@@ -650,6 +650,7 @@ def run_client(
     batch_tokenizer = AutoTokenizer.from_pretrained(
         target_tokenizer or draft_model_name,
         use_fast=False,
+        padding_side="right",
     )
     # ------------------------------------------------------------------
     # Ensure the tokenizer has a PAD token and remap padding in the *tensor*
@@ -724,7 +725,7 @@ def run_client(
             "Cannot determine tokenizer_source: provide --target_tokenizer when "
             "passing a pre-loaded draft model."
         )
-    tokenizer = AutoTokenizer.from_pretrained(tokenizer_source, use_fast=False)
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_source, use_fast=False, padding_side="right")
 
     # start the loop
     start_time = time.time()

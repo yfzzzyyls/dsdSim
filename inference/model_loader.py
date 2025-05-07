@@ -190,6 +190,7 @@ def compile_model(model_path: str,
         # a vector of cache pointers without hitting `.item()` errors in
         # decoder.forward_single().
         neuron_cfg = NeuronConfig(use_2d_cache_ids=True)
+        neuron_cfg = NeuronConfig(padding_side='right')
         model = LlamaForSampling.from_pretrained(
             model_path,
             batch_size=batch_size,
@@ -215,6 +216,7 @@ def compile_model(model_path: str,
         # ------------------------------------------------------------------
         tokenizer = AutoTokenizer.from_pretrained(model_path,
                                                   trust_remote_code=True,
+                                                  padding_side="right",
                                                   use_fast=False)
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token           # reuse </s>
@@ -262,7 +264,7 @@ def compile_model(model_path: str,
         return NeuronHFAdapterWrap(adapter)
     else:
         model = AutoModelForCausalLM.from_pretrained(model_path)
-        tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=False)
+        tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=False, padding_side="right")
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
         tokenizer.pad_token_id = tokenizer.eos_token_id
@@ -291,6 +293,7 @@ def compile_target_model(model_path: str,
     neuron_cfg = NeuronConfig(
         is_eagle_target=False,
         cast_logits_dtype="bfloat16",
+        padding_side="right",
         use_2d_cache_ids=True,          # allow batch vector cache pointers
     )
     model = LlamaForSampling.from_pretrained(
@@ -324,6 +327,7 @@ def compile_target_model(model_path: str,
     # Ensure PAD token is defined so we can always right‑pad inputs.
     tokenizer = AutoTokenizer.from_pretrained(model_path,
                                               trust_remote_code=True,
+                                              padding_side="right",
                                               use_fast=False)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token

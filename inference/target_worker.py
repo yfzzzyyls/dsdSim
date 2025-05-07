@@ -64,7 +64,7 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
         )
         self.temperature = temperature
         self.top_p = top_p
-        self.tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=False)
+        self.tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=False, padding_side="left")
         self.eos_token_id = self.tokenizer.eos_token_id
         self._ctx_estimate = sequence_length
         self.sessions = {}  # session_id -> TargetSession
