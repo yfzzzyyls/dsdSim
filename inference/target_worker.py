@@ -112,25 +112,25 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
             sess = TargetSession(prompt_ids)
             self.sessions[session_id] = sess
 
-            # Prime Neuron KV
-            self.model.cache_ids = None
+            # ------------------------------------------------------------------
+            # Build a (B, L) cache‑id matrix so vectorize_last_token_id=True
+            # can compute last_token_id = cache_ids.max(dim=1).  Positions that
+            # are right‑pad (beyond true_len[b]) are filled with ‑1.
+            # ------------------------------------------------------------------
+            assert prompt_ids.shape[1] > 0, "Prompt length must be > 0"
 
-            # ==========================
-            # L must be > 0 for forward() to work
-            # Do not support L = 0 for now
-            # ==========================
-            assert (prompt_ids.shape[1] > 0, "Prompt length must be > 0")
-            _ = self.model.forward(prompt_ids)
-            # --------------------------------------------------------------
-            # Set `cache_ids` to the TRUE (unpadded) length of each row so
-            # the pointer always indicates the *next* free KV slot.
-            # --------------------------------------------------------------
-            
             # The client supplied true lengths, respect them
             assert request.HasField("prompt_lens"), "prompt_lens must be provided by the client"
+            true_len = _tensor_i32(request.prompt_lens)          # (B,)
 
-            true_len = _tensor_i32(request.prompt_lens)  # (B,)
+            B, L = prompt_ids.shape
+            row_pos  = torch.arange(L, dtype=torch.int32).unsqueeze(0).repeat(B, 1)  # (B,L)
+            over_len = row_pos >= true_len.unsqueeze(1)                              # mask
+            cache_mat = row_pos.masked_fill(over_len, -1)                            # (B,L)
 
+            _ = self.model.forward(prompt_ids, cache_ids=cache_mat)
+
+            # After pre‑fill, store per‑row pointer (next free slot)
             self.model.cache_ids = true_len.clone()   # authoritative per-row pointer
             sess.cache_ids       = true_len.clone()
 

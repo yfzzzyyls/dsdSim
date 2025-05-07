@@ -54,8 +54,17 @@ def batched_speculative_decode(
     # --------------------------------------------------------------
     assert true_lengths is not None, "true_lengths must be provided"
 
-    _ = draft_model.forward(batch_input_ids)   # let Neuron assign 0…L-1
-    draft_model.cache_ids = true_lengths.clone()   # (B,) next-free slot per row
+    # ------------------------------------------------------------------
+    # Provide a (B, L) cache‑id matrix so vectorize_last_token_id=True
+    # works exactly as on the target side.  Slots ≥ true_len[b] get ‑1.
+    # ------------------------------------------------------------------
+    B, L = batch_input_ids.shape
+    row_pos   = torch.arange(L, dtype=torch.int32).unsqueeze(0).repeat(B, 1)
+    over_len  = row_pos >= true_lengths.unsqueeze(1)
+    cache_mat = row_pos.masked_fill(over_len, -1)          # (B, L)
+
+    _ = draft_model.forward(batch_input_ids, cache_ids=cache_mat)
+    draft_model.cache_ids = true_lengths.clone()           # (B,) next-free slot per row
     assert torch.equal(draft_model.cache_ids, true_lengths), (
         "Draft KV cache pointer desynchronised: cache_ids != true_lengths"
     )
