@@ -124,12 +124,12 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
             # Set `cache_ids` to the TRUE (unpadded) length of each row so
             # the pointer always indicates the *next* free KV slot.
             # --------------------------------------------------------------
-            # If the client supplied true lengths, respect them
-            if request.HasField("prompt_lens") and request.prompt_lens.data:
-                true_len = _tensor_i32(request.prompt_lens)  # (B,)
-            else:
-                pad_id = self.tokenizer.pad_token_id or self.tokenizer.eos_token_id
-                true_len = (prompt_ids != pad_id).sum(dim=1, dtype=torch.int32)
+            
+            # The client supplied true lengths, respect them
+            assert request.HasField("prompt_lens"), "prompt_lens must be provided by the client"
+            assert len(request.prompt_lens.shape) == 1, "prompt_lens must be a 1-D tensor"
+
+            true_len = _tensor_i32(request.prompt_lens)  # (B,)
 
             self.model.cache_ids = true_len.clone()   # authoritative per-row pointer
             sess.cache_ids       = true_len.clone()
@@ -250,9 +250,7 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
     def VerifyBatchTokens(self, request, context):
         """
         Each DraftSequence in `request.sequences` holds one row of the batch.
-        We stack those rows into a single VerifyRequest (same session_id),
-        delegate to VerifyDraftTokens (which handles the batched math), then
-        split the committed-ids tensor back into per-row VerifyResult objects.
+        This is now a fast-path implementation: vectorized verify logic is inlined here.
         """
         if len(request.sequences) == 0:
             context.set_code(grpc.StatusCode.INVALID_ARGUMENT)
@@ -289,39 +287,89 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
 
         draft_tok_batch  = torch.cat(padded_tok_rows,  dim=0)   # (B, max_len)
         draft_prob_batch = torch.cat(padded_prob_rows, dim=0)   # (B, max_len)
-        gamma = max_len    # keep variable consistent for later use
-        
-        # Build VerifyRequest with tensor fields
-        verify_req = inference_pb2.VerifyRequest(session_id=session_id)
-        verify_req.draft_tokens.CopyFrom(
-            _make_i32(draft_tok_batch.flatten().tolist(),
-                      list(draft_tok_batch.shape))
-        )
-        verify_req.draft_probs.CopyFrom(
-            _F32(data=draft_prob_batch.flatten().tolist(),
-                 shape=list(draft_prob_batch.shape))
-        )
+        B = draft_tok_batch.shape[0]
 
-        # -- Delegate to existing VerifyDraftTokens (batched) --
-        resp = self.VerifyDraftTokens(verify_req, context)
+        # ------------------------------------------------------------------
+        # === Inline fast‑path verification (formerly VerifyDraftTokens) ===
+        # ------------------------------------------------------------------
+        start_verify_t = time.perf_counter()
+        with self.lock:
+            if session_id not in self.sessions:
+                context.set_code(grpc.StatusCode.NOT_FOUND)
+                context.set_details(f"Session {session_id} not found")
+                empty_result = inference_pb2.VerifyResult(
+                    session_id=session_id,
+                    tokens_accepted=0,
+                    committed_ids=_make_i32([], [B, 0]),
+                    finished=True,
+                )
+                return inference_pb2.VerifyBatchResponse(results=[empty_result])
 
-        # ------------ unwrap committed tensor per row -------------
-        committed_tensor = _tensor_i32(resp.committed_ids)     # (B, K)
-        B, K = committed_tensor.shape
-        results = []
-        for b in range(B):
+            sess = self.sessions[session_id]
+            if sess.finished or draft_tok_batch.numel() == 0:
+                empty_result = inference_pb2.VerifyResult(
+                    session_id=session_id,
+                    tokens_accepted=0,
+                    committed_ids=_make_i32([], [B, 0]),
+                    finished=sess.finished,
+                )
+                return inference_pb2.VerifyBatchResponse(results=[empty_result])
+
+            # ------------- vectorised verify -----------------------
+            logits_all = self.verify(sess, draft_tok_batch)    # (B, γ+1, V)
+            tgt_probs  = torch.softmax(logits_all.float(), dim=-1)
+
+            tgt_row  = tgt_probs[:, :-1, :]      # (B, γ, V)
+            B, gamma, V = tgt_row.shape
+            device = tgt_row.device
+
+            q_draft  = draft_prob_batch.to(device)             # (B, γ)
+            idx_b    = torch.arange(B, device=device).unsqueeze(1).repeat(1, gamma)
+            idx_g    = torch.arange(gamma, device=device)
+            p_tgt    = tgt_row[idx_b, idx_g, draft_tok_batch.to(device)]
+
+            ratio    = p_tgt / q_draft
+            rand     = torch.rand_like(ratio)
+            accept   = (p_tgt >= q_draft) | (rand < ratio)      # (B, γ)
+
+            first_rej   = (~accept).float().argmax(dim=1)
+            all_accept  = accept.all(dim=1)
+
+            committed_batch = []
+            accepted_total  = 0
+            for b in range(B):
+                acc_len = int(first_rej[b].item()) if not all_accept[b] else gamma
+                row_commits = draft_tok_batch[b, :acc_len].tolist() if acc_len > 0 else []
+
+                # choose bonus from row (acc_len or γ)
+                bonus_row = acc_len if acc_len < gamma else gamma
+                bonus_logits = tgt_probs[b, bonus_row]
+                bonus_id = int(torch.multinomial(bonus_logits, 1).item())
+                row_commits.append(bonus_id)
+
+                committed_batch.append(row_commits)
+                accepted_total += acc_len
+
+            # commit to KV + session state
+            self._commit_tokens_bulk(sess, committed_batch)
+
+            # pack committed tensor
+            Kc       = max(len(r) for r in committed_batch)
+            pad_val  = self.eos_token_id if self.eos_token_id is not None else 0
+            commit_pad = []
+            for row in committed_batch:
+                commit_pad.extend(row + [pad_val]*(Kc - len(row)))
+
+            committed_tensor = _make_i32(commit_pad, [B, Kc])
+
             result = inference_pb2.VerifyResult(
                 session_id      = session_id,
-                tokens_accepted = resp.accepted_count,  # aggregated; acceptable
-                committed_ids   = _make_i32(
-                    committed_tensor[b].tolist(),
-                    [1, K]
-                ),
-                finished        = resp.finished,
+                tokens_accepted = accepted_total,
+                committed_ids   = committed_tensor,
+                finished        = sess.finished,
             )
-            results.append(result)
 
-        return inference_pb2.VerifyBatchResponse(results=results)
+            return inference_pb2.VerifyBatchResponse(results=[result])
 
     def VerifyDraftTokens(self, request, context):
         start_verify_t = time.perf_counter()

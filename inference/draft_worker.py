@@ -43,20 +43,25 @@ def batched_speculative_decode(
     draft_model, tokenizer, stub, prompts,
     batch_input_ids, max_new_tokens, gamma,
     *, profile=False, top_p=0.9, temperature=1.0, session_id=None,
+    true_lengths: torch.Tensor | None = None,   # (B,) vector of real prompt lengths
 ):
     B, L = batch_input_ids.shape
 
     # 1) pre-fill
     draft_model.cache_ids = None
-    draft_model._next_pos = 0
     _ = draft_model.forward(batch_input_ids)
-    draft_model.cache_ids = torch.tensor([L]*B, dtype=torch.int32)
-    draft_model._next_pos = L
+    # --------------------------------------------------------------
+    # Use caller-supplied true_lengths when available; otherwise
+    # fall back to counting non-pad tokens.
+    # --------------------------------------------------------------
+    assert true_lengths, "true_lengths must be provided"
+    draft_model.cache_ids = true_lengths.clone()    # (B,) vector
 
     eos_tok = tokenizer.eos_token_id
     finished = torch.zeros(B, dtype=torch.bool)
     out_bufs = [[] for _ in range(B)]
     tokens_generated = torch.zeros(B, dtype=torch.int32)
+    # the prev_token used to generate the next token
     last_token = batch_input_ids[:, -1].clone()
 
     scratch = torch.empty((1,1), dtype=torch.int64)
@@ -65,34 +70,52 @@ def batched_speculative_decode(
 
     while not finished.all():
         # ------------------------------------------------------------------
-        # 1) Draft proposes up to γ tokens per unfinished row
+        # Fully‑batched draft generation: do *γ* batched forward passes total.
+        # We maintain an `active` mask so we only update rows that
+        # still need tokens and skip those that are finished.
         # ------------------------------------------------------------------
-        tok_rows  = []
-        prob_rows = []
-        for b in range(B):
-            if finished[b]:
-                tok_rows.append(torch.empty((0,), dtype=torch.int64))
-                prob_rows.append(torch.empty((0,), dtype=torch.float32))
-                continue
+        tok_rows  = [torch.empty((0,), dtype=torch.int64)  for _ in range(B)]
+        prob_rows = [torch.empty((0,), dtype=torch.float32) for _ in range(B)]
 
-            toks, probs = [], []
-            prev = int(last_token[b])
-            for _ in range(gamma):
-                scratch[0, 0] = prev
-                cache_vec = draft_model.cache_ids[b:b+1] + _
-                logits, _ = draft_model.forward(scratch, cache_ids=cache_vec)
-                logits = logits / temperature
-                p = torch.softmax(logits.float(), dim=-1).squeeze(0)
-                nid = int(torch.multinomial(p, 1).item())
-                toks.append(nid);  probs.append(float(p[nid]))
-                prev = nid
-                if eos_tok is not None and nid == eos_tok:
-                    break
-                if tokens_generated[b] + len(toks) >= max_new_tokens:
-                    break
+        active = ~finished.clone()          # (B,) bool
+        prev_tokens = last_token.clone()    # (B,)
 
-            tok_rows.append(torch.tensor(toks, dtype=torch.int64))
-            prob_rows.append(torch.tensor(probs, dtype=torch.float32))
+        for step in range(gamma):
+            if not active.any():
+                break
+
+            # (1) build batched (B_active, 1) input tensor of prev tokens
+            active_idx = active.nonzero(as_tuple=False).squeeze(-1)    # indices
+            inputs = prev_tokens[active_idx].unsqueeze(1)              # (B_a, 1)
+
+            # (2) build cache_vec for those rows: each gets its current cache_id
+            cache_vec = draft_model.cache_ids[active_idx]              # (B_a,)
+
+            # (3) single batched forward pass
+            logits, _ = draft_model.forward(inputs, cache_ids=cache_vec)
+            logits = logits / temperature                              # (B_a, V)
+            probs  = torch.softmax(logits.float(), dim=-1)             # (B_a, V)
+
+            # (4) sample one token per active row
+            next_ids = torch.multinomial(probs, 1).squeeze(1)          # (B_a,)
+
+            # (5) write results back into row‑lists
+            for idx, row in enumerate(active_idx):
+                tok_rows[row]  = torch.cat([tok_rows[row],  next_ids[idx:idx+1]])
+                prob_rows[row] = torch.cat([prob_rows[row],
+                                            probs[idx, next_ids[idx]].unsqueeze(0)])
+
+            # (6) advance per‑row cache pointers and prev_tokens
+            prev_tokens[active_idx] = next_ids
+
+            # (7) check stopping conditions per row
+            reached_eos = (eos_tok is not None) & (next_ids == eos_tok)
+            reach_budget = (tokens_generated[active_idx] +
+                            torch.tensor([len(tok_rows[r]) for r in active_idx])) >= max_new_tokens
+            should_stop = reached_eos | reach_budget
+            # mark finished rows
+            active[active_idx[should_stop]] = False
+            finished[active_idx[should_stop]] = True
 
         # ---- exit if nobody produced a token --------------------------------
         if all(row.numel() == 0 for row in tok_rows):
@@ -125,25 +148,42 @@ def batched_speculative_decode(
                                 dtype=torch.int64).view(B, -1)    # (B, K)
 
         # ------------------------------------------------------------------
-        # 4) Apply commits per row
+        # 4) Vectorised application of committed tokens
         # ------------------------------------------------------------------
         K = commit_t.shape[1]
-        for b in range(B):
-            commits = [tid for tid in commit_t[b].tolist() if tid != 0]
-            if not commits or finished[b]:
-                continue
 
-            # trim to remaining budget
-            remain = max_new_tokens - tokens_generated[b].item()
-            commits = commits[:remain]
+        # (B,) length of real (non-PAD) commits per row
+        commit_len = commit_t.ne(0).sum(dim=1, dtype=torch.int64)          # (B,)
 
-            out_bufs[b].extend(commits)
-            tokens_generated[b] += len(commits)
-            last_token[b] = commits[-1]
-            draft_model.cache_ids[b] += len(commits)
+        # Respect remaining budget per row
+        remain     = (max_new_tokens - tokens_generated).clamp(min=0)      # (B,)
+        commit_len = torch.minimum(commit_len, remain)
 
-            if eos_tok in commits or tokens_generated[b] >= max_new_tokens:
-                finished[b] = True
+        # Mask of rows that actually receive new tokens *and* aren’t finished
+        valid_mask = (commit_len > 0) & (~finished)
+        if valid_mask.any():
+            idx = valid_mask.nonzero(as_tuple=False).squeeze(1)            # (N,)
+
+            # ---- tensorised state updates ----
+            tokens_generated[idx] += commit_len[idx]
+            draft_model.cache_ids[idx] += commit_len[idx].to(torch.int32)
+
+            # last_token becomes the final committed ID on each row
+            last_pos              = commit_len[idx] - 1                    # (N,)
+            last_token[idx]       = commit_t[idx, last_pos]
+
+            # rows that hit EOS or token budget are marked finished
+            eos_row     = torch.zeros_like(idx, dtype=torch.bool)
+            if eos_tok is not None:
+                eos_row = (commit_t[idx] == eos_tok).any(dim=1)
+            budget_row  = tokens_generated[idx] >= max_new_tokens
+            finished[idx] = eos_row | budget_row
+
+            # Python-list buffer extension (still per row)
+            for b in idx.tolist():
+                k = int(commit_len[b])
+                if k:
+                    out_bufs[b].extend(commit_t[b, :k].tolist())
 
     return [
         tokenizer.decode(buf, skip_special_tokens=True,
@@ -587,6 +627,7 @@ def run_client(
         truncation=False,  # never truncate – force caller to shorten
     )
     batch_input_ids = batch_tok["input_ids"]      # (B, L)
+    true_lengths = (batch_input_ids != 0).sum(dim=1, dtype=torch.int32)   # (B,)
     # ============================================================
 
     logger.info(
@@ -664,6 +705,7 @@ def run_client(
         max_new_tokens, gamma,
         profile=profile, top_p=top_p, temperature=temperature,
         session_id=batch_sid,
+        true_lengths = true_lengths,   # (B,) vector of real prompt lengths
     )
 
     for i, txt in enumerate(generated_texts):
