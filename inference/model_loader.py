@@ -189,7 +189,6 @@ def compile_model(model_path: str,
         # Enable 2‑D cache‑id layout so batched single‑token calls can pass
         # a vector of cache pointers without hitting `.item()` errors in
         # decoder.forward_single().
-        neuron_cfg = NeuronConfig(use_2d_cache_ids=True)
         neuron_cfg = NeuronConfig(padding_side='right')
         model = LlamaForSampling.from_pretrained(
             model_path,
@@ -207,7 +206,8 @@ def compile_model(model_path: str,
             use_cache=True,
             trust_remote_code=True,
             fuse_qkv=True,
-            attention_layout="BSH"
+            attention_layout="BSH",
+            use_2d_cache_ids=True
         )
         model.to_neuron()
         # ------------------------------------------------------------------
@@ -227,6 +227,15 @@ def compile_model(model_path: str,
             hf_config.pad_token_id = tokenizer.pad_token_id
         model.config.pad_token_id = hf_config.pad_token_id
         adapter = HuggingFaceGenerationModelAdapter(hf_config, model)
+
+        # --------------------------------------------------------------
+        # Sanity‑check: both Neuron config *and* tokenizer must use
+        # right‑padding now that use_2d_cache_ids is deprecated.
+        # --------------------------------------------------------------
+        assert model.neuron_config.padding_side == "right", \
+            "NeuronConfig.padding_side must be 'right' for batched cache IDs"
+        assert tokenizer.padding_side == "right", \
+            "Tokenizer.padding_side must be 'right' for batched cache IDs"
         # --------------------------------------------------------------
         # DEBUG: Inspect raw Neuron model output shape *before* wrapping
         # --------------------------------------------------------------
@@ -294,7 +303,6 @@ def compile_target_model(model_path: str,
         is_eagle_target=False,
         cast_logits_dtype="bfloat16",
         padding_side="right",
-        use_2d_cache_ids=True,          # allow batch vector cache pointers
     )
     model = LlamaForSampling.from_pretrained(
         model_path,
@@ -317,6 +325,7 @@ def compile_target_model(model_path: str,
         trust_remote_code     = True,
         fuse_qkv              = True,
         attention_layout      = "BSH",
+        use_2d_cache_ids      = True,
     )
     model.enable_speculative_decoder(spec_buckets)
     model.to_neuron()
