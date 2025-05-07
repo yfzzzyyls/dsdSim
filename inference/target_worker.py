@@ -290,7 +290,7 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
         B = draft_tok_batch.shape[0]
 
         # ------------------------------------------------------------------
-        # === Inline fast‑path verification (formerly VerifyDraftTokens) ===
+        # Inline fast‑path verification
         # ------------------------------------------------------------------
         start_verify_t = time.perf_counter()
         with self.lock:
@@ -337,18 +337,35 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
 
             committed_batch = []
             accepted_total  = 0
-            for b in range(B):
-                acc_len = int(first_rej[b].item()) if not all_accept[b] else gamma
-                row_commits = draft_tok_batch[b, :acc_len].tolist() if acc_len > 0 else []
+            # ------------------------------------------------------------------
+            # Vectorised build of committed tokens per row
+            # ------------------------------------------------------------------
+            acc_len = torch.where(
+                all_accept,
+                torch.full_like(first_rej, gamma),   # accept full γ
+                first_rej,                           # accept up to first reject
+            )                                         # (B,)
 
-                # choose bonus from row (acc_len or γ)
-                bonus_row = acc_len if acc_len < gamma else gamma
-                bonus_logits = tgt_probs[b, bonus_row]
-                bonus_id = int(torch.multinomial(bonus_logits, 1).item())
-                row_commits.append(bonus_id)
+            # ----- accepted draft tokens mask (B, γ) --------------------------
+            idx_tok     = torch.arange(gamma, device=device).view(1, -1)
+            commit_mask = idx_tok < acc_len.unsqueeze(1)          # True where token accepted
 
-                committed_batch.append(row_commits)
-                accepted_total += acc_len
+            pad_val_i   = self.eos_token_id if self.eos_token_id is not None else 0
+            accepted_tok = torch.full((B, gamma), pad_val_i, dtype=torch.int64, device=device)
+            accepted_tok[commit_mask] = draft_tok_batch[commit_mask]   # copy only accepted IDs
+            accepted_tok = accepted_tok.cpu()                          # move to host for list()
+
+            # ----- bonus token selection per row -----------------------------
+            bonus_row  = torch.where(acc_len < gamma, acc_len, torch.full_like(acc_len, gamma))
+            bonus_logits = tgt_probs[torch.arange(B, device=device), bonus_row]   # (B,V)
+            bonus_id   = torch.multinomial(bonus_logits, 1).squeeze(1).cpu()      # (B,)
+
+            # ----- compose committed_batch as list-of-lists -------------------
+            committed_batch = [
+                accepted_tok[b, : int(acc_len[b])].tolist() + [int(bonus_id[b])]
+                for b in range(B)
+            ]
+            accepted_total = int(acc_len.sum().item())
 
             # commit to KV + session state
             self._commit_tokens_bulk(sess, committed_batch)
