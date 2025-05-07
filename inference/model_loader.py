@@ -20,13 +20,14 @@ logger = logging.getLogger(__name__)
 
 class NeuronHFAdapterWrap(torch.nn.Module):
     """
-    Thin wrapper so .forward accepts batched input_ids of shape (B, L)
-    and **retains** batch/length dimensions in the returned logits.
+    Thin wrapper so .forward accepts input_ids, cache_ids=None
+    and returns (logits, cache_ids) packaged as CausalLMOutputWithPast.
     """
     def __init__(self, adapter):
         super().__init__()
         self.adapter = adapter
         self.cache_ids = None  # Initialize KV cache pointer storage
+        self._next_pos = 0  # next position index in the KV cache
         self.config = adapter.config
 
     # ------------------------------------------------------------------  
@@ -78,42 +79,28 @@ class NeuronHFAdapterWrap(torch.nn.Module):
         """
         Thin pass‑through to the underlying Neuron adapter.
 
-        Parameters
-        ----------
-        input_ids : LongTensor
-            Shape (B, L) where B is batch and L is token‑count.
-        cache_ids : IntTensor or None
-            KV‑cache pointer vector of shape (B,) indicating current
-            sequence lengths on device.
-
-        Returns
-        -------
-        logits : FloatTensor
-            • Shape (B, V) if L == 1  (one‑token forward)  
-            • Shape (B, L, V) for multi‑token calls  
-            where V is vocab size.
-        cache_ids : same object that was passed in (for compatibility)
+        All KV‑cache management (cache_ids and next_pos) is handled by the
+        caller.  This wrapper simply forwards the tensors and returns the
+        logits for the last token plus the same `cache_ids` object so
+        existing call‑sites that expect `(logits, pos_tensor)` keep working.
         """
-        out = self.adapter(
-            input_ids=input_ids,
-            cache_ids=cache_ids,
-            return_dict=False,
-            **kwargs,
-        )
+        out = self.adapter(input_ids=input_ids,
+                           cache_ids=cache_ids,
+                           return_dict=False,
+                           **kwargs)
 
-        # ----------------------------------------------
-        # Extract logits tensor from various return types
-        # ----------------------------------------------
+        # Extract logits tensor
         if isinstance(out, (tuple, list)):
             logits = out[0]
         else:
             logits = out.logits if hasattr(out, "logits") else out
 
-        # ------------------------------------------------------------------
-        # IMPORTANT CHANGE: **do NOT squeeze batch / length dims**.
-        # Leave logits as‑is so downstream code can handle batched tensors:
-        #   (B, L, V)  or  (B, V)  depending on input shape.
-        # ------------------------------------------------------------------
+        # Reduce shape to (V)
+        if logits.dim() == 3:       # (B, L, V)
+            logits = logits[0, -1, :]
+        elif logits.dim() == 2:     # (B, V)
+            logits = logits[0]
+
         return logits, cache_ids
 
     # ------------------------------------------------------------------
@@ -186,10 +173,6 @@ def compile_model(model_path: str,
     tp_degree = int(os.environ.get("NEURON_RT_NUM_CORES", "2"))
     if model_type.lower() == "llama" or "llama" in model_path.lower():
         logger.info(f"Compiling model using optimized LLaMA for Neuron ...")
-        # Enable 2‑D cache‑id layout so batched single‑token calls can pass
-        # a vector of cache pointers without hitting `.item()` errors in
-        # decoder.forward_single().
-        neuron_cfg = NeuronConfig(padding_side='right')
         model = LlamaForSampling.from_pretrained(
             model_path,
             batch_size=batch_size,
@@ -197,7 +180,6 @@ def compile_model(model_path: str,
             n_positions=sequence_length,
             context_length_estimate=sequence_length,
             spec_length = spec_length,
-            neuron_config = neuron_cfg,
             tp_degree=tp_degree,
             on_device_generation=False,
             return_all_logits=True,
@@ -206,8 +188,7 @@ def compile_model(model_path: str,
             use_cache=True,
             trust_remote_code=True,
             fuse_qkv=True,
-            attention_layout="BSH",
-            use_2d_cache_ids=True
+            attention_layout="BSH"
         )
         model.to_neuron()
         # ------------------------------------------------------------------
@@ -216,7 +197,6 @@ def compile_model(model_path: str,
         # ------------------------------------------------------------------
         tokenizer = AutoTokenizer.from_pretrained(model_path,
                                                   trust_remote_code=True,
-                                                  padding_side="right",
                                                   use_fast=False)
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token           # reuse </s>
@@ -227,15 +207,6 @@ def compile_model(model_path: str,
             hf_config.pad_token_id = tokenizer.pad_token_id
         model.config.pad_token_id = hf_config.pad_token_id
         adapter = HuggingFaceGenerationModelAdapter(hf_config, model)
-
-        # --------------------------------------------------------------
-        # Sanity‑check: both Neuron config *and* tokenizer must use
-        # right‑padding now that use_2d_cache_ids is deprecated.
-        # --------------------------------------------------------------
-        assert model.neuron_config.padding_side == "right", \
-            "NeuronConfig.padding_side must be 'right' for batched cache IDs"
-        assert tokenizer.padding_side == "right", \
-            "Tokenizer.padding_side must be 'right' for batched cache IDs"
         # --------------------------------------------------------------
         # DEBUG: Inspect raw Neuron model output shape *before* wrapping
         # --------------------------------------------------------------
@@ -273,11 +244,11 @@ def compile_model(model_path: str,
         return NeuronHFAdapterWrap(adapter)
     else:
         model = AutoModelForCausalLM.from_pretrained(model_path)
-        tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=False, padding_side="right")
+        tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=False)
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
         tokenizer.pad_token_id = tokenizer.eos_token_id
-        logger.info("Non-Neuron path: loaded model & tokenizer; skipping on‑disk save because we re‑compile on every run.")
+        logger.info("Non‑Neuron path: loaded model & tokenizer; skipping on‑disk save because we re‑compile on every run.")
         return model
     
 
@@ -299,11 +270,8 @@ def compile_target_model(model_path: str,
                 f"(sequence_length={sequence_length})")
 
     tp_degree = int(os.environ.get("NEURON_RT_NUM_CORES", "2"))
-    neuron_cfg = NeuronConfig(
-        is_eagle_target=False,
-        cast_logits_dtype="bfloat16",
-        padding_side="right",
-    )
+    neuron_cfg = NeuronConfig(is_eagle_target=False,
+                          cast_logits_dtype="bfloat16")   # <- enables safe cast
     model = LlamaForSampling.from_pretrained(
         model_path,
         batch_size            = batch_size,
@@ -325,7 +293,6 @@ def compile_target_model(model_path: str,
         trust_remote_code     = True,
         fuse_qkv              = True,
         attention_layout      = "BSH",
-        use_2d_cache_ids      = True,
     )
     model.enable_speculative_decoder(spec_buckets)
     model.to_neuron()
@@ -336,7 +303,6 @@ def compile_target_model(model_path: str,
     # Ensure PAD token is defined so we can always right‑pad inputs.
     tokenizer = AutoTokenizer.from_pretrained(model_path,
                                               trust_remote_code=True,
-                                              padding_side="right",
                                               use_fast=False)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token

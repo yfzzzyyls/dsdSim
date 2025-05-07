@@ -30,242 +30,6 @@ if not logger.hasHandlers():
     logger.addHandler(h)
     logger.setLevel(logging.INFO)
 
-# ---------------------------------------------------------------------------
-# Helper: flatten tensors for gRPC payloads
-# ---------------------------------------------------------------------------
-def _tensor_to_flat(t: torch.Tensor):
-    return {"data": t.flatten().tolist(), "shape": list(t.shape)}
-
-# ---------------------------------------------------------------------------
-# Batched speculative decoding (B prompts at once)
-# ---------------------------------------------------------------------------
-def batched_speculative_decode(
-    draft_model, tokenizer, stub, prompts,
-    batch_input_ids, max_new_tokens, gamma,
-    *, profile=False, top_p=0.9, temperature=1.0, session_id=None,
-    true_lengths: torch.Tensor | None = None,   # (B,) vector of real prompt lengths
-):
-    B, L = batch_input_ids.shape
-
-    # 1) pre-fill
-    # --------------------------------------------------------------
-    # Pre-fill exactly like the target: call .forward() once with
-    # cache_ids=None, then set the per-row KV pointer to true_lengths.
-    # --------------------------------------------------------------
-    assert true_lengths is not None, "true_lengths must be provided"
-
-    # ------------------------------------------------------------------
-    # Provide a (B, L) cache‑id matrix so vectorize_last_token_id=True
-    # works exactly as on the target side.  Slots ≥ true_len[b] get ‑1.
-    # ------------------------------------------------------------------
-    B, L = batch_input_ids.shape
-    row_pos   = torch.arange(L, dtype=torch.int32).unsqueeze(0).repeat(B, 1)
-    over_len  = row_pos >= true_lengths.unsqueeze(1)
-    cache_mat = row_pos.masked_fill(over_len, -1)          # (B, L)
-
-    _ = draft_model.forward(batch_input_ids, cache_ids=cache_mat)
-    draft_model.cache_ids = true_lengths.clone()           # (B,) next-free slot per row
-    assert torch.equal(draft_model.cache_ids, true_lengths), (
-        "Draft KV cache pointer desynchronised: cache_ids != true_lengths"
-    )
-
-    eos_tok = tokenizer.eos_token_id
-    finished = torch.zeros(B, dtype=torch.bool)
-    out_bufs = [[] for _ in range(B)]
-    tokens_generated = torch.zeros(B, dtype=torch.int32)
-    # the prev_token used to generate the next token
-    last_token = batch_input_ids[:, -1].clone()
-
-    scratch = torch.empty((1,1), dtype=torch.int64)
-    valid_g = [b - 1 for b in SPEC_LENGTH_BUCKETS if b > 1]   # γ values that were compiled
-    requested_gamma = max(1, gamma)                            # never allow γ < 1
-
-    if requested_gamma not in valid_g:
-        snapped_gamma = max(g for g in valid_g if g <= requested_gamma)
-        logger.warning(
-            "Requested gamma=%d is not supported by the compiled buckets %s; "
-            "using gamma=%d instead.",
-            requested_gamma, valid_g, snapped_gamma
-        )
-        gamma = snapped_gamma
-    else:
-        gamma = requested_gamma
-
-    while not finished.all():
-        # ------------------------------------------------------------------
-        # Fully‑batched draft generation: do *γ* batched forward passes total.
-        # We maintain an `active` mask so we only update rows that
-        # still need tokens and skip those that are finished.
-        # ------------------------------------------------------------------
-        tok_rows  = [torch.empty((0,), dtype=torch.int64)  for _ in range(B)]
-        prob_rows = [torch.empty((0,), dtype=torch.float32) for _ in range(B)]
-
-        active = ~finished.clone()          # (B,) bool
-        prev_tokens = last_token.clone()    # (B,)
-
-        for step in range(gamma):
-            if not active.any():
-                break
-
-            # (1) build batched (B_active, 1) input tensor of prev tokens
-            active_idx = active.nonzero(as_tuple=False).squeeze(-1)    # indices
-            inputs = prev_tokens[active_idx].unsqueeze(1)              # (B_a, 1)
-
-            # (2) build cache_vec: Neuron single-token kernel needs (B_a, 1)
-            cache_vec = draft_model.cache_ids[active_idx].unsqueeze(1) # (B_a, 1)
-
-            # (3) single batched forward pass
-            logits, _ = draft_model.forward(inputs, cache_ids=cache_vec)
-            logits = logits / temperature                              # (B_a, V)
-
-            # logits  : (B_active, V)  after temperature scaling
-            # probs   : (B_active, V)  is no longer used directly
-
-            # (4) sampling: apply n-gram filter + top-k / top-p filtering
-            # (A) n‑gram repeat penalty
-            # Build a right‑padded (B_a, C) context tensor so filter_ngrams
-            # can run in one call even when rows have different history length.
-            ctx_rows = [
-                torch.tensor(out_bufs[b], dtype=torch.int64)
-                for b in active_idx.tolist()
-            ]
-            if ctx_rows:
-                C = max(r.numel() for r in ctx_rows)
-                ctx_pad = torch.full((len(ctx_rows), C), 0, dtype=torch.int64)
-                for i, row_t in enumerate(ctx_rows):
-                    k = row_t.numel()
-                    if k:
-                        ctx_pad[i, :k] = row_t
-            else:
-                ctx_pad = torch.zeros((len(active_idx), 0), dtype=torch.int64)
-
-            # --------------------------------------------------------------
-            # transformers_neuronx.sampling.filter_ngrams expects `cur_len`
-            # to be **scalar per call**.  It cannot accept a tensor of
-            # different lengths (one per row).  We therefore call it in a
-            # tiny per‑row loop here; γ is small, so the overhead is minimal.
-            # --------------------------------------------------------------
-            cache_vec_a = draft_model.cache_ids[active_idx]
-            next_ids = []
-            probs_row = []
-            for j, row_logits in enumerate(logits):          # iterate B_active
-                cur_len  = int(cache_vec_a[j].item())        # scalar length
-                row_ctx  = ctx_pad[j : j+1, :]               # (1, C)
-                row_mask = sampling.filter_ngrams(
-                    NGRAM_WINDOW,
-                    row_ctx,
-                    row_logits.unsqueeze(0),   # (1, V)
-                    cur_len
-                )
-                # Optional: apply nucleus/top‑k filtering.
-                # The combined n‑gram mask is already quite restrictive and
-                # the previous batch‑level call caused shape‑mismatch errors
-                # inside `transformers_neuronx.top_k_top_p_filtering`.
-                # For stability we skip that function here and simply
-                # soft‑max over the n‑gram‑masked logits.
-                row_probs = torch.softmax(row_mask, dim=-1).squeeze(0)  # (V,)
-                # If numerical underflow masks all probs, fall back to uniform
-                if row_probs.sum() <= 0:
-                    row_probs = torch.ones_like(row_probs) / row_probs.numel()
-                nid = int(torch.multinomial(row_probs, 1).item())
-                next_ids.append(nid)
-                prob_val = float(row_probs[nid]) if nid < row_probs.shape[0] else 1.0
-                probs_row.append(prob_val)
-            next_ids = torch.tensor(next_ids, dtype=torch.int64)
-            probs    = torch.tensor(probs_row, dtype=torch.float32)
-
-            # (5) write results back into row‑lists
-            for idx, row in enumerate(active_idx):
-                tok_rows[row]  = torch.cat([tok_rows[row], next_ids[idx:idx+1]])
-                prob_rows[row] = torch.cat([prob_rows[row], probs[idx:idx+1]])
-
-            # (6) update prev_tokens
-            prev_tokens[active_idx] = next_ids
-
-            # (7) check stopping conditions per row
-            reached_eos = (eos_tok is not None) & (next_ids == eos_tok)
-            reach_budget = (tokens_generated[active_idx] +
-                            torch.tensor([len(tok_rows[r]) for r in active_idx])) >= max_new_tokens
-            should_stop = reached_eos | reach_budget
-            # mark finished rows
-            active[active_idx[should_stop]] = False
-            finished[active_idx[should_stop]] = True
-
-        # ---- exit if nobody produced a token --------------------------------
-        if all(row.numel() == 0 for row in tok_rows):
-            break
-
-        # ------------------------------------------------------------------
-        # 2) Right-pad rows so they stack into (B, γ′) tensors
-        # ------------------------------------------------------------------
-        max_len = max(r.numel() for r in tok_rows)
-        pad_val = 0
-        tok_batch  = torch.full((B, max_len), pad_val, dtype=torch.int64)
-        prob_batch = torch.zeros((B, max_len), dtype=torch.float32)
-        for b in range(B):
-            k = tok_rows[b].numel()
-            if k:
-                tok_batch[b, :k]  = tok_rows[b]
-                prob_batch[b, :k] = prob_rows[b]
-
-        # ------------------------------------------------------------------
-        # 3) Verify whole batch in *one* RPC
-        # ------------------------------------------------------------------
-        result = grpc_client.verify_batch_tokens(
-            stub,
-            session_id,
-            _tensor_to_flat(tok_batch),      # Int32Tensor  (B, γ′)
-            _tensor_to_flat(prob_batch),     # FloatTensor (B, γ′)
-        )
-        # committed_ids is Int32Tensor → reshape to (B, K)
-        commit_t = torch.tensor(result.committed_ids.data,
-                                dtype=torch.int64).view(B, -1)    # (B, K)
-
-        # ------------------------------------------------------------------
-        # 4) Vectorised application of committed tokens
-        # ------------------------------------------------------------------
-        K = commit_t.shape[1]
-
-        # (B,) length of real (non-PAD) commits per row
-        commit_len = commit_t.ne(0).sum(dim=1, dtype=torch.int64)          # (B,)
-
-        # Respect remaining budget per row
-        remain     = (max_new_tokens - tokens_generated).clamp(min=0)      # (B,)
-        commit_len = torch.minimum(commit_len, remain)
-
-        # Mask of rows that actually receive new tokens *and* aren’t finished
-        valid_mask = (commit_len > 0) & (~finished)
-        if valid_mask.any():
-            idx = valid_mask.nonzero(as_tuple=False).squeeze(1)            # (N,)
-
-            # ---- tensorised state updates ----
-            tokens_generated[idx] += commit_len[idx]
-            draft_model.cache_ids[idx] += commit_len[idx].to(torch.int32)
-
-            # last_token becomes the final committed ID on each row
-            last_pos              = commit_len[idx] - 1                    # (N,)
-            last_token[idx]       = commit_t[idx, last_pos]
-
-            # rows that hit EOS or token budget are marked finished
-            eos_row     = torch.zeros_like(idx, dtype=torch.bool)
-            if eos_tok is not None:
-                eos_row = (commit_t[idx] == eos_tok).any(dim=1)
-            budget_row  = tokens_generated[idx] >= max_new_tokens
-            finished[idx] = eos_row | budget_row
-
-            # Python-list buffer extension (still per row)
-            for b in idx.tolist():
-                k = int(commit_len[b])
-                if k:
-                    out_bufs[b].extend(commit_t[b, :k].tolist())
-
-    return [
-        tokenizer.decode(buf, skip_special_tokens=True,
-                         clean_up_tokenization_spaces=False)
-        for buf in out_bufs
-    ]
-
-
 def speculative_decode(
     draft_model,
     tokenizer,
@@ -666,94 +430,27 @@ def run_client(
         return
     with open(prompt_text_file, 'r', encoding='utf-8') as f:
         prompts = [line.strip() for line in f if line.strip()]
-    # ------------------------------------------------------------------
-    # Batch‑size guardrail: ensure #prompts ≤ compiled batch_size
-    # ------------------------------------------------------------------
-    B = len(prompts)
-    if B > batch_size:
-        raise ValueError(
-            f"Prompt file contains {B} lines, which exceeds the compiled "
-            f"batch_size={batch_size}.  Either trim the prompt file or re-compile the "
-            f"model with a larger --batch value."
-        )
-        # logger.error(
-        #     "Prompt file contains %d lines, which exceeds the compiled "
-        #     "batch_size=%d.  Either trim the prompt file or re‑compile the "
-        #     "model with a larger --batch value.",
-        #     B, batch_size,
-        # )
-        # return
-
-    # ------------------------------------------------------------------
-    # Tokenise all prompts together → (B, L) tensor  (right‑padded)
-    # ------------------------------------------------------------------
-    batch_tokenizer = AutoTokenizer.from_pretrained(
-        target_tokenizer or draft_model_name,
-        use_fast=False,
-        padding_side="right",
-    )
-    # ------------------------------------------------------------------
-    # Ensure the tokenizer has a PAD token and remap padding in the *tensor*
-    # (not the tokenizer vocab) to ID 0.  We store the original pad ID so
-    # we can swap it out after tokenisation.
-    # ------------------------------------------------------------------
-    if batch_tokenizer.pad_token_id is None:
-        batch_tokenizer.add_special_tokens({"pad_token": "[PAD]"})
-
-    original_pad_id = batch_tokenizer.pad_token_id
-    # We won’t change pad_token_id yet; we first need to tokenise so we can
-    # find every occurrence of the old pad ID in the tensor.
-
-    # ============================================================
-    # Tokenise prompts twice:
-    #   (1) WITHOUT padding  → get true length of each prompt
-    #   (2)  WITH  padding   → get right‑padded (B, L) tensor for the model
-    # ============================================================
-
-    # (1) true per‑row lengths BEFORE padding
-    true_len_list = [
-        len(batch_tokenizer.encode(p, add_special_tokens=True))
-        for p in prompts
-    ]
-    true_lengths = torch.tensor(true_len_list, dtype=torch.int32)   # (B,)
-
-    # (2) build the padded batch‑input tensor
-    batch_tok = batch_tokenizer(
-        prompts,
-        return_tensors="pt",
-        padding=True,      # right‑pad to max length across prompts
-        truncation=False,  # never truncate – force caller to shorten
-    )
-    batch_input_ids = batch_tok["input_ids"]      # (B, L)
-    # Replace old pad ID with 0 in the tensor, then make 0 the official PAD ID
-    batch_input_ids[batch_input_ids == original_pad_id] = 0
-    batch_tokenizer.pad_token_id = 0
-    logger.info(
-        "Prepared batch_input_ids tensor with shape %s (B=%d, L=%d)",
-        tuple(batch_input_ids.shape),
-        batch_input_ids.shape[0],
-        batch_input_ids.shape[1],
-    )
-
-    # ============================================================
-    # Check if the prompt tensor is empty
-    assert prompts, "Prompt list is empty. Please provide valid prompts."
-    # ============================================================
+    if not prompts:
+        logger.error("No valid lines in the prompt file.")
+        return
 
     logger.info(f"Loading draft model '{draft_model_name}' (sequence_length={sequence_length}) for speculative decoding...")
-
-    # ============================================================
-    # Load the draft model
-    assert isinstance(draft_model_name, str), (
-        f"draft_model_name must be a string (path), not {type(draft_model_name)}"
-    )
-    draft_model = load_model(
-        draft_model_name,
-        sequence_length=sequence_length,
-        spec_length=gamma,
-        batch_size=batch_size
-    )
-    model_path_str = draft_model_name
+    if isinstance(draft_model_name, str):
+        # draft_model_name is a path → load the model
+        draft_model = load_model(
+            draft_model_name,
+            sequence_length=sequence_length,
+            spec_length=gamma,
+            batch_size=batch_size
+        )
+        model_path_str = draft_model_name
+    else:
+        TypeError("draft_model_name must be a string (path).")
+        # never happens in Neuron
+        # already a model instance
+        draft_model = draft_model_name
+        # try to recover a path for tokenizer fallback
+        model_path_str = getattr(getattr(draft_model, "config", None), "_name_or_path", None)
 
     # Decide which tokenizer to load
     if target_tokenizer:
@@ -765,7 +462,7 @@ def run_client(
             "Cannot determine tokenizer_source: provide --target_tokenizer when "
             "passing a pre-loaded draft model."
         )
-    tokenizer = AutoTokenizer.from_pretrained(tokenizer_source, use_fast=False, padding_side="right")
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_source, use_fast=False)
 
     # start the loop
     start_time = time.time()
@@ -775,37 +472,79 @@ def run_client(
     channel = grpc.insecure_channel(address)
     stub = inference_pb2_grpc.SpeculativeServiceStub(channel)
 
-    # ============================================================
-    # ---------- create batch sessions ----------
-    prompt_tensor = _tensor_to_flat(batch_input_ids)
-    length_tensor  = _tensor_to_flat(true_lengths)
-    sid_server = grpc_client.start_generation_batch(stub, prompt_tensor, length_tensor)
-    # The server MUST return exactly one session‑id for the whole batch.
-    if not sid_server or len(sid_server) == 0:
-        raise RuntimeError("Target server returned no session_id for StartGenerationBatch()")
+    # Step 1) Single unified loop: create a session, prime the target, and immediately decode
+    session_ids = []
+    session_prefill = {}
+    final_texts = []
+    tokens_generated = []
+    accepted_counts = []
+    target_counts = []
 
-    # for a single-session batch the server sends exactly one ID, so the list always has length 1.
-    batch_session_sid = sid_server[0]   # single authoritative session_id
-    # ============================================================
+    logger.info(f"Processing prompt: {prompts[0]}")
+    sid = _gen_session_id()
+    session_ids.append(sid)
 
-    # ---------- run batched speculative decode ----------
-    generated_texts = batched_speculative_decode(
+    # Prime target session
+    t0 = time.perf_counter()
+    stub.StartGeneration(
+        inference_pb2.StartRequest(
+            session_id=sid,
+            prompt=prompts[0],
+            max_new_tokens=max_new_tokens,
+            gamma=gamma,
+        )
+    )
+    session_prefill[sid] = time.perf_counter() - t0
+
+    # Decode this prompt immediately
+    start_time_prompt = time.time()
+    gen_text, perf_stats = speculative_decode(
         draft_model, tokenizer, stub,
-        prompts, batch_input_ids,
-        max_new_tokens, gamma,
+        prompts[0], max_new_tokens, gamma,
         profile=profile, top_p=top_p, temperature=temperature,
-        session_id=batch_session_sid,
-        true_lengths = true_lengths,   # (B,) vector of real prompt lengths
+        session_id=sid
+    )
+    latency_prompt = time.time() - start_time_prompt
+
+    # Post‑process per‑prompt stats
+    perf_stats["target_prefill_time"] = session_prefill[sid]
+    perf_stats["total_time"] = latency_prompt
+    tokens_total = perf_stats.get("tokens_generated", 0)
+    throughput = tokens_total / latency_prompt if latency_prompt > 0 else 0.0
+    perf_stats["throughput"] = throughput
+    perf_stats["avg_token_time"] = latency_prompt / tokens_total if tokens_total > 0 else 0.0
+
+    accepted = perf_stats.get("accepted_tokens_total", 0)
+    tgt = perf_stats.get("target_tokens_total", 0)
+    gen_tokens = accepted + tgt or len(tokenizer.encode(gen_text, add_special_tokens=False))
+
+    match_rate_prompt = perf_stats.get("token_match_rate")
+    if match_rate_prompt is not None:
+        logger.info(
+            f"Speculative decoding match rate: {match_rate_prompt:.2%} "
+            f"(Draft accepted: {accepted}, Target generated: {tgt})"
+        )
+
+    throughput_prompt = gen_tokens / latency_prompt if latency_prompt > 0 else 0.0
+    logger.info(
+        f"speculative decoding completed in {latency_prompt:.2f}s, "
+        f"tokens generated: {gen_tokens}, throughput: {throughput_prompt:.2f} t/s"
     )
 
-    for i, txt in enumerate(generated_texts):
-        print(f"\n=== Output [{i}] ===\n{prompts[i]}{txt}\n")
+    final_texts.append(prompts[0] + gen_text)
+    tokens_generated.append(gen_tokens)
+    accepted_counts.append(accepted)
+    target_counts.append(tgt)
+
+    if profile:
+        perf_stats["prompt_id"] = 0   # single‑prompt path
+        save_perf_stats(perf_stats, file_prefix="performance_speculative")
 
     total_time = time.time() - start_time
     logger.info(f"Distributed speculative decode completed in {total_time:.2f}s.")
 
     print("\n=== Final Outputs ===")
-    for i, text in enumerate(generated_texts):
+    for i, text in enumerate(final_texts):
         print(f"[Prompt {i} Output]:\n{text}\n")
 
 def _gen_session_id():
