@@ -85,7 +85,12 @@ def speculative_decode(
     if prompt_ids.shape[-1] > 0:
        # build the KV cache for the prompt
        time_draftprefill = time.perf_counter()
-       _ = draft_model.forward(input_ids=prompt_ids)          # fills 0…L‑1
+       L = prompt_ids.shape[1]
+       cache_vec = torch.arange(L, dtype=torch.int32).unsqueeze(0)   # (1, L)
+       _ = draft_model.forward(
+           input_ids=prompt_ids,
+           cache_ids=cache_vec,          # avoid AttributeError in Neuron _prepare_for_par_ctx_rhs_padding
+       )                                 # fills 0…L‑1
        timing["draft_prefill_time"] += time.perf_counter() - time_draftprefill
        prompt_len = prompt_ids.shape[-1]
        # Overwrite cache pointer with a single‑index tensor [L]

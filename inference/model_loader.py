@@ -194,6 +194,7 @@ def compile_model(model_path: str,
             fuse_qkv=True,
             attention_layout="BSH",
             enable_chunked_prefill=True,
+            use_2d_cache_ids=True,
         )
         model.to_neuron()
         # ------------------------------------------------------------------

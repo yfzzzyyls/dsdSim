@@ -115,10 +115,19 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
 
             if current_ids.shape[1] > 0:
                 L = current_ids.shape[1]
-                # 2‑D cache id tensor shape (1, L) → [[0, 1, …, L‑1]]
-                cache_vec = torch.arange(L, dtype=torch.int32).unsqueeze(0)
+                # ----------------------------------------------------------
+                # Build a (2, L) batched prompt so it matches the compiled
+                # batch_size=2 graphs.  Row‑0 = real prompt, Row‑1 = PAD.
+                # ----------------------------------------------------------
+                pad_id = self.tokenizer.pad_token_id or self.tokenizer.eos_token_id
+                pad_row = torch.full_like(current_ids, pad_id)     # (1, L)
+                batched_ids = torch.cat([current_ids, pad_row], dim=0)   # (2, L)
+
+                # 2‑D cache_ids tensor (2, L): each row [0 … L‑1]
+                cache_vec = torch.arange(L, dtype=torch.int32).unsqueeze(0).repeat(2, 1)
+
                 _ = self.model.forward(
-                    input_ids=current_ids,
+                    input_ids=batched_ids,
                     cache_ids=cache_vec,
                 )
 
