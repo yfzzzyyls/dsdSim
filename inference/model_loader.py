@@ -294,7 +294,7 @@ def compile_target_model(model_path: str,
         neuron_config         = neuron_cfg,
         tp_degree             = tp_degree,
         on_device_generation  = False,        # we need raw logits on host
-        return_all_logits     = False,         # **key line – full distributions**
+        return_all_logits     = True,          # need full vocab probs for verification
         return_all_outputs    = True,
         return_dict           = True,
         torchscript           = True,

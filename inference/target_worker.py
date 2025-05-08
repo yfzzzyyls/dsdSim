@@ -463,6 +463,20 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
         input_ids  = torch.stack(input_ids, 0)        # (B, γ+1)
         cache_vecs = torch.stack(cache_vecs, 0)       # (B, γ+1)
 
+        # --------------------------------------------------------------
+        # If we have fewer rows than the compiled batch size, pad with
+        # dummy copies of the first row so the Neuron graph key matches
+        # (spec_len, batch_size=self.max_batch).  Padded rows are ignored
+        # when we split results below.
+        # --------------------------------------------------------------
+        if B < self.max_batch:
+            pad_n = self.max_batch - B
+            # Duplicate row‑0; safe because we discard its logits later.
+            pad_ids   = input_ids[0:1].repeat(pad_n, 1)
+            pad_vecs  = cache_vecs[0:1].repeat(pad_n, 1)
+            input_ids = torch.cat([input_ids, pad_ids], dim=0)
+            cache_vecs = torch.cat([cache_vecs, pad_vecs], dim=0)
+
         # ------------------------------------------------------------------
         # Batched speculative_forward
         # ------------------------------------------------------------------
@@ -476,6 +490,9 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
 
         # logits: (B, γ+1, V)  → split per session
         for b, req in enumerate(batch_reqs):
+            # Skip the padded dummy rows – they have no corresponding request
+            if b >= B:
+                continue
             sid          = req["session_id"]
             sess         = sess_list[b]
             draft_tokens = req["draft_tokens"]
