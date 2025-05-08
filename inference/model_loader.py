@@ -173,13 +173,15 @@ def compile_model(model_path: str,
     tp_degree = int(os.environ.get("NEURON_RT_NUM_CORES", "2"))
     if model_type.lower() == "llama" or "llama" in model_path.lower():
         logger.info(f"Compiling model using optimized LLaMA for Neuron ...")
+        neuron_cfg = NeuronConfig(padding_side="right")
         model = LlamaForSampling.from_pretrained(
             model_path,
             batch_size=batch_size,
             amp='bf16',
             n_positions=sequence_length,
             context_length_estimate=sequence_length,
-            spec_length = spec_length,
+            spec_length=spec_length,
+            neuron_config=neuron_cfg,
             tp_degree=tp_degree,
             on_device_generation=False,
             return_all_logits=True,
@@ -271,7 +273,7 @@ def compile_target_model(model_path: str,
 
     tp_degree = int(os.environ.get("NEURON_RT_NUM_CORES", "2"))
     neuron_cfg = NeuronConfig(is_eagle_target=False,
-                          cast_logits_dtype="bfloat16")   # <- enables safe cast
+                          cast_logits_dtype="bfloat16", padding_side="right")
     model = LlamaForSampling.from_pretrained(
         model_path,
         batch_size            = batch_size,
@@ -293,6 +295,7 @@ def compile_target_model(model_path: str,
         trust_remote_code     = True,
         fuse_qkv              = True,
         attention_layout      = "BSH",
+        use_2d_cache_ids      = True,
     )
     model.enable_speculative_decoder(spec_buckets)
     model.to_neuron()
