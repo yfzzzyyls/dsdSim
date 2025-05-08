@@ -30,6 +30,13 @@ class NeuronHFAdapterWrap(torch.nn.Module):
         self._next_pos = 0  # next position index in the KV cache
         self.config = adapter.config
 
+    def update_cache(self, cache_ids, next_pos):
+        """
+        Update the KV cache pointer and next position index.
+        """
+        self.cache_ids = cache_ids
+        self._next_pos = next_pos
+
     # ------------------------------------------------------------------  
     # helper: build a (batch, length) int32 tensor [start, …, start+L‑1]  
     # ------------------------------------------------------------------

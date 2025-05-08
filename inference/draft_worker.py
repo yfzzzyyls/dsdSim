@@ -68,7 +68,8 @@ def speculative_decode(
 
     # pre-filling: Feed the entire prompt once so the draft model builds its KV cache
     prompt_ids = tokenizer(prompt, return_tensors='pt').input_ids
-    prev_token_id = int(prompt_ids[0, -1].item()) if prompt_ids.shape[-1] > 0 else tokenizer.bos_token_id
+    assert prompt_ids is not None, "Prompt tokenization failed due to empty input."
+    prev_token_id = int(prompt_ids[0, -1].item())
 
     # --------------------------------------------------------------
     # Per‑stage timing buckets (all values in seconds)
@@ -82,25 +83,19 @@ def speculative_decode(
     }
     
     # Feed the prompt so Neuron caches 0…L‑1, then set pointer to NEXT index (=L)
-    if prompt_ids.shape[-1] > 0:
-       # build the KV cache for the prompt
-       time_draftprefill = time.perf_counter()
-       L = prompt_ids.shape[1]
-       cache_vec = torch.arange(L, dtype=torch.int32).unsqueeze(0)   # (1, L)
-       _ = draft_model.forward(
-           input_ids=prompt_ids,
-           cache_ids=cache_vec,          # avoid AttributeError in Neuron _prepare_for_par_ctx_rhs_padding
-       )                                 # fills 0…L‑1
-       timing["draft_prefill_time"] += time.perf_counter() - time_draftprefill
-       prompt_len = prompt_ids.shape[-1]
-       # Overwrite cache pointer with a single‑index tensor [L]
-       draft_model.cache_ids = torch.tensor([prompt_len], dtype=torch.int32)
-       draft_model._next_pos = prompt_len
-    else:
-       # no prompt given
-       prompt_len = 0
-       draft_model.cache_ids = torch.tensor([0], dtype=torch.int32)
-       draft_model._next_pos = 0
+    # build the KV cache for the prompt
+    time_draftprefill = time.perf_counter()
+    L = prompt_ids.shape[1]
+    cache_vec = torch.arange(L, dtype=torch.int32).unsqueeze(0)   # (1, L)
+    _ = draft_model.forward(
+        input_ids=prompt_ids,
+        cache_ids=cache_vec,          # avoid AttributeError in Neuron _prepare_for_par_ctx_rhs_padding
+    )                                 # fills 0…L‑1
+    timing["draft_prefill_time"] += time.perf_counter() - time_draftprefill
+    # Overwrite cache pointer with a single‑index tensor [L]
+    draft_model.update_cache(torch.tensor([L], dtype=torch.int32), L)
+    # draft_model.cache_ids = torch.tensor([L], dtype=torch.int32)
+    # draft_model._next_pos = L
 
     tokens_generated = 0
     # reusable scratch tensor (1,1) for single-token forwards

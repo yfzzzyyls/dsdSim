@@ -138,8 +138,11 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
 
             # --- MANUALLY align wrapper pointer with the prompt length ---
             next_pos = current_ids.shape[1]                       # L
-            self.model._next_pos = next_pos
-            self.model.cache_ids = torch.tensor([next_pos], dtype=torch.int32)
+            self.model.update_cache(torch.tensor([next_pos], dtype=torch.int32),
+                                    next_pos)
+            
+            # self.model._next_pos = next_pos
+            # self.model.cache_ids = torch.tensor([next_pos], dtype=torch.int32)
 
             # record in session
             self.sessions[session_id].cache_ids = self.model.cache_ids.clone()
