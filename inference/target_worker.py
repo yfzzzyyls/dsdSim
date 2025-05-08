@@ -216,8 +216,10 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
         # Manually bump wrapper pointer so it matches the device
         orig_next_pos = int(sess.cache_ids.item())    # authoritative
         new_next_pos  = orig_next_pos + len(tok_ids)
-        self.model._next_pos = new_next_pos
-        self.model.cache_ids = torch.tensor([new_next_pos], dtype=torch.int32)
+        self.model.update_cache(torch.tensor([new_next_pos], dtype=torch.int32),
+                                new_next_pos)
+        # self.model._next_pos = new_next_pos
+        # self.model.cache_ids = torch.tensor([new_next_pos], dtype=torch.int32)
 
         # Keep the session pointer consistent with the model.
         sess.cache_ids = self.model.cache_ids.clone()
@@ -231,7 +233,6 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
         sess.current_ids = torch.cat([sess.current_ids, new_tok_tensor], dim=1)
 
         # Optionally assert pointer is correct
-
         if self.eos_token_id is not None and any(t == self.eos_token_id for t in tok_ids):
             sess.finished = True
 
@@ -404,7 +405,7 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
     def _scheduler_loop(self):
         """
         Drain self.verify_queue; batch together all requests that (a) arrive
-        within self.batch_timeout s *or* (b) fill up to self.max_batch items.
+        within self.batch_timeouts *or* (b) fill up to self.max_batch items.
         For the first implementation we assume *all* requests use the same
         γ (chunk length) so they share one compiled Neuron graph.
         """
@@ -439,10 +440,14 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
         sess_list      = []
         draft_tok_lens = {len(r["draft_tokens"]) for r in batch_reqs}
         # Simple: require identical γ; otherwise process sequentially.
-        if len(draft_tok_lens) != 1:
-            for r in batch_reqs:
-                self._process_batch([r])
-            return
+        # TODO: Changed to "padding-to-max" and adjust accept/reject rule to ignore padded slots. 
+        assert len(draft_tok_lens) == 1, \
+            f"Only support same γ for multiple draft models: {draft_tok_lens} (expected 1)"
+        
+        # if len(draft_tok_lens) != 1:
+        #     for r in batch_reqs:
+        #         self._process_batch([r])
+        #     return
 
         gamma = draft_tok_lens.pop()
         B     = len(batch_reqs)
@@ -461,7 +466,7 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
             prev_token = int(sess.current_ids[0, -1].item())
             toks = [prev_token] + r["draft_tokens"]          # γ+1
 
-            start_pos = int(sess.cache_ids.item()) - 1
+            start_pos = int(sess.cache_ids.item())
             vec = torch.arange(len(toks), dtype=torch.int32) + start_pos
 
             input_ids.append(torch.tensor(toks, dtype=torch.int32))
@@ -475,6 +480,8 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
         # collapsing the vocab axis down to 2 columns.
         # Also pad sess_list with None for dummy rows.
         # --------------------------------------------------------------
+        assert real_B <= self.max_batch, \
+            f"Batch size {real_B} compiled now should be the less than max_batch {self.max_batch}"
         if real_B < self.max_batch:
             pad_n   = self.max_batch - real_B
             pad_ids = input_ids[0].clone()
@@ -496,7 +503,7 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
             cache_ids   = cache_vecs,
             spec_length = gamma + 1,
         )
-        logger.info("[scheduler - process_batch] speculative_forward raw shape = %s", tuple(logits.shape))
+        # logger.info("[scheduler - process_batch] speculative_forward raw shape = %s", tuple(logits.shape))
         # Raw Neuron layout is (N, V, B)  where:
         #   N = γ + 1, V = vocab shards (≈ vocab_size × TP), B = batch
         # We keep this layout to avoid the transpose overhead.
@@ -521,12 +528,12 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
             device = tgt_row_probs.device
             dr_tokens = torch.tensor(draft_tokens, device=device)
             row_idx   = torch.arange(len(draft_tokens), device=device)
-            p_tgt_t   = tgt_row_probs[row_idx, dr_tokens]
-            q_draft_t = torch.tensor(draft_probs, device=device)
+            p_tgt   = tgt_row_probs[row_idx, dr_tokens]
+            q_draft = torch.tensor(draft_probs, device=device)
 
-            ratio  = p_tgt_t / q_draft_t
+            ratio  = p_tgt / q_draft
             rand_v = torch.rand_like(ratio)
-            accept = (p_tgt_t >= q_draft_t) | (rand_v < ratio)
+            accept = (p_tgt >= q_draft) | (rand_v < ratio)
             rej    = (~accept).nonzero(as_tuple=False)
             first_rej = int(rej[0].item()) if rej.numel() > 0 else len(draft_tokens)
 

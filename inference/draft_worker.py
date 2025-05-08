@@ -273,12 +273,13 @@ def speculative_decode(
         # ============================================================
         # set bonus id to the next beginning of generating new draft tokens
         prev_token_id = bonus_id
-        tok = bonus_id
         # ==============================================================
         # # 3) Advance pointer past the newly‑written bonus token.
         # this is used to update the KV cache ptr
-        draft_model._next_pos += (accepted_count + 1)
-        draft_model.cache_ids[0] = draft_model._next_pos
+        # draft_model.update_cache(torch.tensor([tok], dtype=torch.int32), tok)
+        new_next_pos = draft_model._next_pos + accepted_count + 1
+        new_cache_id = torch.tensor([new_next_pos], dtype=torch.int32)
+        draft_model.update_cache(new_cache_id, new_next_pos)
         # ==============================================================
 
         # Record every token that will appear in the final text
@@ -287,7 +288,7 @@ def speculative_decode(
         if tokens_generated >= max_new_tokens:
             finished = True
             break
-        if tokenizer.eos_token_id is not None and tok == tokenizer.eos_token_id:
+        if tokenizer.eos_token_id is not None and bonus_id == tokenizer.eos_token_id:
             finished = True
 
         logger.debug("ACCEPT cnt=%d  committed=%s",
