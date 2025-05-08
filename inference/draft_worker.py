@@ -123,7 +123,8 @@ def speculative_decode(
         for i in range(current_gamma):
             scratch_token[0, 0] = prev_token_id
             next_pos = draft_model._next_pos + i
-            cache_vec = torch.tensor([next_pos], dtype=torch.int32)
+            # Neuron decoder expects (B, 1) – wrap pos in an extra bracket
+            cache_vec = torch.tensor([[next_pos]], dtype=torch.int32)   # shape = (1, 1)
             time_draftgen = time.perf_counter()            
             logits, _ = draft_model.forward(input_ids=scratch_token, cache_ids=cache_vec)
             timing["draft_generation_time"] += time.perf_counter() - time_draftgen
