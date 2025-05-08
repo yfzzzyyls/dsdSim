@@ -62,7 +62,7 @@ pip install --upgrade transformers-neuronx
 3. **Optinal: Generate new grpc files**
 
    ```
-   cd Choral-Spec/grpc_comm
+   cd grpc_comm
    python -m grpc_tools.protoc -I. --python_out=. --grpc_python_out=. inference.proto
    ```
 

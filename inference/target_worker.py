@@ -143,7 +143,7 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
 
             # record in session
             self.sessions[session_id].cache_ids = self.model.cache_ids.clone()
-        return inference_pb2.StartResponse(acknowledged=True)
+        return inference_pb2.StartResponse(acknowledged=True, session_id=session_id)
     
     def _commit_tokens_bulk(self, sess, tok_ids):
         """
