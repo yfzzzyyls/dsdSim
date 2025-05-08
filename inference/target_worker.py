@@ -10,6 +10,7 @@ import random
 from transformers.generation import LogitsProcessorList, SuppressTokensLogitsProcessor
 import queue
 import threading
+import uuid
 
 
 logger = logging.getLogger(__name__)
@@ -99,13 +100,16 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
         gamma = request.gamma
         logger.debug(f"[session={session_id}] StartGeneration: prompt='{prompt_text}', max_new_tokens={max_tokens}, gamma={gamma}")
         with self.lock:
-            if session_id in self.sessions:
-                logger.warning(f"Session {session_id} already exists, overwriting.")
-            if prompt_text:
-                enc = self.tokenizer(prompt_text, return_tensors='pt')
-                current_ids = enc["input_ids"]
-            else:
-                current_ids = torch.zeros((1,0), dtype=torch.long)
+            assert session_id == 0, \
+                f"Session id {session_id} must be 0 for StartGeneration."
+            assert not session_id in self.sessions, \
+                f"Session {session_id} should not exists."
+            assert prompt_text is not None, \
+                f"Prompt text is required for session."
+            # Generate a fresh, 32-bit random id
+            session_id = int(uuid.uuid4()) & 0xFFFFFFFF
+            enc = self.tokenizer(prompt_text, return_tensors='pt')
+            current_ids = enc["input_ids"]
             self.sessions[session_id] = TargetSession(current_ids)
             # ------------------------------------------------------------------
             # Priming Neuron KV cache for the prompt
@@ -113,23 +117,24 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
             self.model.cache_ids = None
             self.model._next_pos = 0
 
-            if current_ids.shape[1] > 0:
-                L = current_ids.shape[1]
-                # ----------------------------------------------------------
-                # Build a (2, L) batched prompt so it matches the compiled
-                # batch_size=2 graphs.  Row‑0 = real prompt, Row‑1 = PAD.
-                # ----------------------------------------------------------
-                pad_id = self.tokenizer.pad_token_id or self.tokenizer.eos_token_id
-                pad_row = torch.full_like(current_ids, pad_id)     # (1, L)
-                batched_ids = torch.cat([current_ids, pad_row], dim=0)   # (2, L)
+            # propmt shape: (1, L)  where L = prompt length
+            L = current_ids.shape[1]
+            # ----------------------------------------------------------
+            # Build a (2, L) batched prompt so it matches the compiled
+            # batch_size=2 graphs.  Row‑0 = real prompt, Row‑1 = PAD.
+            # TODO: Should be (N, L) in the future
+            # ----------------------------------------------------------
+            pad_id = self.tokenizer.pad_token_id or 0
+            pad_row = torch.full_like(current_ids, pad_id)     # (1, L)
+            batched_ids = torch.cat([current_ids, pad_row], dim=0)   # (2, L)
 
-                # 2‑D cache_ids tensor (2, L): each row [0 … L‑1]
-                cache_vec = torch.arange(L, dtype=torch.int32).unsqueeze(0).repeat(2, 1)
+            # 2‑D cache_ids tensor (2, L): each row [0 … L‑1]
+            cache_vec = torch.arange(L, dtype=torch.int32).unsqueeze(0).repeat(2, 1)
 
-                _ = self.model.forward(
-                    input_ids=batched_ids,
-                    cache_ids=cache_vec,
-                )
+            _ = self.model.forward(
+                input_ids=batched_ids,
+                cache_ids=cache_vec,
+            )
 
             # --- MANUALLY align wrapper pointer with the prompt length ---
             next_pos = current_ids.shape[1]                       # L

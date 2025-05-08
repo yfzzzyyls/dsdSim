@@ -477,16 +477,17 @@ def run_client(
     # session_id, cache, and speculative_decode() loop.
     # ------------------------------------------------------------------
     def _worker(prompt_idx, prompt_text):
-        sid = _gen_session_id()
         # Prime target
-        stub.StartGeneration(
+        # Ask the target to assign a canonical session-id
+        start_resp = stub.StartGeneration(
             inference_pb2.StartRequest(
-                session_id=sid,
+                session_id=0,                 # 0 → “please assign one for me”
                 prompt=prompt_text,
                 max_new_tokens=max_new_tokens,
                 gamma=gamma,
             )
         )
+        sid = start_resp.session_id
         t0 = time.time()
         gen_text, perf_stats = speculative_decode(
             draft_model, tokenizer, stub,
