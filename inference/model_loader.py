@@ -175,7 +175,6 @@ def compile_model(model_path: str,
         logger.info(f"Compiling model using optimized LLaMA for Neuron ...")
         neuron_cfg = NeuronConfig(
             padding_side="right",
-            enable_chunked_prefill=True,   # ← activate chunked‑prefill
         )
         model = LlamaForSampling.from_pretrained(
             model_path,
@@ -193,7 +192,8 @@ def compile_model(model_path: str,
             use_cache=True,
             trust_remote_code=True,
             fuse_qkv=True,
-            attention_layout="BSH"
+            attention_layout="BSH",
+            enable_chunked_prefill=True,
         )
         model.to_neuron()
         # ------------------------------------------------------------------
@@ -279,7 +279,6 @@ def compile_target_model(model_path: str,
         is_eagle_target=False,
         cast_logits_dtype="bfloat16",
         padding_side="right",
-        enable_chunked_prefill=True,      # ← activate chunked‑prefill
     )
     model = LlamaForSampling.from_pretrained(
         model_path,
@@ -303,6 +302,7 @@ def compile_target_model(model_path: str,
         fuse_qkv              = True,
         attention_layout      = "BSH",
         use_2d_cache_ids      = True,
+        enable_chunked_prefill=True,
     )
     model.enable_speculative_decoder(spec_buckets)
     model.to_neuron()
