@@ -12,6 +12,7 @@ from transformers import AutoTokenizer
 import torch
 import random
 import collections
+import concurrent.futures
 from transformers_neuronx import sampling
 from inference.model_loader import SPEC_LENGTH_BUCKETS
 
@@ -464,88 +465,71 @@ def run_client(
         )
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_source, use_fast=False)
 
-    # start the loop
-    start_time = time.time()
+    # ------------------------------------------------------------------
+    # Stage‑3: run one *thread* per prompt so draft‑side generation
+    # overlaps network verification latency.  Each thread owns its own
+    # session_id, cache, and speculative_decode() loop.
+    # ------------------------------------------------------------------
+    def _worker(prompt_idx, prompt_text):
+        sid = _gen_session_id()
+        # Prime target
+        stub.StartGeneration(
+            inference_pb2.StartRequest(
+                session_id=sid,
+                prompt=prompt_text,
+                max_new_tokens=max_new_tokens,
+                gamma=gamma,
+            )
+        )
+        t0 = time.time()
+        gen_text, perf_stats = speculative_decode(
+            draft_model, tokenizer, stub,
+            prompt_text, max_new_tokens, gamma,
+            profile=profile, top_p=top_p, temperature=temperature,
+            session_id=sid
+        )
+        latency = time.time() - t0
+        final_text = prompt_text + gen_text
+        logger.info(
+            "[Thread %d] completed in %.2fs, tokens=%d, throughput=%.2f t/s",
+            prompt_idx, latency,
+            perf_stats.get("tokens_generated", 0),
+            perf_stats.get("throughput", 0.0),
+        )
+        return {
+            "prompt_idx": prompt_idx,
+            "text": final_text,
+            "latency": latency,
+            "perf": perf_stats,
+        }
 
+    start_time = time.time()
     address = f"{target_host}:{port}"
     logger.info(f"Connecting to target server at {address} (host={target_host}, port={port})...")
     channel = grpc.insecure_channel(address)
     stub = inference_pb2_grpc.SpeculativeServiceStub(channel)
 
-    # Step 1) Single unified loop: create a session, prime the target, and immediately decode
-    session_ids = []
-    session_prefill = {}
-    final_texts = []
-    tokens_generated = []
-    accepted_counts = []
-    target_counts = []
+    results = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(prompts), 8)) as pool:
+        fut2idx = {pool.submit(_worker, i, p): i for i, p in enumerate(prompts)}
+        for fut in concurrent.futures.as_completed(fut2idx):
+            results.append(fut.result())
 
-    logger.info(f"Processing prompt: {prompts[0]}")
-    sid = _gen_session_id()
-    session_ids.append(sid)
+    # Sort results by original prompt order
+    results.sort(key=lambda r: r["prompt_idx"])
 
-    # Prime target session
-    t0 = time.perf_counter()
-    stub.StartGeneration(
-        inference_pb2.StartRequest(
-            session_id=sid,
-            prompt=prompts[0],
-            max_new_tokens=max_new_tokens,
-            gamma=gamma,
-        )
-    )
-    session_prefill[sid] = time.perf_counter() - t0
+    # Pretty‑print outputs
+    print("\n=== Final Outputs (CONCURRENT) ===")
+    for r in results:
+        print(f"[Prompt {r['prompt_idx']} Output]:\n{r['text']}\n")
 
-    # Decode this prompt immediately
-    start_time_prompt = time.time()
-    gen_text, perf_stats = speculative_decode(
-        draft_model, tokenizer, stub,
-        prompts[0], max_new_tokens, gamma,
-        profile=profile, top_p=top_p, temperature=temperature,
-        session_id=sid
-    )
-    latency_prompt = time.time() - start_time_prompt
-
-    # Post‑process per‑prompt stats
-    perf_stats["target_prefill_time"] = session_prefill[sid]
-    perf_stats["total_time"] = latency_prompt
-    tokens_total = perf_stats.get("tokens_generated", 0)
-    throughput = tokens_total / latency_prompt if latency_prompt > 0 else 0.0
-    perf_stats["throughput"] = throughput
-    perf_stats["avg_token_time"] = latency_prompt / tokens_total if tokens_total > 0 else 0.0
-
-    accepted = perf_stats.get("accepted_tokens_total", 0)
-    tgt = perf_stats.get("target_tokens_total", 0)
-    gen_tokens = accepted + tgt or len(tokenizer.encode(gen_text, add_special_tokens=False))
-
-    match_rate_prompt = perf_stats.get("token_match_rate")
-    if match_rate_prompt is not None:
-        logger.info(
-            f"Speculative decoding match rate: {match_rate_prompt:.2%} "
-            f"(Draft accepted: {accepted}, Target generated: {tgt})"
-        )
-
-    throughput_prompt = gen_tokens / latency_prompt if latency_prompt > 0 else 0.0
-    logger.info(
-        f"speculative decoding completed in {latency_prompt:.2f}s, "
-        f"tokens generated: {gen_tokens}, throughput: {throughput_prompt:.2f} t/s"
-    )
-
-    final_texts.append(prompts[0] + gen_text)
-    tokens_generated.append(gen_tokens)
-    accepted_counts.append(accepted)
-    target_counts.append(tgt)
-
+    # Aggregate CSV if profiling
     if profile:
-        perf_stats["prompt_id"] = 0   # single‑prompt path
-        save_perf_stats(perf_stats, file_prefix="performance_speculative")
+        for r in results:
+            save_perf_stats(r["perf"], file_prefix="performance_speculative")
 
     total_time = time.time() - start_time
     logger.info(f"Distributed speculative decode completed in {total_time:.2f}s.")
-
-    print("\n=== Final Outputs ===")
-    for i, text in enumerate(final_texts):
-        print(f"[Prompt {i} Output]:\n{text}\n")
 
 def _gen_session_id():
     return int(uuid.uuid4()) & 0xFFFFFFFF

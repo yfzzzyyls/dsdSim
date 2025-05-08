@@ -8,6 +8,8 @@ from transformers import AutoTokenizer
 from grpc_comm import inference_pb2, inference_pb2_grpc
 import random
 from transformers.generation import LogitsProcessorList, SuppressTokensLogitsProcessor
+import queue
+import threading
 
 
 logger = logging.getLogger(__name__)
@@ -45,6 +47,18 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
         self.eos_token_id = self.tokenizer.eos_token_id
         self._ctx_estimate = sequence_length
         self.sessions = {}  # session_id -> TargetSession
+        # ------------------------------------------------------------------
+        # Scheduler state (Stage‑2 incremental batching)
+        # ------------------------------------------------------------------
+        self.verify_queue   = queue.Queue()               # (req_dict) items
+        self.batch_timeout  = 0.001                       # seconds to wait for more peers
+        self.max_batch      = batch_size                  # honour compile batch
+        # map session_id -> Queue for the blocking VerifyDraftTokens call
+        self.result_queues  = {}
+        self._sched_thread  = threading.Thread(
+            target=self._scheduler_loop, daemon=True
+        )
+        self._sched_thread.start()
         self.lock = torch.multiprocessing.Lock()
 
     # ------------------------------------------------------------------
@@ -303,195 +317,43 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
         return logits_all
 
     def VerifyDraftTokens(self, request, context):
+        """
+        Non-blocking enqueue: place request in scheduler queue, wait for result.
+        """
         start_verify_t = time.perf_counter()
-        sid          = request.session_id
-        draft_tokens = list(request.draft_tokens)
-        # # ============================
-        # # Decode IDs → words for easier debugging
-        # draft_texts = [self.tokenizer.decode([tid], clean_up_tokenization_spaces=False)
-        #             for tid in draft_tokens]
-        # logger.debug("[session=%s] received draft tokens (text)=%s  ids=%s",
-        #             sid, draft_texts, draft_tokens)
-        # # ============================
-        
-        draft_probs  = list(request.draft_probs)
-        logger.debug("[session=%s] draft_probs=%s", sid, draft_probs)
+        sid           = request.session_id
+        draft_tokens  = list(request.draft_tokens)
+        draft_probs   = list(request.draft_probs)
 
-        assert draft_probs, (
-            f"[session={sid}] VerifyDraftTokens received empty draft_probs for "
-            f"{len(draft_tokens)} draft_tokens"
+        if not draft_tokens:
+            return inference_pb2.VerifyResponse(
+                committed_ids=[], accepted_count=0,
+                verify_time_ms=0.0, finished=True
+            )
+
+        # Prepare per‑call rendez‑vous Queue
+        resp_q = queue.Queue(maxsize=1)
+        self.result_queues[sid] = resp_q
+
+        # Enqueue work for the scheduler thread
+        self.verify_queue.put({
+            "session_id":    sid,
+            "draft_tokens":  draft_tokens,
+            "draft_probs":   draft_probs,
+            "enqueue_time":  start_verify_t,
+        })
+
+        # Block until scheduler puts result
+        committed_ids, accepted_cnt, verify_ms, finished = resp_q.get()
+
+        return inference_pb2.VerifyResponse(
+            committed_ids=committed_ids,
+            accepted_count=accepted_cnt,
+            verify_time_ms=verify_ms,
+            finished=finished,
         )
 
-        with self.lock:
-            if sid not in self.sessions:
-                logger.error(f"[VerifyDraftTokens] Session {sid} not found.")
-                verify_time_ms = (time.perf_counter() - start_verify_t) * 1000.0
-                return inference_pb2.VerifyResponse(committed_ids=[],
-                                                    accepted_count=0,
-                                                    verify_time_ms=verify_time_ms,
-                                                    finished=True)
-            sess = self.sessions[sid]
-            if sess.finished or not draft_tokens:
-                verify_time_ms = (time.perf_counter() - start_verify_t) * 1000.0
-                return inference_pb2.VerifyResponse(committed_ids=[],
-                                                    accepted_count=0,
-                                                    verify_time_ms=verify_time_ms,
-                                                    finished=sess.finished)
 
-            committed     = []
-            accepted_cnt  = 0
-
-            # ---- ONE verification pass for the entire chunk + bonus ----
-            logits_all = self.verify(sess, draft_tokens)
-
-            # # ===========================================
-            # # ---- DEBUG: show draft chunk size, words, and token IDs ----
-            # draft_size  = len(draft_tokens)
-            # draft_words = [
-            #     self.tokenizer.decode([tid], clean_up_tokenization_spaces=False)
-            #     for tid in draft_tokens
-            # ]
-            # logger.debug(
-            #     "[DEBUG draft chunk] size=%d  words=%s  ids=%s",
-            #     draft_size,
-            #     draft_words,
-            #     draft_tokens,
-            # )
-            # # ===========================================
-
-            # Soft-max after masking
-            all_row_probs = torch.softmax(logits_all.float(), dim=-1)
-            logger.debug("all_row_probs shape=%s", all_row_probs.shape)
-            
-            # ================================================
-            # multinomial probe: sample one token from each row, then log once ---
-            # ================================================
-            # sampled_tokens = []
-            # sampled_ids    = []
-            # sampled_ps     = []
-
-            # for r in range(all_row_probs.size(0)):
-            #     row_probs   = all_row_probs[r]
-            #     sampled_id  = int(torch.multinomial(row_probs, 1).item())
-            #     sampled_p   = float(row_probs[sampled_id].item())
-            #     sampled_tok = self.tokenizer.decode(
-            #         [sampled_id], clean_up_tokenization_spaces=False
-            #     )
-            #     sampled_tokens.append(sampled_tok)
-            #     sampled_ids.append(sampled_id)
-            #     sampled_ps.append(sampled_p)
-
-            # logger.debug(
-            #     "[DEBUG multinomial] sampled_tokens=%s  ids=%s  p_rows=%s",
-            #     sampled_tokens,
-            #     sampled_ids,
-            #     ["{:.6f}".format(p) for p in sampled_ps],
-            # )
-            # =============================================
-
-
-            target_row_probs = all_row_probs[:-1]      # γ rows
-
-            probs = [float(target_row_probs[i, tok].item())
-                    for i, tok in enumerate(draft_tokens)]
-                        
-            # --- diagnostic shapes ------------------------------------------------
-            logger.debug(
-                "[session=%s] verify returned shapes: "
-                "probs=%d  bonus_row_probs=%s  target_row_probs=%s",
-                sid,
-                len(probs),
-                tuple(all_row_probs[-1].shape),
-                tuple(target_row_probs.shape),
-            )
-            # ----------------------------------------------------------------------
-
-            # Sanity‑check: we must have one q_draft per draft token
-            assert len(draft_probs) == len(draft_tokens), (
-                f"[session={sid}] Length mismatch: "
-                f"{len(draft_probs)} draft_probs vs {len(draft_tokens)} draft_tokens"
-            )
-            # ------------------------------------------------------------------
-            # Vectorised probabilistic acceptance (device‑resident, no Python loops)
-            # ------------------------------------------------------------------
-            device = target_row_probs.device            # stay on same device
-            draft_token_tensor = torch.tensor(draft_tokens, device=device)
-
-            # p_tgt_t: gather target P(draft_token | prefix) directly from tensor
-            row_idx = torch.arange(len(draft_tokens), device=device)
-            p_tgt_t = target_row_probs[row_idx, draft_token_tensor]     # (γ,)
-
-            # q_draft comes from RPC as Python list – move to same device
-            q_draft_t = torch.tensor(draft_probs, device=device)
-
-            # Guard against zero probabilities to avoid NaNs
-            torch._assert((q_draft_t > 0).all(), "q_draft contains zeros")
-
-            ratio    = p_tgt_t / q_draft_t
-            rand_vec = torch.rand_like(ratio)
-            accept_vec = (p_tgt_t >= q_draft_t) | (rand_vec < ratio)
-
-            # index of first rejection; if none, len(draft_tokens)
-            reject_idx = (~accept_vec).nonzero(as_tuple=False)
-            first_rej  = int(reject_idx[0].item()) if reject_idx.numel() > 0 else len(draft_tokens)
-
-            accepted_cnt = first_rej
-            committed    = draft_tokens[:accepted_cnt]
-
-            if accepted_cnt < len(draft_tokens):
-                # one rejection → sample bonus from that row
-                row_idx    = accepted_cnt        # 0‑based
-                bonus_id   = int(torch.multinomial(all_row_probs[row_idx], 1).item())
-                committed.append(bonus_id)
-                # ============================
-                # DEBUG logging (single call)
-                # if logger.isEnabledFor(logging.DEBUG):
-                #     d_tok  = self.tokenizer.decode([draft_tokens[row_idx]], clean_up_tokenization_spaces=False)
-                #     b_tok  = self.tokenizer.decode([bonus_id], clean_up_tokenization_spaces=False)
-                #     logger.debug(
-                #         "[DEBUG token rejected] i=%d draft token='%s' bonus token='%s' "
-                #         "id=%d  p_tgt=%.6f  q_draft=%.6f",
-                #         row_idx, d_tok, b_tok, draft_tokens[row_idx],
-                #         p_tgt_t[row_idx], q_draft_t[row_idx]
-                #     )
-                # ============================
-            else:
-                # all accepted – sample bonus from last row (γ)
-                bonus_id = int(torch.multinomial(all_row_probs[-1], 1).item())
-                committed.append(bonus_id)
-                # # ============================
-                # if logger.isEnabledFor(logging.DEBUG):
-                #     b_tok = self.tokenizer.decode([bonus_id], clean_up_tokenization_spaces=False)
-                #     logger.debug(
-                #         "[DEBUG all token accepted] bonus token='%s' id=%d",
-                #         b_tok, bonus_id
-                #     )
-                # # ============================
-
-            # stop condition: if EOS was accepted
-            if self.eos_token_id in committed:
-                sess.finished = True
-                
-            # # ---------------------------------------------------------------
-            # # Bulk commit all tokens at once
-            # commit_texts = [self.tokenizer.decode([tid], clean_up_tokenization_spaces=False)
-            #                 for tid in committed]
-            # logger.debug("target generate/verified tokens (text)=%s  ids=%s", commit_texts, committed)
-            # ---------------------------------------------------------------
-
-
-            # ==========================================
-            # Commit all accepted tokens in one call
-            self._commit_tokens_bulk(sess, committed)
-            # ==========================================
-            
-            logger.debug("commmit response to draft: _next_pos=%d", int(self.model._next_pos))
-
-            verify_time_ms = (time.perf_counter() - start_verify_t) * 1000.0
-            return inference_pb2.VerifyResponse(committed_ids=committed,
-                                                accepted_count=accepted_cnt,
-                                                verify_time_ms=verify_time_ms,
-                                                finished=sess.finished)
 
     # helper used above
     def _commit_token(self, sess, tok_id):
@@ -566,3 +428,128 @@ def run_server(model_path, port=50051, sequence_length=128,
     server.add_insecure_port(server_address)
     server.start()
     server.wait_for_termination()
+
+    # ------------------------------------------------------------------
+    # STAGE‑2: scheduler thread that batches requests
+    # ------------------------------------------------------------------
+    def _scheduler_loop(self):
+        """
+        Drain self.verify_queue; batch together all requests that (a) arrive
+        within self.batch_timeout s *or* (b) fill up to self.max_batch items.
+        For the first implementation we assume *all* requests use the same
+        γ (chunk length) so they share one compiled Neuron graph.
+        """
+        pending = []
+        last_pop = time.monotonic()
+        while True:
+            try:
+                # Non‑blocking get with small timeout so we can flush
+                req = self.verify_queue.get(timeout=self.batch_timeout)
+                pending.append(req)
+                # Flush if we filled the batch
+                flush = len(pending) >= self.max_batch
+            except queue.Empty:
+                flush = len(pending) > 0
+
+            now = time.monotonic()
+            if flush or (pending and (now - last_pop) >= self.batch_timeout):
+                self._process_batch(pending)
+                pending.clear()
+                last_pop = now
+
+    def _process_batch(self, batch_reqs):
+        """
+        batch_reqs: List[dict] with keys session_id, draft_tokens, draft_probs.
+        Performs one batched speculative_forward and writes result to each
+        caller's result_queue.
+        """
+        if not batch_reqs:
+            return
+
+        # Group tensors
+        sess_list      = []
+        draft_tok_lens = {len(r["draft_tokens"]) for r in batch_reqs}
+        # Simple: require identical γ; otherwise process sequentially.
+        if len(draft_tok_lens) != 1:
+            for r in batch_reqs:
+                self._process_batch([r])
+            return
+
+        gamma = draft_tok_lens.pop()
+        B     = len(batch_reqs)
+
+        # ------------------------------------------------------------------
+        # Build input tensors (B, γ+1) and cache_vec (B, γ+1)
+        # ------------------------------------------------------------------
+        input_ids  = []
+        cache_vecs = []
+        for r in batch_reqs:
+            sid  = r["session_id"]
+            sess = self.sessions[sid]
+            self._sync_kv_pointer(sess)
+
+            prev_token = int(sess.current_ids[0, -1].item())
+            toks = [prev_token] + r["draft_tokens"]          # γ+1
+
+            start_pos = int(sess.cache_ids.item()) - 1
+            vec = torch.arange(len(toks), dtype=torch.int32) + start_pos
+
+            input_ids.append(torch.tensor(toks, dtype=torch.int32))
+            cache_vecs.append(vec)
+
+            sess_list.append(sess)
+
+        input_ids  = torch.stack(input_ids, 0)        # (B, γ+1)
+        cache_vecs = torch.stack(cache_vecs, 0)       # (B, γ+1)
+
+        # ------------------------------------------------------------------
+        # Batched speculative_forward
+        # ------------------------------------------------------------------
+        t0 = time.perf_counter()
+        logits = self.model.speculative_forward(
+            input_ids   = input_ids,
+            cache_ids   = cache_vecs,
+            spec_length = gamma + 1,
+        )
+        verify_ms = (time.perf_counter() - t0) * 1000.0
+
+        # logits: (B, γ+1, V)  → split per session
+        for b, req in enumerate(batch_reqs):
+            sid          = req["session_id"]
+            sess         = sess_list[b]
+            draft_tokens = req["draft_tokens"]
+            draft_probs  = req["draft_probs"]
+
+            all_row_probs = torch.softmax(
+                logits[b].float(), dim=-1
+            )                            # (γ+1, V)
+            tgt_row_probs = all_row_probs[:-1]
+
+            device = tgt_row_probs.device
+            dr_tokens = torch.tensor(draft_tokens, device=device)
+            row_idx   = torch.arange(len(draft_tokens), device=device)
+            p_tgt_t   = tgt_row_probs[row_idx, dr_tokens]
+            q_draft_t = torch.tensor(draft_probs, device=device)
+
+            ratio  = p_tgt_t / q_draft_t
+            rand_v = torch.rand_like(ratio)
+            accept = (p_tgt_t >= q_draft_t) | (rand_v < ratio)
+            rej    = (~accept).nonzero(as_tuple=False)
+            first_rej = int(rej[0].item()) if rej.numel() > 0 else len(draft_tokens)
+
+            accepted_cnt = first_rej
+            committed    = draft_tokens[:accepted_cnt]
+
+            if accepted_cnt < len(draft_tokens):
+                bonus_id = int(torch.multinomial(all_row_probs[first_rej], 1).item())
+            else:
+                bonus_id = int(torch.multinomial(all_row_probs[-1], 1).item())
+            committed.append(bonus_id)
+
+            self._commit_tokens_bulk(sess, committed)
+            finished = sess.finished
+
+            # Respond to the waiting gRPC handler
+            self.result_queues[sid].put(
+                (committed, accepted_cnt, verify_ms, finished)
+            )
