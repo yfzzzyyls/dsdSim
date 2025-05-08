@@ -438,6 +438,7 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
 
         gamma = draft_tok_lens.pop()
         B     = len(batch_reqs)
+        real_B = B            # remember how many *real* rows we have
 
         # ------------------------------------------------------------------
         # Build input tensors (B, γ+1) and cache_vec (B, γ+1)
@@ -460,22 +461,23 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
 
             sess_list.append(sess)
 
+        # --------------------------------------------------------------
+        # Pad *lists* before stacking so the final stacked tensor keeps
+        # the original (B, N, V) layout coming out of Neuron.  This avoids
+        # collapsing the vocab axis down to 2 columns.
+        # Also pad sess_list with None for dummy rows.
+        # --------------------------------------------------------------
+        if real_B < self.max_batch:
+            pad_n   = self.max_batch - real_B
+            pad_ids = input_ids[0].clone()
+            pad_vec = cache_vecs[0].clone()
+            for _ in range(pad_n):
+                input_ids.append(pad_ids)
+                cache_vecs.append(pad_vec)
+                sess_list.append(None)          # placeholder for dummy row
+
         input_ids  = torch.stack(input_ids, 0)        # (B, γ+1)
         cache_vecs = torch.stack(cache_vecs, 0)       # (B, γ+1)
-
-        # --------------------------------------------------------------
-        # If we have fewer rows than the compiled batch size, pad with
-        # dummy copies of the first row so the Neuron graph key matches
-        # (spec_len, batch_size=self.max_batch).  Padded rows are ignored
-        # when we split results below.
-        # --------------------------------------------------------------
-        if B < self.max_batch:
-            pad_n = self.max_batch - B
-            # Duplicate row‑0; safe because we discard its logits later.
-            pad_ids   = input_ids[0:1].repeat(pad_n, 1)
-            pad_vecs  = cache_vecs[0:1].repeat(pad_n, 1)
-            input_ids = torch.cat([input_ids, pad_ids], dim=0)
-            cache_vecs = torch.cat([cache_vecs, pad_vecs], dim=0)
 
         # ------------------------------------------------------------------
         # Batched speculative_forward
@@ -486,22 +488,26 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
             cache_ids   = cache_vecs,
             spec_length = gamma + 1,
         )
-        logger.info("[scheduler] speculative_forward raw shape = %s", tuple(logits.shape))
+        logger.info("[scheduler - process_batch] speculative_forward raw shape = %s", tuple(logits.shape))
+        # Raw Neuron layout is (N, V, B)  where:
+        #   N = γ + 1, V = vocab shards (≈ vocab_size × TP), B = batch
+        # We keep this layout to avoid the transpose overhead.
         verify_ms = (time.perf_counter() - t0) * 1000.0
 
-        # logits: (B, γ+1, V)  → split per session
+        # logits: (N, V, B)  → split per session
         for b, req in enumerate(batch_reqs):
             # Skip the padded dummy rows – they have no corresponding request
-            if b >= B:
+            sess = sess_list[b]
+            if sess is None:
                 continue
             sid          = req["session_id"]
-            sess         = sess_list[b]
             draft_tokens = req["draft_tokens"]
             draft_probs  = req["draft_probs"]
 
+            # logits[:, :, b] → (N, V) for this session
             all_row_probs = torch.softmax(
-                logits[b].float(), dim=-1
-            )                            # (γ+1, V)
+                logits[:, :, b].float(), dim=-1
+            )                               # (γ+1, V)
             tgt_row_probs = all_row_probs[:-1]
 
             device = tgt_row_probs.device
