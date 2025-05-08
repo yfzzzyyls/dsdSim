@@ -486,6 +486,7 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
             cache_ids   = cache_vecs,
             spec_length = gamma + 1,
         )
+        logger.info("[scheduler] speculative_forward raw shape = %s", tuple(logits.shape))
         verify_ms = (time.perf_counter() - t0) * 1000.0
 
         # logits: (B, γ+1, V)  → split per session
