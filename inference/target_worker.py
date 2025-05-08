@@ -51,7 +51,7 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
         # Scheduler state (Stage‑2 incremental batching)
         # ------------------------------------------------------------------
         self.verify_queue   = queue.Queue()               # (req_dict) items
-        self.batch_timeout  = 3                             # seconds to wait for more peers
+        self.batch_timeout  = 0.03                             # seconds to wait for more peers
         self.max_batch      = batch_size                  # honour compile batch
         # map session_id -> Queue for the blocking VerifyDraftTokens call
         self.result_queues  = {}
