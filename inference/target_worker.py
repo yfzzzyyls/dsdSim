@@ -107,11 +107,20 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
             else:
                 current_ids = torch.zeros((1,0), dtype=torch.long)
             self.sessions[session_id] = TargetSession(current_ids)
-            # --- prime Neuron KV cache on the prompt ---
+            # ------------------------------------------------------------------
+            # Priming Neuron KV cache for the prompt
+            # ------------------------------------------------------------------
             self.model.cache_ids = None
             self.model._next_pos = 0
+
             if current_ids.shape[1] > 0:
-                _ = self.model.forward(current_ids)
+                L = current_ids.shape[1]
+                # 2‑D cache id tensor shape (1, L) → [[0, 1, …, L‑1]]
+                cache_vec = torch.arange(L, dtype=torch.int32).unsqueeze(0)
+                _ = self.model.forward(
+                    input_ids=current_ids,
+                    cache_ids=cache_vec,
+                )
 
             # --- MANUALLY align wrapper pointer with the prompt length ---
             next_pos = current_ids.shape[1]                       # L
@@ -372,63 +381,6 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
         # baseline target-only decoding, optional
         return super().GenerateFull(request, context)
 
-
-def _extract_logits(outputs):
-    if isinstance(outputs, (tuple, list)):
-        out_t = outputs[0]
-    elif hasattr(outputs, "logits"):
-        out_t = outputs.logits[:, -1, :]
-    else:
-        out_t = outputs
-    if len(out_t.shape) == 3:
-        return out_t[:, -1, :].float()
-    elif len(out_t.shape) == 2:
-        return out_t.float()
-    elif len(out_t.shape) == 1:
-        return out_t.unsqueeze(0).float()
-    else:
-        raise ValueError(f"Unknown shape for outputs: {out_t.shape}")
-
-
-def _extract_logits_all(outputs):
-    if isinstance(outputs, (tuple, list)):
-        out_t = outputs[0]
-    elif hasattr(outputs, "logits"):
-        return outputs.logits.float()
-    else:
-        out_t = outputs
-    if len(out_t.shape) == 3:
-        return out_t.float()
-    elif len(out_t.shape) == 2:
-        return out_t.unsqueeze(1).float()
-    elif len(out_t.shape) == 1:
-        return out_t.unsqueeze(0).unsqueeze(0).float()
-    else:
-        raise ValueError(f"Unhandled shape for model output: {out_t.shape}")
-
-
-def run_server(model_path, port=50051, sequence_length=128,
-               spec_length=None, profile=False,
-               temperature: float = 1.0, top_p: float = 0.9,
-               batch_size: int = 1):
-    logging.basicConfig(level=logging.INFO)
-    logger.info(f"Initializing target server with model: {model_path}")
-    server = grpc.server(futures.ThreadPoolExecutor(max_workers=16))
-    servicer = SpeculativeServiceServicer(
-        model_path,
-        sequence_length=sequence_length,
-        spec_length=spec_length,
-        batch_size=batch_size,
-        temperature=temperature,
-        top_p=top_p,
-    )
-    inference_pb2_grpc.add_SpeculativeServiceServicer_to_server(servicer, server)
-    server_address = f"[::]:{port}"
-    logger.info(f"Target server starting on {server_address}")
-    server.add_insecure_port(server_address)
-    server.start()
-    server.wait_for_termination()
-
     # ------------------------------------------------------------------
     # STAGE‑2: scheduler thread that batches requests
     # ------------------------------------------------------------------
@@ -553,3 +505,59 @@ def run_server(model_path, port=50051, sequence_length=128,
             self.result_queues[sid].put(
                 (committed, accepted_cnt, verify_ms, finished)
             )
+
+def _extract_logits(outputs):
+    if isinstance(outputs, (tuple, list)):
+        out_t = outputs[0]
+    elif hasattr(outputs, "logits"):
+        out_t = outputs.logits[:, -1, :]
+    else:
+        out_t = outputs
+    if len(out_t.shape) == 3:
+        return out_t[:, -1, :].float()
+    elif len(out_t.shape) == 2:
+        return out_t.float()
+    elif len(out_t.shape) == 1:
+        return out_t.unsqueeze(0).float()
+    else:
+        raise ValueError(f"Unknown shape for outputs: {out_t.shape}")
+
+
+def _extract_logits_all(outputs):
+    if isinstance(outputs, (tuple, list)):
+        out_t = outputs[0]
+    elif hasattr(outputs, "logits"):
+        return outputs.logits.float()
+    else:
+        out_t = outputs
+    if len(out_t.shape) == 3:
+        return out_t.float()
+    elif len(out_t.shape) == 2:
+        return out_t.unsqueeze(1).float()
+    elif len(out_t.shape) == 1:
+        return out_t.unsqueeze(0).unsqueeze(0).float()
+    else:
+        raise ValueError(f"Unhandled shape for model output: {out_t.shape}")
+
+
+def run_server(model_path, port=50051, sequence_length=128,
+               spec_length=None, profile=False,
+               temperature: float = 1.0, top_p: float = 0.9,
+               batch_size: int = 1):
+    logging.basicConfig(level=logging.INFO)
+    logger.info(f"Initializing target server with model: {model_path}")
+    server = grpc.server(futures.ThreadPoolExecutor(max_workers=16))
+    servicer = SpeculativeServiceServicer(
+        model_path,
+        sequence_length=sequence_length,
+        spec_length=spec_length,
+        batch_size=batch_size,
+        temperature=temperature,
+        top_p=top_p,
+    )
+    inference_pb2_grpc.add_SpeculativeServiceServicer_to_server(servicer, server)
+    server_address = f"[::]:{port}"
+    logger.info(f"Target server starting on {server_address}")
+    server.add_insecure_port(server_address)
+    server.start()
+    server.wait_for_termination()
