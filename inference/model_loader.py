@@ -173,7 +173,10 @@ def compile_model(model_path: str,
     tp_degree = int(os.environ.get("NEURON_RT_NUM_CORES", "2"))
     if model_type.lower() == "llama" or "llama" in model_path.lower():
         logger.info(f"Compiling model using optimized LLaMA for Neuron ...")
-        neuron_cfg = NeuronConfig(padding_side="right")
+        neuron_cfg = NeuronConfig(
+            padding_side="right",
+            enable_chunked_prefill=True,   # ← activate chunked‑prefill
+        )
         model = LlamaForSampling.from_pretrained(
             model_path,
             batch_size=batch_size,
@@ -272,8 +275,12 @@ def compile_target_model(model_path: str,
                 f"(sequence_length={sequence_length})")
 
     tp_degree = int(os.environ.get("NEURON_RT_NUM_CORES", "2"))
-    neuron_cfg = NeuronConfig(is_eagle_target=False,
-                          cast_logits_dtype="bfloat16", padding_side="right")
+    neuron_cfg = NeuronConfig(
+        is_eagle_target=False,
+        cast_logits_dtype="bfloat16",
+        padding_side="right",
+        enable_chunked_prefill=True,      # ← activate chunked‑prefill
+    )
     model = LlamaForSampling.from_pretrained(
         model_path,
         batch_size            = batch_size,
