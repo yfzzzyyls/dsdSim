@@ -481,6 +481,37 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
                 bonus_id = int(torch.multinomial(all_row_probs[-1], 1).item())
             committed.append(bonus_id)
 
+            # ----------------------------------------------------------
+            # DEBUG: Show draft proposals, target predictions, accept/reject,
+            #        and final committed chunk in **human‑readable words**
+            # ----------------------------------------------------------
+            draft_words = [
+                self.tokenizer.decode([tid], clean_up_tokenization_spaces=False)
+                for tid in draft_tokens
+            ]
+            tgt_preds = torch.argmax(tgt_row_probs, dim=-1).tolist()
+            tgt_words = [
+                self.tokenizer.decode([tid], clean_up_tokenization_spaces=False)
+                for tid in tgt_preds
+            ]
+            committed_words = [
+                self.tokenizer.decode([tid], clean_up_tokenization_spaces=False)
+                for tid in committed
+            ]
+            status = (
+                "all_accepted"
+                if accepted_cnt == len(draft_tokens)
+                else f"rejected_from_pos_{accepted_cnt}"
+            )
+            logger.info(
+                "[Verify] sid=%s  status=%s\n"
+                "  draft  = %s\n"
+                "  target = %s\n"
+                "  commit = %s",
+                sid, status,
+                draft_words, tgt_words, committed_words,
+            )
+
             self._commit_tokens_bulk(sess, committed, b)
             finished = sess.finished
 
