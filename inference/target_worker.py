@@ -86,8 +86,6 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
         return torch.cat([input_ids, pad_tokens], dim=1)
 
     def _sync_kv_pointer(self, sess: TargetSession):
-        self.model.cache_ids = sess.cache_ids.clone()
-        self.model._next_pos = int(sess.cache_ids.item())
         # ---- sanity check ----
         assert int(self.model.cache_ids.item()) == int(sess.cache_ids.item()), \
             "Target KV cache_ids desynchronised after sync"
@@ -148,85 +146,31 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
             self.sessions[session_id].cache_ids = self.model.cache_ids.clone()
         return inference_pb2.StartResponse(acknowledged=True, session_id=session_id)
     
-    def _commit_tokens_bulk(self, sess, tok_ids):
+    def _commit_tokens_bulk(self, sess, tok_ids, row_idx: int):
         """
         Commit a list of tokens (accepted draft + bonus) in ONE Neuron
         speculative_forward call so the KV cache advances in bulk.
         We call `forward` (not speculative_forward) here so that the Neuron
         wrapper's _postprocess() updates the Python‑side KV pointer.
         """
+        # Skip dummy padding rows (should never be called with None)
+        if sess is None:
+            return
 
         if not tok_ids:
             return
 
-        # Ensure model & session pointers match before we bump
+        # Manually bump ONLY the cache‑ids row that belongs to this session
+        orig_next_pos = int(sess.cache_ids.item())
+        new_next_pos  = orig_next_pos + len(tok_ids)
+
+        # update session's cache_ids, and the model's cache_ids
+        sess.cache_ids = torch.tensor([new_next_pos], dtype=torch.int32)
+        self.model.update_cache(sess.cache_ids, new_next_pos)
+
         self._sync_kv_pointer(sess)
 
-        # ===============================================================
-        # Discover the compiled speculation bucket sizes ONCE per call.
-        # ===============================================================
-        # LlamaForSamplingModel = self.model.adapter.model
-        # bucket_lengths = {k[0] if isinstance(k, tuple) else int(k)
-        #                     for k in LlamaForSamplingModel.decoder_lm_head_for_speculation.keys()}
-
-        # #=================================================
-        # token_texts = [self.tokenizer.decode([tid], clean_up_tokenization_spaces=False)
-        #         for tid in tok_ids]
-        # logger.debug("Commit tokens (text)=%s  ids=%s", token_texts, tok_ids)
-        # #==================================================
-
-        # # Sanity checks
-        # assert len(tok_ids) in bucket_lengths, \
-        #     f"Commit length {len(tok_ids)} not compiled; buckets={sorted(bucket_lengths)}"
-        # # --- allow EOS even when tokenizer.vocab_size is stale ---
-        # valid = [
-        #     t for t in tok_ids
-        #     if t == self.eos_token_id or t < self.tokenizer.vocab_size
-        # ]
-        # assert len(valid) == len(tok_ids), \
-        #     f"OOV token(s) in commit_ids: {tok_ids}"
-
-        # self._sync_kv_pointer(sess)
-
-        # # (1, K) tensor of the new (real) tokens
-        # in_tensor = torch.tensor([tok_ids], dtype=sess.current_ids.dtype)
-        # cache_vec = torch.arange(len(tok_ids), dtype=torch.int32) + self.model._next_pos
-
-        # ------------------------------------------------------------------
-        # Figure out which speculation buckets were actually compiled.
-        # self.model is a NeuronHFAdapterWrap → .adapter → HFAdapter →
-        # .model (the underlying LlamaForSampling).
-        # ------------------------------------------------------------------
-        # raw_keys = LlamaForSamplingModel.decoder_lm_head_for_speculation.keys()
-        # # Accept both (k, batch_size) and k-only keys
-        # def _extract_k(k):
-        #     if isinstance(k, tuple):
-        #         return k[0]
-        #     return k
-        # spec_ok = len(tok_ids) in {_extract_k(k) for k in raw_keys}
-        # assert spec_ok, f"speculative_forward not compiled for {len(tok_ids)} tokens"
-
-        # # Use speculative_forward to process all tokens and update the KV cache.
-        # _ = self.model.speculative_forward(
-        #     input_ids=in_tensor,
-        #     cache_ids=cache_vec,
-        #     spec_length=len(tok_ids),
-        # )
-
-        # Manually bump wrapper pointer so it matches the device
-        orig_next_pos = int(sess.cache_ids.item())    # authoritative
-        new_next_pos  = orig_next_pos + len(tok_ids)
-        self.model.update_cache(torch.tensor([new_next_pos], dtype=torch.int32),
-                                new_next_pos)
-        # self.model._next_pos = new_next_pos
-        # self.model.cache_ids = torch.tensor([new_next_pos], dtype=torch.int32)
-
-        # Keep the session pointer consistent with the model.
-        sess.cache_ids = self.model.cache_ids.clone()
-
         # print(f"commit tokens: _next_pos={self.model._next_pos} -> current_shape{sess.current_ids.shape[1]} + {len(tok_ids)}")
-        assert int(self.model._next_pos) == sess.current_ids.shape[1] + len(tok_ids), \
-            "KV pointer mismatch after manual bump"
 
         # Append committed ids to session's token history
         new_tok_tensor = torch.tensor([tok_ids], dtype=sess.current_ids.dtype)
@@ -380,25 +324,6 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
             finished=finished,
         )
 
-
-
-    # helper used above
-    def _commit_token(self, sess, tok_id):
-        tok = torch.tensor([[tok_id]], dtype=sess.current_ids.dtype)
-        sess.current_ids = torch.cat([sess.current_ids, tok], dim=1)
-        self._sync_kv_pointer(sess)
-        _, _ = self.model.forward(input_ids=tok,
-                                  cache_ids=torch.tensor([self.model._next_pos],
-                                                         dtype=torch.int32))
-        sess.cache_ids = torch.tensor([self.model._next_pos], dtype=torch.int32)
-        if self.eos_token_id == tok_id:
-            sess.finished = True
-
-
-    def GenerateFull(self, request, context):
-        # baseline target-only decoding, optional
-        return super().GenerateFull(request, context)
-
     # ------------------------------------------------------------------
     # STAGE‑2: scheduler thread that batches requests
     # ------------------------------------------------------------------
@@ -443,15 +368,16 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
         # TODO: Changed to "padding-to-max" and adjust accept/reject rule to ignore padded slots. 
         assert len(draft_tok_lens) == 1, \
             f"Only support same γ for multiple draft models: {draft_tok_lens} (expected 1)"
-        
-        # if len(draft_tok_lens) != 1:
-        #     for r in batch_reqs:
-        #         self._process_batch([r])
-        #     return
 
         gamma = draft_tok_lens.pop()
         B     = len(batch_reqs)
         real_B = B            # remember how many *real* rows we have
+
+        # Log real_B, gamma, session ids
+        logger.info(
+            "[Batch] real_B=%d  gamma=%d  session_ids=%s",
+            real_B, gamma, [r['session_id'] for r in batch_reqs]
+        )
 
         # ------------------------------------------------------------------
         # Build input tensors (B, γ+1) and cache_vec (B, γ+1)
@@ -469,9 +395,18 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
             start_pos = int(sess.cache_ids.item())
             vec = torch.arange(len(toks), dtype=torch.int32) + start_pos
 
+            # Decode the first five token-ids to human‑readable strings
+            token_words = [
+                self.tokenizer.decode([tid], clean_up_tokenization_spaces=False)
+                for tid in toks[:5]
+            ]
+            logger.info(
+                "[BatchRow %d] sid=%s  ids=%s  words=%s  cache_vec=%s",
+                len(sess_list), sid, toks[:5], token_words, vec[:5].tolist()
+            )
+
             input_ids.append(torch.tensor(toks, dtype=torch.int32))
             cache_vecs.append(vec)
-
             sess_list.append(sess)
 
         # --------------------------------------------------------------
@@ -546,47 +481,13 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
                 bonus_id = int(torch.multinomial(all_row_probs[-1], 1).item())
             committed.append(bonus_id)
 
-            self._commit_tokens_bulk(sess, committed)
+            self._commit_tokens_bulk(sess, committed, b)
             finished = sess.finished
 
             # Respond to the waiting gRPC handler
             self.result_queues[sid].put(
                 (committed, accepted_cnt, verify_ms, finished)
             )
-
-def _extract_logits(outputs):
-    if isinstance(outputs, (tuple, list)):
-        out_t = outputs[0]
-    elif hasattr(outputs, "logits"):
-        out_t = outputs.logits[:, -1, :]
-    else:
-        out_t = outputs
-    if len(out_t.shape) == 3:
-        return out_t[:, -1, :].float()
-    elif len(out_t.shape) == 2:
-        return out_t.float()
-    elif len(out_t.shape) == 1:
-        return out_t.unsqueeze(0).float()
-    else:
-        raise ValueError(f"Unknown shape for outputs: {out_t.shape}")
-
-
-def _extract_logits_all(outputs):
-    if isinstance(outputs, (tuple, list)):
-        out_t = outputs[0]
-    elif hasattr(outputs, "logits"):
-        return outputs.logits.float()
-    else:
-        out_t = outputs
-    if len(out_t.shape) == 3:
-        return out_t.float()
-    elif len(out_t.shape) == 2:
-        return out_t.unsqueeze(1).float()
-    elif len(out_t.shape) == 1:
-        return out_t.unsqueeze(0).unsqueeze(0).float()
-    else:
-        raise ValueError(f"Unhandled shape for model output: {out_t.shape}")
-
 
 def run_server(model_path, port=50051, sequence_length=128,
                spec_length=None, profile=False,
