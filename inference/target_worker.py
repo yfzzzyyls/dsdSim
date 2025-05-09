@@ -23,7 +23,7 @@ if not logger.hasHandlers():
     logger.setLevel(logging.INFO)
 
 class TargetSession:
-    def __init__(self, input_ids):
+    def __init__(self, input_ids, row_idx: int):
         self.current_ids = input_ids  # Torch tensor [1, seq_len]
         self.finished = False
         self.tokens_generated = 0
@@ -33,6 +33,7 @@ class TargetSession:
         # pointer to the *next* KV slot (scalar tensor, starts at 0)
         self.cache_id = torch.tensor([0], dtype=torch.int32)
         self.pending_logits = None
+        self.row_idx = row_idx
 
     # ------------------------------------------------------------------
     # Accessors / mutators for session‑local KV pointer
@@ -76,6 +77,20 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
         self.verify_queue   = queue.Queue()               # (req_dict) items
         self.batch_timeout  = 0.03                             # seconds to wait for more peers
         self.max_batch      = batch_size                  # honour compile batch
+        # ----------------------------------------------------------
+        # Row‑index pool for static‑batch Neuron graph
+        # ----------------------------------------------------------
+        self._row_pool = list(range(batch_size))          # free rows 0…B‑1
+
+        def _allocate_row():
+            assert self._row_pool, "No free Neuron batch rows left"
+            return self._row_pool.pop(0)
+
+        def _release_row(idx: int):
+            self._row_pool.append(idx)
+
+        self._allocate_row = _allocate_row
+        self._release_row  = _release_row
         # map session_id -> Queue for the blocking VerifyDraftTokens call
         self.result_queues  = {}
         self._sched_thread  = threading.Thread(
@@ -109,11 +124,10 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
 
     def _sync_kv_pointer(self, sess: TargetSession):
         pass
-        # ---- sanity check ----
-        # should sync the draft model cache pointer with the session cache pointer 
-        # becasue they are essentially the same.
-        # assert int(self.model.cache_id.item()) == int(sess.cache_ids.item()), \
-        #     "Target KV cache_ids desynchronised after sync"
+        # TODO: implement pointer sync check
+        # if self.model.get_batched_cache_id_vec() is not None:
+        #     assert int(self.model.get_batched_cache_id_vec()[sess.row_idx].item()) == \
+        #            int(sess.get_session_cache_id().item()), "KV desync"
 
 
     def StartGeneration(self, request, context):
@@ -133,7 +147,9 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
             session_id = int(uuid.uuid4()) & 0xFFFFFFFF
             enc = self.tokenizer(prompt_text, return_tensors='pt')
             current_ids = enc["input_ids"]
-            self.sessions[session_id] = TargetSession(current_ids)
+            # Allocate a free Neuron‑batch row for this session
+            row_idx = self._allocate_row()
+            self.sessions[session_id] = TargetSession(current_ids, row_idx)
             # ------------------------------------------------------------------
             # Priming Neuron KV cache for the prompt
             # ------------------------------------------------------------------
@@ -146,10 +162,6 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
             L = current_ids.shape[1]               # prompt length
             B = self.max_batch  # compiled batch size
             pad_id = 0
-
-            # For now we map each new session to the first free row.
-            # In production you would allocate from a row‑pool.
-            row_idx = 0
 
             # Build a full (B, L) tensor filled with pad_id, then insert prompt at row_idx
             batched_ids = torch.full(
@@ -191,7 +203,7 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
             )
         return inference_pb2.StartResponse(acknowledged=True, session_id=session_id)
     
-    def _commit_tokens_bulk(self, sess, tok_ids, row_idx: int):
+    def _commit_tokens_bulk(self, sess, tok_ids):
         """
         Commit a list of tokens (accepted draft + bonus) in ONE Neuron
         speculative_forward call so the KV cache advances in bulk.
@@ -204,6 +216,8 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
 
         if not tok_ids:
             return
+
+        row_idx = sess.row_idx
 
         # --------------------------------------------------------------
         # Bump KV‑cache pointers by the number of tokens we just committed
@@ -223,21 +237,7 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
         # Optionally assert pointer is correct
         if self.eos_token_id is not None and any(t == self.eos_token_id for t in tok_ids):
             sess.finished = True
-
-        # # --------------------------------------------------------------
-        # # 9) Detailed commit log: committed tokens *and* full context words
-        # # --------------------------------------------------------------
-        # current_words = [
-        #     self.tokenizer.decode([tid], clean_up_tokenization_spaces=False)
-        #     for tid in sess.current_ids.squeeze(0).tolist()
-        # ]
-        # logger.debug(
-        #     "Committed tokens (text)=%s  ids=%s; _next_pos -> %d | current_ids (text)=%s",
-        #     token_texts,
-        #     tok_ids,
-        #     self.model._next_pos,
-        #     current_words,
-        # )
+            self._release_row(sess.row_idx)
 
     # def verify(self, sess: TargetSession, draft_tokens):
     #     """
@@ -593,7 +593,7 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
                 draft_words, tgt_words, committed_words,
             )
 
-            self._commit_tokens_bulk(sess, committed, b)
+            self._commit_tokens_bulk(sess, committed)
             finished = sess.finished
 
             # Respond to the waiting gRPC handler
