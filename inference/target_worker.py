@@ -154,29 +154,40 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
             # Priming Neuron KV cache for the prompt
             # ------------------------------------------------------------------
             # ----------------------------------------------------------
-            # Build a (B, L) batched prompt where B equals the compiled
-            # batch size (self.max_batch).  Row‑0 contains the real prompt
-            # and the remaining B‑1 rows are PAD so the tensor shape always
-            # matches the Neuron graph regardless of CLI --batch.
+            # Build a (B, ctx_len) tensor that preserves every *existing*
+            # session’s prompt so we never overwrite their KV banks.  Only
+            # the newly‑allocated row is filled with the new prompt; all
+            # unused rows remain PAD.
             # ----------------------------------------------------------
-            L = current_ids.shape[1]               # prompt length
-            B = self.max_batch  # compiled batch size
-            pad_id = 0
+            ctx_len = self._ctx_estimate
+            B       = self.max_batch
+            pad_id  = 0
 
-            # Build a full (B, L) tensor filled with pad_id, then insert prompt at row_idx
+            # Start with all PAD tokens
             batched_ids = torch.full(
-                (B, L),
+                (B, ctx_len),
                 pad_id,
                 dtype=current_ids.dtype,
                 device=current_ids.device,
             )
-            batched_ids[row_idx, :L] = current_ids
 
-            # Build a 2‑D cache_ids tensor (B, L) where each row is [0 … L‑1]
+            # ① copy prompts for sessions that were already running
+            for s in self.sessions.values():
+                if s is self.sessions[session_id]:     # skip – new row handled below
+                    continue
+                row = s.row_idx
+                L_old = s.current_ids.shape[1]
+                batched_ids[row, :min(L_old, ctx_len)] = s.current_ids[0, :ctx_len]
+
+            # ② copy the *new* prompt into its assigned row
+            L_new = current_ids.shape[1]
+            batched_ids[row_idx, :min(L_new, ctx_len)] = current_ids[0, :ctx_len]
+
+            # cache_vec rows are always [0 … ctx_len‑1]
             cache_vec = (
-                torch.arange(L, dtype=torch.int32)
-                .unsqueeze(0)
-                .repeat(B, 1)
+                torch.arange(ctx_len, dtype=torch.int32, device=current_ids.device)
+                      .unsqueeze(0)
+                      .repeat(B, 1)
             )
 
             _ = self.model.forward(
@@ -195,9 +206,8 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
             #        model‑wrapper cache pointer right after pre‑fill
             # ----------------------------------------------------------
             logger.info(
-                "[StartGeneration] sid=%s  L=%d  session.cache_id=%s  model.cache_id_vec=%s",
+                "[StartGeneration] sid=%s   session.cache_id=%s  model.cache_id_vec=%s",
                 session_id,
-                L,
                 self.sessions[session_id].cache_id.tolist(),
                 self.model.get_batched_cache_id_vec().tolist(),
             )
