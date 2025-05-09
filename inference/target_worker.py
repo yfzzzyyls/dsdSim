@@ -115,19 +115,34 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
             self.model.cache_ids = None
             self.model._next_pos = 0
 
-            # propmt shape: (1, L)  where L = prompt length
-            L = current_ids.shape[1]
             # ----------------------------------------------------------
-            # Build a (2, L) batched prompt so it matches the compiled
-            # batch_size=2 graphs.  Row‑0 = real prompt, Row‑1 = PAD.
-            # TODO: Should be (N, L) in the future
+            # Build a (B, L) batched prompt where B equals the compiled
+            # batch size (self.max_batch).  Row‑0 contains the real prompt
+            # and the remaining B‑1 rows are PAD so the tensor shape always
+            # matches the Neuron graph regardless of CLI --batch.
             # ----------------------------------------------------------
-            pad_id = self.tokenizer.pad_token_id or 0
-            pad_row = torch.full_like(current_ids, pad_id)     # (1, L)
-            batched_ids = torch.cat([current_ids, pad_row], dim=0)   # (2, L)
+            L = current_ids.shape[1]               # prompt length
+            B = self.max_batch  # compiled batch size
+            pad_id = 0
 
-            # 2‑D cache_ids tensor (2, L): each row [0 … L‑1]
-            cache_vec = torch.arange(L, dtype=torch.int32).unsqueeze(0).repeat(2, 1)
+            if B == 1:
+                # No padding needed when the compiled batch size is 1
+                batched_ids = current_ids                                   # (1, L)
+            else:
+                pad_rows = torch.full(
+                    (B - 1, L),
+                    pad_id,
+                    dtype=current_ids.dtype,
+                    device=current_ids.device,
+                )
+                batched_ids = torch.cat([current_ids, pad_rows], dim=0)     # (B, L)
+
+            # Build a 2‑D cache_ids tensor (B, L) where each row is [0 … L‑1]
+            cache_vec = (
+                torch.arange(L, dtype=torch.int32)
+                .unsqueeze(0)
+                .repeat(B, 1)
+            )
 
             _ = self.model.forward(
                 input_ids=batched_ids,
@@ -508,6 +523,13 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
             accept = (p_tgt >= q_draft) | (rand_v < ratio)
             rej    = (~accept).nonzero(as_tuple=False)
             first_rej = int(rej[0].item()) if rej.numel() > 0 else len(draft_tokens)
+            logger.info(
+                f"[ACCEPTANCE DEBUG] "
+                f"accept={accept.cpu().tolist()} "
+                f"reject_indices={(rej.squeeze(-1).cpu().tolist() if rej.numel() else [])} "
+                f"first_rej={first_rej}"
+            )
+
 
             accepted_cnt = first_rej
             committed    = draft_tokens[:accepted_cnt]
