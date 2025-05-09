@@ -444,13 +444,17 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
         assert real_B <= self.max_batch, \
             f"Batch size {real_B} compiled now should be the less than max_batch {self.max_batch}"
         if real_B < self.max_batch:
-            pad_n   = self.max_batch - real_B
-            pad_ids = input_ids[0].clone()
-            pad_vec = cache_vecs[0].clone()
+            pad_n = self.max_batch - real_B
+
+            # Use explicit padding instead of cloning row‑0 data
+            pad_token_id = 0
+            pad_ids = torch.full_like(input_ids[0], pad_token_id)     # (γ+1,) all PAD
+            pad_vec = torch.zeros_like(cache_vecs[0])                 # (γ+1,) all zeros
+
             for _ in range(pad_n):
                 input_ids.append(pad_ids)
                 cache_vecs.append(pad_vec)
-                sess_list.append(None)          # placeholder for dummy row
+                sess_list.append(None)        # placeholder for dummy row
 
         input_ids  = torch.stack(input_ids, 0)        # (B, γ+1)
         cache_vecs = torch.stack(cache_vecs, 0)       # (B, γ+1)
