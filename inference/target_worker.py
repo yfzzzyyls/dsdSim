@@ -144,6 +144,17 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
 
             # record in session
             self.sessions[session_id].cache_ids = self.model.cache_ids.clone()
+            # ----------------------------------------------------------
+            # DEBUG: show prompt length L, session‑side cache pointer and
+            #        model‑wrapper cache pointer right after pre‑fill
+            # ----------------------------------------------------------
+            logger.info(
+                "[StartGeneration] sid=%s  L=%d  session.cache_ids=%s  model.cache_ids=%s",
+                session_id,
+                L,
+                self.sessions[session_id].cache_ids.tolist(),
+                self.model.cache_ids.tolist(),
+            )
         return inference_pb2.StartResponse(acknowledged=True, session_id=session_id)
     
     def _commit_tokens_bulk(self, sess, tok_ids, row_idx: int):
@@ -195,97 +206,97 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
         #     current_words,
         # )
 
-    def verify(self, sess: TargetSession, draft_tokens):
-        """
-        Fast path: score all draft_tokens and bonus in ONE forward pass.
-        Returns
-        -------
-        probs : List[float]   - P_target(d_i | prefix + d_<i)   for each i
-        bonus_probs : tensor  - P_target(vocab) for bonus token
-        """
-        # ---------- short‑circuit ----------
-        if not draft_tokens:
-            return [], None
+    # def verify(self, sess: TargetSession, draft_tokens):
+    #     """
+    #     Fast path: score all draft_tokens and bonus in ONE forward pass.
+    #     Returns
+    #     -------
+    #     probs : List[float]   - P_target(d_i | prefix + d_<i)   for each i
+    #     bonus_probs : tensor  - P_target(vocab) for bonus token
+    #     """
+    #     # ---------- short‑circuit ----------
+    #     if not draft_tokens:
+    #         return [], None
 
-        # ==========================================
-        # get the last commit KV cache position
-        # ==========================================
-        orig_cache   = sess.cache_ids.clone()
-        orig_nextpos = int(orig_cache.item())
+    #     # ==========================================
+    #     # get the last commit KV cache position
+    #     # ==========================================
+    #     orig_cache   = sess.cache_ids.clone()
+    #     orig_nextpos = int(orig_cache.item())
 
-        # ==========================================
-        # set indices for speculative forward
-        # ==========================================
-        prev_token_id = int(sess.current_ids[0, -1])
-        spec_tokens   = [prev_token_id] + draft_tokens          # γ + 1 tokens
-        spec_len      = len(spec_tokens)
+    #     # ==========================================
+    #     # set indices for speculative forward
+    #     # ==========================================
+    #     prev_token_id = int(sess.current_ids[0, -1])
+    #     spec_tokens   = [prev_token_id] + draft_tokens          # γ + 1 tokens
+    #     spec_len      = len(spec_tokens)
 
-        input_ids = torch.tensor([spec_tokens], dtype=sess.current_ids.dtype)
-        cache_vec = torch.arange(spec_len, dtype=torch.int32) + orig_nextpos - 1
+    #     input_ids = torch.tensor([spec_tokens], dtype=sess.current_ids.dtype)
+    #     cache_vec = torch.arange(spec_len, dtype=torch.int32) + orig_nextpos - 1
 
-        # ------------------------------------
-        # ------------------------------------
-        assert cache_vec.numel() == spec_len, (
-            f"VERIFY cache_vec length {cache_vec.numel()} must equal spec token length {spec_len}"
-        )
-        logger.debug(
-            f"VERIFY cache_vec length {cache_vec.numel()} must equal spec token length {spec_len}"
-        )
-        # # ------------------------------------
-        # # ------------------------------------
-        # token_texts = [self.tokenizer.decode([tid], clean_up_tokenization_spaces=False)
-        #        for tid in spec_tokens]
-        # logger.debug("verify call K(gamma[%d] + 1)=%d tokens(text)=%s ids=%s",
-        #             len(draft_tokens), input_ids.shape[1], token_texts, input_ids.tolist())
-        # #------------------------------------
-        # # ------------------------------------
+    #     # ------------------------------------
+    #     # ------------------------------------
+    #     assert cache_vec.numel() == spec_len, (
+    #         f"VERIFY cache_vec length {cache_vec.numel()} must equal spec token length {spec_len}"
+    #     )
+    #     logger.debug(
+    #         f"VERIFY cache_vec length {cache_vec.numel()} must equal spec token length {spec_len}"
+    #     )
+    #     # # ------------------------------------
+    #     # # ------------------------------------
+    #     # token_texts = [self.tokenizer.decode([tid], clean_up_tokenization_spaces=False)
+    #     #        for tid in spec_tokens]
+    #     # logger.debug("verify call K(gamma[%d] + 1)=%d tokens(text)=%s ids=%s",
+    #     #             len(draft_tokens), input_ids.shape[1], token_texts, input_ids.tolist())
+    #     # #------------------------------------
+    #     # # ------------------------------------
         
-        logits_all = self.model.speculative_forward(
-            input_ids=input_ids,
-            cache_ids=cache_vec,
-            # start_ids = torch.tensor([0], dtype=torch.int32), # can pass multiple batches in the future
-            spec_length=spec_len,
-        )
+    #     logits_all = self.model.speculative_forward(
+    #         input_ids=input_ids,
+    #         cache_ids=cache_vec,
+    #         # start_ids = torch.tensor([0], dtype=torch.int32), # can pass multiple batches in the future
+    #         spec_length=spec_len,
+    #     )
         
-        # (B, N, V)  → after squeeze  (N, V) where N = γ + 1
-        if logits_all.dim() == 3:
-            logger.debug(f"speculative_forward logits_all shape={logits_all.shape}")
-            logits_all = logits_all.squeeze(-1)          # (N, V)
+    #     # (B, N, V)  → after squeeze  (N, V) where N = γ + 1
+    #     if logits_all.dim() == 3:
+    #         logger.debug(f"speculative_forward logits_all shape={logits_all.shape}")
+    #         logits_all = logits_all.squeeze(-1)          # (N, V)
 
-        #-----------------------------------
-        # print the shape of the logits
-        #-----------------------------------
-        # logger.debug("verify logits_all shape=%s", logits_all.shape)
+    #     #-----------------------------------
+    #     # print the shape of the logits
+    #     #-----------------------------------
+    #     # logger.debug("verify logits_all shape=%s", logits_all.shape)
 
-        # ------------------------------------------------------------------
-        # Library-style masking of BOS / PAD with SuppressTokensLogitsProcessor
-        # ------------------------------------------------------------------
-        # special_ids = []
-        # for attr in ("bos_token_id", "pad_token_id"):
-        #     tid = getattr(self.tokenizer, attr, None)
-        #     if tid is not None:
-        #         special_ids.append(tid)
+    #     # ------------------------------------------------------------------
+    #     # Library-style masking of BOS / PAD with SuppressTokensLogitsProcessor
+    #     # ------------------------------------------------------------------
+    #     # special_ids = []
+    #     # for attr in ("bos_token_id", "pad_token_id"):
+    #     #     tid = getattr(self.tokenizer, attr, None)
+    #     #     if tid is not None:
+    #     #         special_ids.append(tid)
 
-        # if special_ids:
-        #     processors = LogitsProcessorList(
-        #         [SuppressTokensLogitsProcessor(special_ids)]
-        #     )
-        #     # dummy_input_ids shape (N,1) – only the seq-len matters
-        #     dummy_input_ids = torch.zeros(
-        #         (logits_all.size(0), 1), dtype=torch.long, device=logits_all.device
-        #     )
-        #     logits_all = processors(dummy_input_ids, logits_all)
-        # ===========================================================
+    #     # if special_ids:
+    #     #     processors = LogitsProcessorList(
+    #     #         [SuppressTokensLogitsProcessor(special_ids)]
+    #     #     )
+    #     #     # dummy_input_ids shape (N,1) – only the seq-len matters
+    #     #     dummy_input_ids = torch.zeros(
+    #     #         (logits_all.size(0), 1), dtype=torch.long, device=logits_all.device
+    #     #     )
+    #     #     logits_all = processors(dummy_input_ids, logits_all)
+    #     # ===========================================================
 
-        # # ---------- restore snapshot ----------
-        # self.model.cache_ids = orig_cache.clone()
-        # self.model._next_pos = orig_nextpos
-        # sess.cache_ids = orig_cache
-        # # self.model.adapter.model.reset_cache(orig_cache)   # hypothetical helper
-        # assert int(self.model.cache_ids.item()) == int(sess.cache_ids.item()), \
-        #     "KV desync detected on verify exit"
+    #     # # ---------- restore snapshot ----------
+    #     # self.model.cache_ids = orig_cache.clone()
+    #     # self.model._next_pos = orig_nextpos
+    #     # sess.cache_ids = orig_cache
+    #     # # self.model.adapter.model.reset_cache(orig_cache)   # hypothetical helper
+    #     # assert int(self.model.cache_ids.item()) == int(sess.cache_ids.item()), \
+    #     #     "KV desync detected on verify exit"
         
-        return logits_all
+    #     return logits_all
 
     def VerifyDraftTokens(self, request, context):
         """
@@ -432,13 +443,22 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
         # ------------------------------------------------------------------
         # Batched speculative_forward
         # ------------------------------------------------------------------
+        # --------------------------------------------------------------
+        # DEBUG: show the raw tensors that will be fed to speculative_forward
+        # --------------------------------------------------------------
+        logger.info(
+            "[SpecForward] γ=%d  input_ids=%s  cache_vecs(row0…)=%s",
+            gamma,
+            input_ids.tolist(),
+            cache_vecs.tolist()[:2]   # print first 2 rows to avoid log spam
+        )
         t0 = time.perf_counter()
         logits = self.model.speculative_forward(
             input_ids   = input_ids,
             cache_ids   = cache_vecs,
             spec_length = gamma + 1,
         )
-        # logger.info("[scheduler - process_batch] speculative_forward raw shape = %s", tuple(logits.shape))
+        logger.info("[scheduler - process_batch] speculative_forward raw shape = %s", tuple(logits.shape))
         # Raw Neuron layout is (N, V, B)  where:
         #   N = γ + 1, V = vocab shards (≈ vocab_size × TP), B = batch
         # We keep this layout to avoid the transpose overhead.
@@ -458,6 +478,23 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
             all_row_probs = torch.softmax(
                 logits[:, :, b].float(), dim=-1
             )                               # (γ+1, V)
+            # ----------------------------------------------------------
+            # DEBUG: sample *one* token from the target distribution for
+            #        each position i (0…γ) so we can see what the large
+            #        model "wants" to emit.  Decode to words.
+            # ----------------------------------------------------------
+            sampled_ids = []
+            sampled_words = []
+            for i in range(all_row_probs.size(0)):
+                samp_id = int(torch.multinomial(all_row_probs[i], 1).item())
+                sampled_ids.append(samp_id)
+                sampled_words.append(
+                    self.tokenizer.decode([samp_id], clean_up_tokenization_spaces=False)
+                )
+            logger.info(
+                "[TargetSample] sid=%s  sampled_ids=%s  words=%s",
+                sid, sampled_ids, sampled_words
+            )
             tgt_row_probs = all_row_probs[:-1]
 
             device = tgt_row_probs.device

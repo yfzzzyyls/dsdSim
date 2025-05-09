@@ -200,7 +200,7 @@ def compile_model(model_path: str,
             trust_remote_code=True,
             fuse_qkv=True,
             attention_layout="BSH",
-            enable_chunked_prefill=True,
+            enable_chunked_prefill=False,
             use_2d_cache_ids=True,
         )
         model.to_neuron()
@@ -310,7 +310,7 @@ def compile_target_model(model_path: str,
         fuse_qkv              = True,
         attention_layout      = "BSH",
         use_2d_cache_ids      = True,
-        enable_chunked_prefill=True,
+        enable_chunked_prefill=False,
     )
     model.enable_speculative_decoder(spec_buckets)
     model.to_neuron()
