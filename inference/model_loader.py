@@ -20,22 +20,92 @@ logger = logging.getLogger(__name__)
 
 class NeuronHFAdapterWrap(torch.nn.Module):
     """
-    Thin wrapper so .forward accepts input_ids, cache_ids=None
-    and returns (logits, cache_ids) packaged as CausalLMOutputWithPast.
+    Thin wrapper mainly used to manage the KV cache pointer for the
+    underlying Neuron model.
     """
-    def __init__(self, adapter):
+    def __init__(self, adapter, batch_size: int = 1):
         super().__init__()
         self.adapter = adapter
-        self.cache_ids = None  # Initialize KV cache pointer storage
-        self._next_pos = 0  # next position index in the KV cache
+        # Initialise KV‑cache pointer storage
+        self.cache_id = torch.tensor([0], dtype=torch.int32)               # shape (1,)
+        self.batched_cache_ids = torch.zeros(batch_size, dtype=torch.int32) # shape (B,)
         self.config = adapter.config
 
-    def update_cache(self, cache_ids, next_pos):
+    def update_cache(self, delta):
         """
-        Update the KV cache pointer and next position index.
+        Increment the *single‑row* KV‑cache pointer by `delta`.
+        `delta` may be an int, float, or 0‑D tensor; it is cast to int.
         """
-        self.cache_ids = cache_ids
-        self._next_pos = next_pos
+        # Normalise delta to Python int
+        if isinstance(delta, torch.Tensor):
+            delta = int(delta.item())
+        else:
+            delta = int(delta)
+
+        # Lazily initialise cache_ids on first call
+        assert self.cache_id is not None, "cache_ids should not be None"
+
+        self.cache_id = self.cache_id + delta
+
+    def update_batched_cache(self, delta, row_idx):
+        """
+        Increment specific rows of the batched `(B,)` KV‑cache pointer by `delta`.
+        `delta` may be an int, float, or 0‑D tensor; it is cast to int.
+        The rows to update are specified by `row_idx`, which may be an int, list, tuple, or tensor.
+        Only manipulates self.batched_cache_ids.
+        """
+        # --------------------------------------------------------------
+        # Normalize delta to an int
+        # --------------------------------------------------------------
+        if isinstance(delta, torch.Tensor):
+            delta = int(delta.item())
+        else:
+            delta = int(delta)
+
+        # --------------------------------------------------------------
+        # Ensure batched pointer tensor exists
+        # --------------------------------------------------------------
+        assert self.batched_cache_ids is not None, "batched_cache_ids should not be None"
+
+        # --------------------------------------------------------------
+        # Convert row_idx into a flat list of integer indices
+        # --------------------------------------------------------------
+        if isinstance(row_idx, torch.Tensor):
+            indices = row_idx.flatten().tolist()
+        elif isinstance(row_idx, (list, tuple)):
+            indices = list(row_idx)
+        else:
+            indices = [int(row_idx)]
+
+        # Validate all indices
+        B = self.batched_cache_ids.shape[0]
+        assert all(0 <= idx < B for idx in indices), (
+            f"row_idx values {indices} out of range for batched_cache_ids with length {B}"
+        )
+        # --------------------------------------------------------------
+        # Increment only the requested rows
+        # --------------------------------------------------------------
+        for idx in indices:
+            self.batched_cache_ids[idx] += delta
+
+    # ------------------------------------------------------------------
+    # Accessors for external components
+    # ------------------------------------------------------------------
+    def get_cache_id_vec(self):
+        """
+        Return a **clone** of the single‑row KV‑cache pointer vector so
+        callers cannot mutate internal state accidentally.
+        """
+        assert self.cache_id is not None, "cache_id should not be None"
+        return self.cache_id.clone()
+
+    def get_batched_cache_id_vec(self):
+        """
+        Return a **clone** of the batched `(B,)` KV‑cache pointer vector.
+        """
+        assert self.batched_cache_ids is not None, "batched_cache_ids should not be None"
+        return self.batched_cache_ids.clone()
+
 
     # ------------------------------------------------------------------  
     # helper: build a (batch, length) int32 tensor [start, …, start+L‑1]  
@@ -254,7 +324,7 @@ def compile_model(model_path: str,
         # )
 
         # Wrap the adapter so downstream code keeps the KV‑pointer logic
-        return NeuronHFAdapterWrap(adapter)
+        return NeuronHFAdapterWrap(adapter, batch_size=batch_size)
     else:
         model = AutoModelForCausalLM.from_pretrained(model_path)
         tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=False)
@@ -262,7 +332,7 @@ def compile_model(model_path: str,
             tokenizer.pad_token = tokenizer.eos_token
         tokenizer.pad_token_id = tokenizer.eos_token_id
         logger.info("Non‑Neuron path: loaded model & tokenizer; skipping on‑disk save because we re‑compile on every run.")
-        return model
+        return NeuronHFAdapterWrap(HuggingFaceGenerationModelAdapter(model.config, model), batch_size=batch_size)
     
 
 def compile_target_model(model_path: str,
@@ -332,7 +402,7 @@ def compile_target_model(model_path: str,
     model.config.pad_token_id = hf_config.pad_token_id
 
     adapter = HuggingFaceGenerationModelAdapter(hf_config, model)
-    return NeuronHFAdapterWrap(adapter)
+    return NeuronHFAdapterWrap(adapter, batch_size=batch_size)
 
 
 def load_target_model(model_path: str,

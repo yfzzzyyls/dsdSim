@@ -30,9 +30,31 @@ class TargetSession:
         self.verification_time = 0.0   # cumulative time spent verifying draft tokens (seconds)
         self.finalize_calls    = 0     # count of FinalizeTokens invocations
         self.last_draft_chunk = None
-        # pointer to the *next* KV slot
-        self.cache_ids = torch.tensor([input_ids.shape[1]], dtype=torch.int32)
+        # pointer to the *next* KV slot (scalar tensor, starts at 0)
+        self.cache_id = torch.tensor([0], dtype=torch.int32)
         self.pending_logits = None
+
+    # ------------------------------------------------------------------
+    # Accessors / mutators for session‑local KV pointer
+    # ------------------------------------------------------------------
+    def get_session_cache_id(self):
+        """
+        Return the scalar tensor that holds this session's next KV slot.
+        """
+        return self.cache_id
+
+    def update_session_cache_id(self, delta):
+        """
+        Increment the session's KV pointer by `delta`.
+        `delta` may be an int, float, or 0‑D tensor.
+        """
+        if isinstance(delta, torch.Tensor):
+            delta = int(delta.item())
+        else:
+            delta = int(delta)
+
+        # Increment in place to preserve tensor identity where callers keep a reference
+        self.cache_id += delta
 
 class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
     def __init__(self, model_path, sequence_length=128, spec_length=None,
@@ -65,30 +87,33 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
     # ------------------------------------------------------------------
     # Utility: right‑pad an (1, L) tensor with zeros to ctx_estimate
     # ------------------------------------------------------------------
-    def _pad_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
-        seq_len = input_ids.shape[1]
-        if seq_len >= self._ctx_estimate:
-            return input_ids                   # long enough
-        pad_len = self._ctx_estimate - seq_len
+    # def _pad_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+    #     seq_len = input_ids.shape[1]
+    #     if seq_len >= self._ctx_estimate:
+    #         return input_ids                   # long enough
+    #     pad_len = self._ctx_estimate - seq_len
 
-        # ① choose a *legal* pad-id
-        pad_id = self.tokenizer.pad_token_id
-        if pad_id is None:                    # just in case
-            pad_id = self.tokenizer.eos_token_id
+    #     # ① choose a *legal* pad-id
+    #     pad_id = self.tokenizer.pad_token_id
+    #     if pad_id is None:                    # just in case
+    #         pad_id = self.tokenizer.eos_token_id
 
-        # ② fill token pad with pad_id  (keep -1 only for cache_ids)
-        pad_tokens = torch.full(
-            (1, pad_len),
-            pad_id,
-            dtype=input_ids.dtype,
-            device=input_ids.device,
-        )
-        return torch.cat([input_ids, pad_tokens], dim=1)
+    #     # ② fill token pad with pad_id  (keep -1 only for cache_id)
+    #     pad_tokens = torch.full(
+    #         (1, pad_len),
+    #         pad_id,
+    #         dtype=input_ids.dtype,
+    #         device=input_ids.device,
+    #     )
+    #     return torch.cat([input_ids, pad_tokens], dim=1)
 
     def _sync_kv_pointer(self, sess: TargetSession):
+        pass
         # ---- sanity check ----
-        assert int(self.model.cache_ids.item()) == int(sess.cache_ids.item()), \
-            "Target KV cache_ids desynchronised after sync"
+        # should sync the draft model cache pointer with the session cache pointer 
+        # becasue they are essentially the same.
+        # assert int(self.model.cache_id.item()) == int(sess.cache_ids.item()), \
+        #     "Target KV cache_ids desynchronised after sync"
 
 
     def StartGeneration(self, request, context):
@@ -112,9 +137,6 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
             # ------------------------------------------------------------------
             # Priming Neuron KV cache for the prompt
             # ------------------------------------------------------------------
-            self.model.cache_ids = None
-            self.model._next_pos = 0
-
             # ----------------------------------------------------------
             # Build a (B, L) batched prompt where B equals the compiled
             # batch size (self.max_batch).  Row‑0 contains the real prompt
@@ -125,17 +147,18 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
             B = self.max_batch  # compiled batch size
             pad_id = 0
 
-            if B == 1:
-                # No padding needed when the compiled batch size is 1
-                batched_ids = current_ids                                   # (1, L)
-            else:
-                pad_rows = torch.full(
-                    (B - 1, L),
-                    pad_id,
-                    dtype=current_ids.dtype,
-                    device=current_ids.device,
-                )
-                batched_ids = torch.cat([current_ids, pad_rows], dim=0)     # (B, L)
+            # For now we map each new session to the first free row.
+            # In production you would allocate from a row‑pool.
+            row_idx = 0
+
+            # Build a full (B, L) tensor filled with pad_id, then insert prompt at row_idx
+            batched_ids = torch.full(
+                (B, L),
+                pad_id,
+                dtype=current_ids.dtype,
+                device=current_ids.device,
+            )
+            batched_ids[row_idx, :L] = current_ids
 
             # Build a 2‑D cache_ids tensor (B, L) where each row is [0 … L‑1]
             cache_vec = (
@@ -149,26 +172,22 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
                 cache_ids=cache_vec,
             )
 
-            # --- MANUALLY align wrapper pointer with the prompt length ---
-            next_pos = current_ids.shape[1]                       # L
-            self.model.update_cache(torch.tensor([next_pos], dtype=torch.int32),
-                                    next_pos)
-            
-            # self.model._next_pos = next_pos
-            # self.model.cache_ids = torch.tensor([next_pos], dtype=torch.int32)
+            # --- Advance KV pointers by the prompt length (delta = L) ---
+            delta = current_ids.shape[1]            # how many tokens we just pref‑filled
+            self.model.update_batched_cache(delta, row_idx)          # target (B,) pointer
+            self.sessions[session_id].update_session_cache_id(delta) # draft‑side scalar
 
             # record in session
-            self.sessions[session_id].cache_ids = self.model.cache_ids.clone()
             # ----------------------------------------------------------
             # DEBUG: show prompt length L, session‑side cache pointer and
             #        model‑wrapper cache pointer right after pre‑fill
             # ----------------------------------------------------------
             logger.info(
-                "[StartGeneration] sid=%s  L=%d  session.cache_ids=%s  model.cache_ids=%s",
+                "[StartGeneration] sid=%s  L=%d  session.cache_id=%s  model.cache_id_vec=%s",
                 session_id,
                 L,
-                self.sessions[session_id].cache_ids.tolist(),
-                self.model.cache_ids.tolist(),
+                self.sessions[session_id].cache_id.tolist(),
+                self.model.get_batched_cache_id_vec().tolist(),
             )
         return inference_pb2.StartResponse(acknowledged=True, session_id=session_id)
     
@@ -186,13 +205,12 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
         if not tok_ids:
             return
 
-        # Manually bump ONLY the cache‑ids row that belongs to this session
-        orig_next_pos = int(sess.cache_ids.item())
-        new_next_pos  = orig_next_pos + len(tok_ids)
-
-        # update session's cache_ids, and the model's cache_ids
-        sess.cache_ids = torch.tensor([new_next_pos], dtype=torch.int32)
-        self.model.update_cache(sess.cache_ids, new_next_pos)
+        # --------------------------------------------------------------
+        # Bump KV‑cache pointers by the number of tokens we just committed
+        # --------------------------------------------------------------
+        delta = len(tok_ids)                     # how many new tokens
+        self.model.update_batched_cache(delta, row_idx)   # target side (B,)
+        sess.update_session_cache_id(delta)               # draft/session side
 
         self._sync_kv_pointer(sess)
 
@@ -418,7 +436,7 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
             prev_token = int(sess.current_ids[0, -1].item())
             toks = [prev_token] + r["draft_tokens"]          # γ+1
 
-            start_pos = int(sess.cache_ids.item())
+            start_pos = int(sess.get_session_cache_id().item())
             vec = torch.arange(len(toks), dtype=torch.int32) + start_pos
 
             # Decode the first five token-ids to human‑readable strings

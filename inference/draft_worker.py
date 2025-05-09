@@ -63,8 +63,8 @@ def speculative_decode(
 
     # Initial setup: process prompt through draft model to initialize cache
     output_tokens = []
-    draft_model.cache_ids = None
-    draft_model._next_pos = 0  # next position index in the KV cache
+    # draft_model.cache_ids = None
+    # draft_model._next_pos = 0  # next position index in the KV cache
 
     # pre-filling: Feed the entire prompt once so the draft model builds its KV cache
     prompt_ids = tokenizer(prompt, return_tensors='pt').input_ids
@@ -93,7 +93,7 @@ def speculative_decode(
     )                                 # fills 0…L‑1
     timing["draft_prefill_time"] += time.perf_counter() - time_draftprefill
     # Overwrite cache pointer with a single‑index tensor [L]
-    draft_model.update_cache(torch.tensor([L], dtype=torch.int32), L)
+    draft_model.update_cache(L)
     # draft_model.cache_ids = torch.tensor([L], dtype=torch.int32)
     # draft_model._next_pos = L
 
@@ -117,9 +117,13 @@ def speculative_decode(
         # past_states = [draft_model.cache_ids]
         for i in range(current_gamma):
             scratch_token[0, 0] = prev_token_id
-            next_pos = draft_model._next_pos + i
+            # Compute the absolute KV-cache position for this token
+            current_ptr = int(draft_model.get_cache_id_vec().item())
+            next_pos = current_ptr + i
             # Neuron decoder expects (B, 1) – wrap pos in an extra bracket
-            cache_vec = torch.tensor([[next_pos]], dtype=torch.int32)   # shape = (1, 1)
+            cache_vec = torch.tensor([[next_pos]],
+                                     dtype=torch.int32,
+                                     device=scratch_token.device)   # shape = (1, 1)
             time_draftgen = time.perf_counter()            
             logits, _ = draft_model.forward(input_ids=scratch_token, cache_ids=cache_vec)
             timing["draft_generation_time"] += time.perf_counter() - time_draftgen
@@ -276,10 +280,11 @@ def speculative_decode(
         # ==============================================================
         # # 3) Advance pointer past the newly‑written bonus token.
         # this is used to update the KV cache ptr
-        # draft_model.update_cache(torch.tensor([tok], dtype=torch.int32), tok)
-        new_next_pos = draft_model._next_pos + accepted_count + 1
-        new_cache_id = torch.tensor([new_next_pos], dtype=torch.int32)
-        draft_model.update_cache(new_cache_id, new_next_pos)
+        # --------------------------------------------------------------
+        # Advance the draft model’s KV pointer by (accepted_count + bonus)
+        # --------------------------------------------------------------
+        delta = accepted_count + 1          # bonus token counts as +1
+        draft_model.update_cache(delta)     # unified, increment-by-delta API
         # ==============================================================
 
         # Record every token that will appear in the final text
