@@ -177,13 +177,13 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
             self.model.update_batched_cache(delta, row_idx)          # target‑side vector
             self.sessions[session_id].update_session_cache_id(delta) # session‑side scalar
 
-            # ------------------------------------------------------------------
-            logger.info(
-                "[StartGeneration] sid=%s L=%d row=%d session.cache_id=%s model.cache_vec=%s",
-                session_id, L_new, row_idx,
-                self.sessions[session_id].cache_id.tolist(),
-                self.model.get_batched_cache_id_vec().tolist(),
-            )
+            # # ------------------------------------------------------------------
+            # logger.info(
+            #     "[StartGeneration] sid=%s L=%d row=%d session.cache_id=%s model.cache_vec=%s",
+            #     session_id, L_new, row_idx,
+            #     self.sessions[session_id].cache_id.tolist(),
+            #     self.model.get_batched_cache_id_vec().tolist(),
+            # )
         return inference_pb2.StartResponse(acknowledged=True, session_id=session_id)
     
     def _commit_tokens_bulk(self, sess, tok_ids):
@@ -400,11 +400,11 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
         B     = len(batch_reqs)
         real_B = B            # remember how many *real* rows we have
 
-        # Log real_B, gamma, session ids
-        logger.info(
-            "[Batch] real_B=%d  gamma=%d  session_ids=%s",
-            real_B, gamma, [r['session_id'] for r in batch_reqs]
-        )
+        # # Log real_B, gamma, session ids
+        # logger.info(
+        #     "[Batch] real_B=%d  gamma=%d  session_ids=%s",
+        #     real_B, gamma, [r['session_id'] for r in batch_reqs]
+        # )
 
         # ------------------------------------------------------------------
         # Build input tensors (B, γ+1) and cache_vec (B, γ+1)
@@ -433,14 +433,14 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
             # (no row‑offset added because continuous batching routes by seq_id)
 
             # Decode the first five token-ids to human‑readable strings
-            token_words = [
-                self.tokenizer.decode([tid], clean_up_tokenization_spaces=False)
-                for tid in toks[:5]
-            ]
-            logger.info(
-                "[BatchRow %d] sid=%s  ids=%s  words=%s  cache_vec=%s",
-                len(sess_list), sid, toks[:5], token_words, vec[:5].tolist()
-            )
+            # token_words = [
+            #     self.tokenizer.decode([tid], clean_up_tokenization_spaces=False)
+            #     for tid in toks[:5]
+            # ]
+            # logger.info(
+            #     "[BatchRow %d] sid=%s  ids=%s  words=%s  cache_vec=%s",
+            #     len(sess_list), sid, toks[:5], token_words, vec[:5].tolist()
+            # )
 
             input_ids.append(torch.tensor(toks, dtype=torch.int32))
             cache_vecs.append(vec)
@@ -470,12 +470,12 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
         # --------------------------------------------------------------
         # DEBUG: show the raw tensors that will be fed to speculative_forward
         # --------------------------------------------------------------
-        logger.info(
-            "[SpecForward] γ=%d  input_ids=%s  cache_vecs(row0…)=%s",
-            gamma,
-            input_ids.tolist(),
-            cache_vecs.tolist()[:2]   # print first 2 rows to avoid log spam
-        )
+        # logger.info(
+        #     "[SpecForward] γ=%d  input_ids=%s  cache_vecs(row0…)=%s",
+        #     gamma,
+        #     input_ids.tolist(),
+        #     cache_vecs.tolist()[:2]   # print first 2 rows to avoid log spam
+        # )
         t0 = time.perf_counter()
         logits = self.model.speculative_forward(
             input_ids = input_ids,
@@ -483,7 +483,7 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
             start_ids = start_ids,          # NEW
             spec_length = gamma + 1,
         )
-        logger.info("[scheduler - process_batch] speculative_forward raw shape = %s", tuple(logits.shape))
+        # logger.info("[scheduler - process_batch] speculative_forward raw shape = %s", tuple(logits.shape))
         # Raw Neuron layout is (N, V, B)  where:
         #   N = γ + 1, V = vocab shards (≈ vocab_size × TP), B = batch
         # We keep this layout to avoid the transpose overhead.
@@ -508,18 +508,18 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
             #        each position i (0…γ) so we can see what the large
             #        model "wants" to emit.  Decode to words.
             # ----------------------------------------------------------
-            sampled_ids = []
-            sampled_words = []
-            for i in range(all_row_probs.size(0)):
-                samp_id = int(torch.multinomial(all_row_probs[i], 1).item())
-                sampled_ids.append(samp_id)
-                sampled_words.append(
-                    self.tokenizer.decode([samp_id], clean_up_tokenization_spaces=False)
-                )
-            logger.info(
-                "[TargetSample] sid=%s  sampled_ids=%s  words=%s",
-                sid, sampled_ids, sampled_words
-            )
+            # sampled_ids = []
+            # sampled_words = []
+            # for i in range(all_row_probs.size(0)):
+            #     samp_id = int(torch.multinomial(all_row_probs[i], 1).item())
+            #     sampled_ids.append(samp_id)
+            #     sampled_words.append(
+            #         self.tokenizer.decode([samp_id], clean_up_tokenization_spaces=False)
+            #     )
+            # logger.info(
+            #     "[TargetSample] sid=%s  sampled_ids=%s  words=%s",
+            #     sid, sampled_ids, sampled_words
+            # )
             tgt_row_probs = all_row_probs[:-1]
 
             device = tgt_row_probs.device
@@ -533,12 +533,12 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
             accept = (p_tgt >= q_draft) | (rand_v < ratio)
             rej    = (~accept).nonzero(as_tuple=False)
             first_rej = int(rej[0].item()) if rej.numel() > 0 else len(draft_tokens)
-            logger.info(
-                f"[ACCEPTANCE DEBUG] "
-                f"accept={accept.cpu().tolist()} "
-                f"reject_indices={(rej.squeeze(-1).cpu().tolist() if rej.numel() else [])} "
-                f"first_rej={first_rej}"
-            )
+            # logger.info(
+            #     f"[ACCEPTANCE DEBUG] "
+            #     f"accept={accept.cpu().tolist()} "
+            #     f"reject_indices={(rej.squeeze(-1).cpu().tolist() if rej.numel() else [])} "
+            #     f"first_rej={first_rej}"
+            # )
 
 
             accepted_cnt = first_rej
@@ -567,19 +567,19 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
                 self.tokenizer.decode([tid], clean_up_tokenization_spaces=False)
                 for tid in committed
             ]
-            status = (
-                "all_accepted"
-                if accepted_cnt == len(draft_tokens)
-                else f"rejected_from_pos_{accepted_cnt}"
-            )
-            logger.info(
-                "[Verify] sid=%s  status=%s\n"
-                "  draft  = %s\n"
-                "  target = %s\n"
-                "  commit = %s",
-                sid, status,
-                draft_words, tgt_words, committed_words,
-            )
+            # status = (
+            #     "all_accepted"
+            #     if accepted_cnt == len(draft_tokens)
+            #     else f"rejected_from_pos_{accepted_cnt}"
+            # )
+            # logger.info(
+            #     "[Verify] sid=%s  status=%s\n"
+            #     "  draft  = %s\n"
+            #     "  target = %s\n"
+            #     "  commit = %s",
+            #     sid, status,
+            #     draft_words, tgt_words, committed_words,
+            # )
 
             self._commit_tokens_bulk(sess, committed)
             finished = sess.finished
