@@ -159,14 +159,18 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
             row_idx = self.sessions[session_id].row_idx
             L_new   = current_ids.shape[1]
 
-            # ---------- Build (1, L_new) tensors (batch size 1) ----------
-            offset = row_idx * ctx_len
-            cache_vec = (
-                torch.arange(L_new, dtype=torch.int32, device=current_ids.device) + offset
-            ).unsqueeze(0)                     # shape: (1, L_new)
+            # In continuous batching each sequence writes inside its own 0‑based slice,
+            # so cache_ids should start at 0 for a brand‑new row.
+            cache_vec = torch.arange(L_new, dtype=torch.int32,
+                                     device=current_ids.device).unsqueeze(0)  # (1, L_new)
 
             # ---- Prefill only this row (batch size 1) ----
-            _ = self.model.forward(input_ids=current_ids, cache_ids=cache_vec)
+            seq_ids = torch.tensor([row_idx], dtype=torch.int32, device=current_ids.device)
+            _ = self.model.forward(
+                input_ids=current_ids,
+                cache_ids=cache_vec,
+                start_ids=seq_ids           # pass logical sequence‑id
+            )
 
             # ---- Advance KV pointer for *this* row only ----
             delta = L_new
@@ -416,6 +420,7 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
             toks = [prev_token] + r["draft_tokens"]          # γ+1 tokens
 
             # ---------- NEW: pad / truncate to match spec bucket = 5 ----------
+            # TODO: desired len or maximum (gamma + 1) length should be a parameter
             desired_len = 5                                  # current compiled bucket
             pad_id      = 0
             if len(toks) < desired_len:
@@ -423,7 +428,9 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
             # ------------------------------------------------------------------
 
             start_pos = int(sess.get_session_cache_id().item())
+            # start_pos is already the local pointer for this row (0‑based within its slice)
             vec = torch.arange(len(toks), dtype=torch.int32) + start_pos
+            # (no row‑offset added because continuous batching routes by seq_id)
 
             # Decode the first five token-ids to human‑readable strings
             token_words = [
@@ -443,25 +450,19 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
         # Pad *lists* before stacking so the final stacked tensor keeps
         # the original (B, N, V) layout coming out of Neuron.  This avoids
         # collapsing the vocab axis down to 2 columns.
-        # Also pad sess_list with None for dummy rows.
         # --------------------------------------------------------------
         assert real_B <= self.max_batch, \
             f"Batch size {real_B} compiled now should be the less than max_batch {self.max_batch}"
-        if real_B < self.max_batch:
-            pad_n = self.max_batch - real_B
-
-            # Use explicit padding instead of cloning row‑0 data
-            pad_token_id = 0
-            pad_ids = torch.full_like(input_ids[0], pad_token_id)     # (γ+1,) all PAD
-            pad_vec = torch.zeros_like(cache_vecs[0])                 # (γ+1,) all zeros
-
-            for _ in range(pad_n):
-                input_ids.append(pad_ids)
-                cache_vecs.append(pad_vec)
-                sess_list.append(None)        # placeholder for dummy row
-
+        # REMOVE dummy-row padding: do not pad input_ids, cache_vecs, or sess_list
         input_ids  = torch.stack(input_ids, 0)        # (B, γ+1)
         cache_vecs = torch.stack(cache_vecs, 0)       # (B, γ+1)
+
+        # Add start_ids tensor for batch
+        start_ids = torch.tensor(
+            [s.row_idx for s in sess_list],
+            dtype=torch.int32,
+            device=input_ids.device
+        )
 
         # ------------------------------------------------------------------
         # Batched speculative_forward
@@ -477,9 +478,10 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
         )
         t0 = time.perf_counter()
         logits = self.model.speculative_forward(
-            input_ids   = input_ids,
-            cache_ids   = cache_vecs,
-            spec_length = gamma + 1,           # match the compiled bucket
+            input_ids = input_ids,
+            cache_ids = cache_vecs,
+            start_ids = start_ids,          # NEW
+            spec_length = gamma + 1,
         )
         logger.info("[scheduler - process_batch] speculative_forward raw shape = %s", tuple(logits.shape))
         # Raw Neuron layout is (N, V, B)  where:

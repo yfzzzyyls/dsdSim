@@ -15,7 +15,10 @@ import types
 # Fused Speculative Decoding is supported.
 # fsd = FusedSpeculativeDecoder(draft_model, target_model, spec_length)
 # fsd.to_neuron()  # Compile the fused speculative model
+ # Speculation buckets are specified by *length*; the compiler will build
+ # both batch‑1 and batch‑2 heads automatically when `dynamic_batch_size=True`.
 SPEC_LENGTH_BUCKETS = [5, 128]
+BATCH_BUCKETS = [1, 2]
 logger = logging.getLogger(__name__)
 
 class NeuronHFAdapterWrap(torch.nn.Module):
@@ -389,9 +392,10 @@ def compile_target_model(model_path: str,
         fuse_qkv              = True,
         attention_layout      = "BSH",
         use_2d_cache_ids      = True,
+        dynamic_batch_size    = False,      # build (len,1) and (len,2) heads
         enable_chunked_prefill=False,
     )
-    model.enable_speculative_decoder(spec_buckets)
+    model.enable_speculative_decoder(SPEC_LENGTH_BUCKETS, BATCH_BUCKETS)
     model.to_neuron()
 
     logger.info("Requested spec-length buckets: %s", spec_buckets)
