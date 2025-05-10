@@ -27,7 +27,11 @@ from concurrent import futures
 import grpc
 import torch
 from transformers import AutoTokenizer
+
 from vllm.engine.llm_engine import LLMEngine, EngineArgs
+from vllm import SamplingParams
+from vllm.inputs import TokensPrompt
+from vllm.engine.arg_utils import EngineArgs
 
 from grpc_comm import inference_pb2, inference_pb2_grpc
 
@@ -63,11 +67,11 @@ class SpeculativeService(inference_pb2_grpc.SpeculativeServiceServicer):
                  top_p: float = 0.9,
                  gamma: int = 4):
         self.gamma = gamma
+        self.temperature = temperature
+        self.top_p = top_p
         self.tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=False)
 
         # ---- Launch vLLM engine (continuous batching on Neuron) ----
-        from vllm.engine.arg_utils import EngineArgs
-
         args = EngineArgs(
             model=model_path,
             device="neuron",
@@ -88,12 +92,19 @@ class SpeculativeService(inference_pb2_grpc.SpeculativeServiceServicer):
         if not prompt:
             context.abort(grpc.StatusCode.INVALID_ARGUMENT, "prompt must be non‑empty")
 
-        prompt_ids = self.tokenizer(prompt, return_tensors="pt").input_ids.squeeze(0).tolist()
         session_id = int(uuid.uuid4()) & 0xFFFFFFFF
         req_id     = f"{session_id}"
 
+        prompt_ids = self.tokenizer(prompt, return_tensors="pt").input_ids.squeeze(0).tolist()
+        tokens_prompt = TokensPrompt(tokens=prompt_ids)   # pass by name
+
         # add slot & run prefill once
-        self.engine.add_request(req_id, prompt_ids)
+        sampling_params = SamplingParams(
+            max_tokens=request.max_new_tokens if request.max_new_tokens > 0 else self.engine.model_config.max_seq_len,
+            temperature=self.temperature,
+            top_p=self.top_p,
+        )
+        self.engine.add_request(req_id, prompt, sampling_params)
         self.engine.prefill([req_id])          # fills KV cache, no logits needed
 
         self.sessions[session_id] = TargetSession(req_id, prompt_ids)
