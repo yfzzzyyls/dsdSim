@@ -151,63 +151,47 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
             row_idx = self._allocate_row()
             self.sessions[session_id] = TargetSession(current_ids, row_idx)
             # ------------------------------------------------------------------
-            # Priming Neuron KV cache for the prompt
+            # Priming Neuron KV cache for *only* the newly‑allocated row
+            # (avoid replaying prompts for other rows)
             # ------------------------------------------------------------------
-            # ----------------------------------------------------------
-            # Build a (B, ctx_len) tensor that preserves every *existing*
-            # session’s prompt so we never overwrite their KV banks.  Only
-            # the newly‑allocated row is filled with the new prompt; all
-            # unused rows remain PAD.
-            # ----------------------------------------------------------
-            ctx_len = self._ctx_estimate
-            B       = self.max_batch
-            pad_id  = 0
+            ctx_len = self._ctx_estimate          # compile‑time context length (128)
+            B       = self.max_batch              # static batch (e.g. 2)
+            row_idx = self.sessions[session_id].row_idx
+            L_new   = current_ids.shape[1]
 
-            # Start with all PAD tokens
-            batched_ids = torch.full(
-                (B, ctx_len),
+            # ---------- Build (B, L_new) input_ids ----------
+            pad_id = 0
+            ids_batched = torch.full(
+                (B, L_new),
                 pad_id,
                 dtype=current_ids.dtype,
                 device=current_ids.device,
             )
+            ids_batched[row_idx] = current_ids[0]         # copy only new prompt
 
-            # ① copy prompts for sessions that were already running
-            for s in self.sessions.values():
-                if s is self.sessions[session_id]:     # skip – new row handled below
-                    continue
-                row = s.row_idx
-                L_old = s.current_ids.shape[1]
-                batched_ids[row, :min(L_old, ctx_len)] = s.current_ids[0, :ctx_len]
-
-            # ② copy the *new* prompt into its assigned row
-            L_new = current_ids.shape[1]
-            batched_ids[row_idx, :min(L_new, ctx_len)] = current_ids[0, :ctx_len]
-
-            # cache_vec rows are always [0 … ctx_len‑1]
-            cache_vec = (
-                torch.arange(ctx_len, dtype=torch.int32, device=current_ids.device)
-                      .unsqueeze(0)
-                      .repeat(B, 1)
+            # ---------- Build (B, L_new) cache_vec ----------
+            cache_batched = torch.zeros(
+                (B, L_new),
+                dtype=torch.int32,
+                device=current_ids.device,
+            )
+            offset = row_idx * ctx_len
+            cache_batched[row_idx] = (
+                torch.arange(L_new, dtype=torch.int32, device=current_ids.device) + offset
             )
 
-            _ = self.model.forward(
-                input_ids=batched_ids,
-                cache_ids=cache_vec,
-            )
+            # ---- Prefill only this slot (other rows are PAD -> no‑op) ----
+            _ = self.model.forward(input_ids=ids_batched, cache_ids=cache_batched)
 
-            # --- Advance KV pointers by the prompt length (delta = L) ---
-            delta = current_ids.shape[1]            # how many tokens we just pref‑filled
-            self.model.update_batched_cache(delta, row_idx)          # target (B,) pointer
-            self.sessions[session_id].update_session_cache_id(delta) # draft‑side scalar
+            # ---- Advance KV pointer for *this* row only ----
+            delta = L_new
+            self.model.update_batched_cache(delta, row_idx)          # target‑side vector
+            self.sessions[session_id].update_session_cache_id(delta) # session‑side scalar
 
-            # record in session
-            # ----------------------------------------------------------
-            # DEBUG: show prompt length L, session‑side cache pointer and
-            #        model‑wrapper cache pointer right after pre‑fill
-            # ----------------------------------------------------------
+            # ------------------------------------------------------------------
             logger.info(
-                "[StartGeneration] sid=%s   session.cache_id=%s  model.cache_id_vec=%s",
-                session_id,
+                "[StartGeneration] sid=%s L=%d row=%d session.cache_id=%s model.cache_vec=%s",
+                session_id, L_new, row_idx,
                 self.sessions[session_id].cache_id.tolist(),
                 self.model.get_batched_cache_id_vec().tolist(),
             )
@@ -444,7 +428,14 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
             self._sync_kv_pointer(sess)
 
             prev_token = int(sess.current_ids[0, -1].item())
-            toks = [prev_token] + r["draft_tokens"]          # γ+1
+            toks = [prev_token] + r["draft_tokens"]          # γ+1 tokens
+
+            # ---------- NEW: pad / truncate to match spec bucket = 5 ----------
+            desired_len = 5                                  # current compiled bucket
+            pad_id      = 0
+            if len(toks) < desired_len:
+                toks += [pad_id] * (desired_len - len(toks)) # right‑pad with PAD
+            # ------------------------------------------------------------------
 
             start_pos = int(sess.get_session_cache_id().item())
             vec = torch.arange(len(toks), dtype=torch.int32) + start_pos
@@ -503,7 +494,7 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
         logits = self.model.speculative_forward(
             input_ids   = input_ids,
             cache_ids   = cache_vecs,
-            spec_length = gamma + 1,
+            spec_length = gamma + 1,           # match the compiled bucket
         )
         logger.info("[scheduler - process_batch] speculative_forward raw shape = %s", tuple(logits.shape))
         # Raw Neuron layout is (N, V, B)  where:

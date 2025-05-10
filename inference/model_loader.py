@@ -15,7 +15,7 @@ import types
 # Fused Speculative Decoding is supported.
 # fsd = FusedSpeculativeDecoder(draft_model, target_model, spec_length)
 # fsd.to_neuron()  # Compile the fused speculative model
-SPEC_LENGTH_BUCKETS = [1, 2, 3, 4, 5]
+SPEC_LENGTH_BUCKETS = [5, 128]
 logger = logging.getLogger(__name__)
 
 class NeuronHFAdapterWrap(torch.nn.Module):
