@@ -441,7 +441,18 @@ def run_client(
     if not prompts:
         logger.error("No valid lines in the prompt file.")
         return
-
+    
+    assert (gamma <= max(SPEC_LENGTH_BUCKETS) - 1), (
+        f"Gamma {gamma} exceeds the maximum supported length "
+        f"({max(SPEC_LENGTH_BUCKETS) - 1}). Please choose a smaller value."
+    )
+    assert (gamma >= 1), (
+        f"Gamma {gamma} is less than the minimum supported length "
+        f"(1). Please choose a larger value."
+    )
+    # ------------------------------------------------------------------
+    # Stage‑1: load the target model and start the gRPC server
+    # ------------------------------------------------------------------
     logger.info(f"Loading draft model '{draft_model_name}' (sequence_length={sequence_length}) for speculative decoding...")
     if isinstance(draft_model_name, str):
         # draft_model_name is a path → load the model

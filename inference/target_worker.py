@@ -11,6 +11,7 @@ from transformers.generation import LogitsProcessorList, SuppressTokensLogitsPro
 import queue
 import threading
 import uuid
+from inference.model_loader import SPEC_LENGTH_BUCKETS   # available bucket lengths
 
 logger = logging.getLogger(__name__)
 if not logger.hasHandlers():
@@ -421,12 +422,16 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
             prev_token = int(sess.current_ids[0, -1].item())
             toks = [prev_token] + r["draft_tokens"]          # γ+1 tokens
 
-            # ---------- NEW: pad / truncate to match spec bucket = 5 ----------
-            # TODO: desired len or maximum (gamma + 1) length should be a parameter
-            desired_len = 5                                  # current compiled bucket
-            pad_id      = 0
-            if len(toks) < desired_len:
-                toks += [pad_id] * (desired_len - len(toks)) # right‑pad with PAD
+            # ---------- Dynamic padding to the closest spec bucket ----------
+            spec_buckets = sorted(SPEC_LENGTH_BUCKETS)       # e.g. [5, 8, 128]
+            # choose the smallest bucket ≥ current γ+1, else fall back to largest
+            desired_len = next((b for b in spec_buckets if b >= len(toks)),
+                               spec_buckets[-1])
+            pad_id = 0
+            assert len(toks) <= desired_len, \
+                f"Batch size {real_B} compiled now should be the less than max_batch {self.max_batch}"
+            if len(toks) < desired_len:                      # right-pad
+                toks += [pad_id] * (desired_len - len(toks))
             # ------------------------------------------------------------------
 
             start_pos = int(sess.get_session_cache_id().item())
@@ -482,8 +487,8 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
         logits = self.model.speculative_forward(
             input_ids = input_ids,
             cache_ids = cache_vecs,
-            start_ids = start_ids,          # NEW
-            spec_length = gamma + 1,
+            start_ids = start_ids,          # continuous batching
+            spec_length = input_ids.size(1),   # use the padded/truncated length
         )
         # logger.info("[scheduler - process_batch] speculative_forward raw shape = %s", tuple(logits.shape))
         # Raw Neuron layout is (N, V, B)  where:
