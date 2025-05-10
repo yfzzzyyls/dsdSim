@@ -380,6 +380,7 @@ def compile_target_model(model_path: str,
         fuse_qkv              = True,
         attention_layout      = "BSH",
         use_2d_cache_ids      = True,
+        dynamic_batch_size    = True,
         enable_chunked_prefill=False,
     )
     model.enable_speculative_decoder(spec_buckets)
