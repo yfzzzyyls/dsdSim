@@ -80,7 +80,8 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
         # ----------------------------------------------------------
         # Row‑index pool for static‑batch Neuron graph
         # ----------------------------------------------------------
-        self._row_pool = list(range(batch_size))          # free rows 0…B‑1
+        # TODO: make this dynamic, now hardcoded to 2 rows
+        self._row_pool = list(range(2))          # free rows 0…B‑1
 
         def _allocate_row():
             assert self._row_pool, "No free Neuron batch rows left"
