@@ -8,9 +8,9 @@ from transformers_neuronx import LlamaForSampling
 from transformers_neuronx.module import save_pretrained_split
 from transformers_neuronx.generation_utils import HuggingFaceGenerationModelAdapter
 import torch
-from transformers_neuronx.config import NeuronConfig
 from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers_neuronx.fused_speculation import FusedSpeculativeDecoder
+from transformers_neuronx.config import NeuronConfig, ContinuousBatchingConfig
 import types
 # Fused Speculative Decoding is supported.
 # fsd = FusedSpeculativeDecoder(draft_model, target_model, spec_length)
@@ -353,10 +353,19 @@ def compile_target_model(model_path: str,
                 f"(sequence_length={sequence_length})")
 
     tp_degree = int(os.environ.get("NEURON_RT_NUM_CORES", "2"))
+    # --------------------------------------------------------------
+    # Naïve Continuous Batching: minimal parameters for current SDK
+    # --------------------------------------------------------------
+    CB = ContinuousBatchingConfig(
+        max_num_seqs   = batch_size,       # logical seq‑ids / physical rows
+        max_model_len  = sequence_length,  # bucket size (128)
+    )
+
     neuron_cfg = NeuronConfig(
-        is_eagle_target=False,
-        cast_logits_dtype="bfloat16",
-        padding_side="right",
+        continuous_batching = CB,
+        padding_side        = "right",
+        is_eagle_target     = False,
+        cast_logits_dtype   = "bfloat16",
     )
     model = LlamaForSampling.from_pretrained(
         model_path,
@@ -380,7 +389,6 @@ def compile_target_model(model_path: str,
         fuse_qkv              = True,
         attention_layout      = "BSH",
         use_2d_cache_ids      = True,
-        dynamic_batch_size    = True,
         enable_chunked_prefill=False,
     )
     model.enable_speculative_decoder(spec_buckets)
