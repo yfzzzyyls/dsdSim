@@ -155,33 +155,17 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
             # (avoid replaying prompts for other rows)
             # ------------------------------------------------------------------
             ctx_len = self._ctx_estimate          # compile‑time context length (128)
-            B       = self.max_batch              # static batch (e.g. 2)
             row_idx = self.sessions[session_id].row_idx
             L_new   = current_ids.shape[1]
 
-            # ---------- Build (B, L_new) input_ids ----------
-            pad_id = 0
-            ids_batched = torch.full(
-                (B, L_new),
-                pad_id,
-                dtype=current_ids.dtype,
-                device=current_ids.device,
-            )
-            ids_batched[row_idx] = current_ids[0]         # copy only new prompt
-
-            # ---------- Build (B, L_new) cache_vec ----------
-            cache_batched = torch.zeros(
-                (B, L_new),
-                dtype=torch.int32,
-                device=current_ids.device,
-            )
+            # ---------- Build (1, L_new) tensors (batch size 1) ----------
             offset = row_idx * ctx_len
-            cache_batched[row_idx] = (
+            cache_vec = (
                 torch.arange(L_new, dtype=torch.int32, device=current_ids.device) + offset
-            )
+            ).unsqueeze(0)                     # shape: (1, L_new)
 
-            # ---- Prefill only this slot (other rows are PAD -> no‑op) ----
-            _ = self.model.forward(input_ids=ids_batched, cache_ids=cache_batched)
+            # ---- Prefill only this row (batch size 1) ----
+            _ = self.model.forward(input_ids=current_ids, cache_ids=cache_vec)
 
             # ---- Advance KV pointer for *this* row only ----
             delta = L_new
