@@ -51,8 +51,16 @@ def speculative_decode(
     # snap initial γ to the largest compiled bucket ≤ user request
     # Derive valid gammas and gamma_max from the bucket list
     valid_gammas = tuple(b - 1 for b in SPEC_LENGTH_BUCKETS if b > 1)
-    gamma_max    = max(valid_gammas)
-    current_gamma = max(g for g in valid_gammas if g <= max(1, gamma))
+
+    # Fail fast if the global bucket list is mis‑configured
+    if not valid_gammas:
+        raise ValueError(
+            "SPEC_LENGTH_BUCKETS must contain integers > 1; "
+            f"current value = {SPEC_LENGTH_BUCKETS}"
+        )
+    gamma_max = max(valid_gammas)
+    # Clamp the user‑requested γ to the supported range [1, gamma_max]
+    current_gamma = gamma
     current_temp  = temperature            # draft temperature we can tweak
     target_accept = 0.5                    # desired per‑loop acceptance rate
 
