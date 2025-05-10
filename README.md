@@ -62,7 +62,7 @@ pip install --upgrade transformers-neuronx
 3. **Optinal: Generate new grpc files**
 
    ```
-   cd Choral-Spec/grpc_comm
+   cd grpc_comm
    python -m grpc_tools.protoc -I. --python_out=. --grpc_python_out=. inference.proto
    ```
 
@@ -91,34 +91,26 @@ rm -r /var/tmp/neuron-compile-cache
 ### **Compile & Run the Target Model Server**
 
 ```
-python main.py --role target --model /home/ubuntu/models/llama-3.2-3b/ --port 50051 --sequence_length 64 --gamma 4
+python main.py --role target --model /home/ubuntu/models/llama-3.1-8b/ --port 50051 --sequence_length 160 --batch 2 --profile --top_p 1.0
 ```
 
 ### **Compile & Run the Draft Model server**
 
 ```
-python main.py --role draft --model /home/ubuntu/models/llama-3.2-1b/ --target_host 3.137.153.173 --port 50051 --prompt_text prompt.txt --max_new_tokens 32 --gamma 4 --sequence_length 64
+python main.py --role draft --model /home/ubuntu/models/llama-3.2-1b/ --target_host 52.15.111.1 --port 50051 --prompt_text prompt.txt --max_new_tokens 100 --gamma 4 --sequence_length 160 --profile --top_p 1.0 --temperature 0.9
 ```
 
 ### **Example Output**
 
 ```
-INFO:inference.draft_worker:[Thread-2] Starting speculative decoding with session_id=104464132
-INFO:inference.draft_worker:[Thread-0] Starting speculative decoding with session_id=3780988024
-INFO:inference.draft_worker:[Thread-1] Starting speculative decoding with session_id=1574770097
-INFO:inference.speculative:Speculative decoding match rate: 37.50% (Draft accepted: 48, Target generated: 80)
-INFO:inference.speculative:Speculative decoding match rate: 22.48% (Draft accepted: 29, Target generated: 100)
-INFO:inference.speculative:Speculative decoding match rate: 17.83% (Draft accepted: 23, Target generated: 106)
+2025-04-25 03:36:14,234 INFO inference.draft_worker: [BATCH] Decoding prompt 0: What is the difference between llama and alpaca?
+2025-04-25 03:36:22,733 INFO inference.speculative: Latency: 8.49 seconds
+2025-04-25 03:36:22,733 INFO inference.speculative: Speculative decoding match rate: 9.38% (Draft accepted: 6, Target generated: 58)
+2025-04-25 03:36:22,733 INFO inference.draft_worker: Batched decode completed in 8.50s.
 
-=== Final Batched Outputs ===
-
+=== Final Outputs (BATCH approach) ===
 [Prompt 0 Output]:
-Once upon a time, there there
-......
-[Prompt 1 Output]:
-......
-[Prompt 2 Output]:
-......
+What is the difference between llama and alpaca? Alpacas are native to South America Peru, Bolivia, Chile have grey, brown, white, rose grey and fawn coloured coats while llamas have been domestic garded for over 4,000 years, are usually brown in colour, have thick woolly coats and longer legs and have been used far quieter and
 ```
 
 ## **Performance Profiling Stats**
@@ -136,7 +128,7 @@ You can also run either the draft or target model **standalone** (without specul
 To run the **target model** by itself on a prompt:
 
 ```
-python main.py --role verify_target --model /home/ubuntu/models/llama-3.1-8b --prompt "What is the difference between llama and alpaca?" --sequence_length 128 --max_new_tokens 64 --profile
+python main.py --role verify_target --model /home/ubuntu/models/llama-3.1-8b --prompt_text prompt.txt --sequence_length 128 --max_new_tokens 100 --profile
 ```
 
 This will load the 8B target model and generate 64 tokens continuing the prompt, printing each generated token as it arrives, followed by the full output text.
@@ -144,7 +136,7 @@ This will load the 8B target model and generate 64 tokens continuing the prompt,
 Similarly, to run the **draft model** by itself:
 
 ```
-python main.py --role verify_draft --model /home/ubuntu/models/llama-3.2-1b --prompt "Hi, how are you? Tell me about the difference between llama and alpaca." --sequence_length 640 --max_new_tokens 128 --profile
+python main.py --role verify_target --model /home/ubuntu/models/llama-3.2-1b --prompt_text prompt.txt --sequence_length 128 --max_new_tokens 100 --profile
 ```
 
 This will use the 1B draft model to generate text token-by-token for the given prompt.
@@ -152,3 +144,4 @@ This will use the 1B draft model to generate text token-by-token for the given p
 *Note:* In verification modes, the model will be compiled on the fly if a compiled Neuron model is not found. By default, **`--sequence_length 128` is used; ensure you use the same sequence length that the model was compiled with (or specify** **`--sequence_length` accordingly) to avoid recompilation. The** `--max_tokens` option controls how many new tokens to generate for the prompt.
 
 ## **Supported features**
+

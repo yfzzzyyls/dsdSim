@@ -1,6 +1,3 @@
-// NOTE: After modifying this file run:
-//   python -m grpc_tools.protoc -I. --python_out=. --grpc_python_out=. inference.proto
-// to regenerate *_pb2.py stubs.
 syntax = "proto3";
 option py_generic_services = false;
 
@@ -17,23 +14,31 @@ message StartRequest {
 
 message StartResponse {
   bool acknowledged = 1;
+  uint64 session_id = 2;
 }
 
-// For BATCH verification.
 message DraftSequence {
-  uint64 session_id = 1;        // which session these tokens belong to
-  repeated int32 draft_tokens = 2;  // the newly generated tokens from the draft model
+  uint64 session_id = 1;
+  repeated int32  draft_tokens = 2;
+  repeated float  draft_probs  = 3;   // <<< NEW  proposal probs q(d_i|ctx)
 }
 
 message VerifyBatchRequest {
   repeated DraftSequence sequences = 1;
 }
 
+message VerifyRequest {
+  uint64 session_id   = 1;
+  repeated int32 draft_tokens = 2;
+  repeated float draft_probs  = 3;    // <<< NEW
+}
+
+
 message VerifyResult {
-  uint64 session_id = 1;
-  uint32 tokens_accepted = 2; // how many tokens in the draft were accepted
-  int32 target_token = 3;     // fallback token from target if partial acceptance, else 0
-  bool finished = 4;          // if the target model is done for this session
+  uint64 session_id     = 1;
+  uint32 tokens_accepted = 2;
+  int32  target_token    = 3;
+  bool   finished        = 4;
 }
 
 message VerifyBatchResponse {
@@ -63,11 +68,6 @@ message FinalizeBatchResponse {
 // However, we can keep them or remove them if you prefer. For a safe drop-in,
 // we keep them, but the server and client can choose which to call.
 
-message VerifyRequest {
-  uint64 session_id = 1;
-  repeated int32 draft_tokens = 2;
-  repeated float draft_probs = 3;   // probability q(x) for each draft token
-}
 
 message VerifyResponse {
   // Tokens that actually became part of the sequence
@@ -76,6 +76,8 @@ message VerifyResponse {
   uint32 accepted_count = 2;
   // Generation finished?
   bool finished = 3;
+  // Time spent on the target side verifying this draft chunk (milliseconds)
+  float verify_time_ms = 4;
 }
 
 message FinalizeRequest {

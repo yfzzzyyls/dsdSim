@@ -67,18 +67,15 @@ def finalize_batch_tokens(stub, sequences):
 # -----------------------------------------
 
 def verify_draft_tokens(stub, draft_tokens, draft_probs, session_id=0):
-    """
-    Unified RPC: returns (committed_ids, accepted_count, finished)
-    """
     request = inference_pb2.VerifyRequest(
-        session_id=session_id,
-        draft_tokens=draft_tokens,
-        draft_probs=draft_probs,
+        session_id   = session_id,
+        draft_tokens = draft_tokens,
+        draft_probs  = draft_probs,   # <<<
     )
-    response = stub.VerifyDraftTokens(request)
-
+    resp = stub.VerifyDraftTokens(request)
     return (
-        list(response.committed_ids),  # committed_ids
-        response.accepted_count,       # how many of those came from draft
-        response.finished,             # generation finished?
+        list(resp.committed_ids),
+        resp.accepted_count,
+        resp.verify_time_ms,
+        resp.finished,
     )

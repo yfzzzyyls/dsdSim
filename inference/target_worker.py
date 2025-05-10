@@ -3,15 +3,15 @@ import torch
 from concurrent import futures
 import grpc
 import time
-import random
-TOP_K_TARGET = 512      # keep in sync with speculative.py
 from inference import model_loader
 from transformers import AutoTokenizer
 from grpc_comm import inference_pb2, inference_pb2_grpc
+import random
+from transformers.generation import LogitsProcessorList, SuppressTokensLogitsProcessor
+import queue
+import threading
+import uuid
 
-# Small helper: Softmax once per row in float32 for numeric stability
-def _row_softmax(t: torch.Tensor) -> torch.Tensor:
-    return torch.softmax(t.float(), dim=-1)
 
 logger = logging.getLogger(__name__)
 if not logger.hasHandlers():
@@ -23,149 +23,111 @@ if not logger.hasHandlers():
     logger.setLevel(logging.INFO)
 
 class TargetSession:
-    def __init__(self, input_ids):
+    def __init__(self, input_ids, row_idx: int):
         self.current_ids = input_ids  # Torch tensor [1, seq_len]
         self.finished = False
         self.tokens_generated = 0
         self.verification_time = 0.0   # cumulative time spent verifying draft tokens (seconds)
         self.finalize_calls    = 0     # count of FinalizeTokens invocations
         self.last_draft_chunk = None
-        # pointer to the *next* KV slot
-        self.cache_ids = torch.tensor([input_ids.shape[1]], dtype=torch.int32)
+        # pointer to the *next* KV slot (scalar tensor, starts at 0)
+        self.cache_id = torch.tensor([0], dtype=torch.int32)
         self.pending_logits = None
+        self.row_idx = row_idx
+
+    # ------------------------------------------------------------------
+    # Accessors / mutators for session‑local KV pointer
+    # ------------------------------------------------------------------
+    def get_session_cache_id(self):
+        """
+        Return the scalar tensor that holds this session's next KV slot.
+        """
+        return self.cache_id
+
+    def update_session_cache_id(self, delta):
+        """
+        Increment the session's KV pointer by `delta`.
+        `delta` may be an int, float, or 0‑D tensor.
+        """
+        if isinstance(delta, torch.Tensor):
+            delta = int(delta.item())
+        else:
+            delta = int(delta)
+
+        # Increment in place to preserve tensor identity where callers keep a reference
+        self.cache_id += delta
 
 class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
-    def __init__(self, model_path, sequence_length=128, spec_length=None, temperature: float = 1.0, top_p: float = 0.9):
+    def __init__(self, model_path, sequence_length=128, spec_length=None,
+                 batch_size: int = 1, temperature: float = 1.0, top_p: float = 0.9):
         self.model = model_loader.load_target_model(
             model_path,
             sequence_length=sequence_length,
-            spec_length=spec_length or 4,
-            top_k=TOP_K_TARGET,
-            top_p=top_p,
-            temperature=temperature,
+            batch_size=batch_size,
         )
         self.temperature = temperature
         self.top_p = top_p
         self.tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=False)
         self.eos_token_id = self.tokenizer.eos_token_id
-        # ------------------------------------------------------------
-        # Discover the compile‑time `context_length_estimate` so we can
-        # pad short inputs (γ‑token chunks, short prompts) up to the
-        # bucket size Neuron expects (64, 128, …).
-        # ------------------------------------------------------------
-        compiled_est = None
-        base_adapter = getattr(self.model, "adapter", None)
-        if base_adapter is not None and hasattr(base_adapter, "model"):
-            inner = base_adapter.model
-            compiled_est = getattr(inner, "context_length_estimate", None)
-        if compiled_est is None:
-            compiled_est = sequence_length            # fallback
-
-        # inference/target_worker.py  – inside SpeculativeServiceServicer.__init__
-
-        def _deep_ctx_estimate(obj):
-            best = getattr(obj, "context_length_estimate", None)
-            for name in ("model", "base_model", "checkpoint_model"):
-                child = getattr(obj, name, None)
-                if child is not None:
-                    sub = _deep_ctx_estimate(child)
-                    if sub is not None:
-                        best = max(best or 0, sub)
-            return best
-
-        compiled_est = _deep_ctx_estimate(self.model) or sequence_length
-        self._ctx_estimate = compiled_est
-        logger.info("[init] detected context_length_estimate=%d", self._ctx_estimate)
-
+        self._ctx_estimate = sequence_length
         self.sessions = {}  # session_id -> TargetSession
+        # ------------------------------------------------------------------
+        # Scheduler state (Stage‑2 incremental batching)
+        # ------------------------------------------------------------------
+        self.verify_queue   = queue.Queue()               # (req_dict) items
+        self.batch_timeout  = 0.03                             # seconds to wait for more peers
+        self.max_batch      = batch_size                  # honour compile batch
+        # ----------------------------------------------------------
+        # Row‑index pool for static‑batch Neuron graph
+        # ----------------------------------------------------------
+        self._row_pool = list(range(batch_size))          # free rows 0…B‑1
+
+        def _allocate_row():
+            assert self._row_pool, "No free Neuron batch rows left"
+            return self._row_pool.pop(0)
+
+        def _release_row(idx: int):
+            self._row_pool.append(idx)
+
+        self._allocate_row = _allocate_row
+        self._release_row  = _release_row
+        # map session_id -> Queue for the blocking VerifyDraftTokens call
+        self.result_queues  = {}
+        self._sched_thread  = threading.Thread(
+            target=self._scheduler_loop, daemon=True
+        )
+        self._sched_thread.start()
         self.lock = torch.multiprocessing.Lock()
 
     # ------------------------------------------------------------------
     # Utility: right‑pad an (1, L) tensor with zeros to ctx_estimate
     # ------------------------------------------------------------------
-    def _pad_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
-        """
-        Neuron‑compiled forward graphs expect the input length to be
-        >= the compile‑time estimate (self._ctx_estimate, defaults to the
-        --sequence_length used at compile time).  If the supplied tensor
-        is shorter we right‑pad with zeros so its shape is (1, ctx_estimate).
+    # def _pad_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+    #     seq_len = input_ids.shape[1]
+    #     if seq_len >= self._ctx_estimate:
+    #         return input_ids                   # long enough
+    #     pad_len = self._ctx_estimate - seq_len
 
-        Parameters
-        ----------
-        input_ids : torch.Tensor   shape (1, L), dtype = same as model input
+    #     # ① choose a *legal* pad-id
+    #     pad_id = self.tokenizer.pad_token_id
+    #     if pad_id is None:                    # just in case
+    #         pad_id = self.tokenizer.eos_token_id
 
-        Returns
-        -------
-        torch.Tensor  shape (1, max(L, ctx_estimate))
-        """
-        if self._ctx_estimate == 0:
-            return input_ids
-        seq_len = input_ids.shape[1]
-        logger.debug("[pad_ids] seq_len=%d  bucket=%d", seq_len, self._ctx_estimate)
-        if seq_len >= self._ctx_estimate:            # already long enough
-            return input_ids
-        pad_len = self._ctx_estimate - seq_len
-        pad = torch.zeros((1, pad_len), dtype=input_ids.dtype, device=input_ids.device)
-        return torch.cat([input_ids, pad], dim=1)
-
-    # ------------------------------------------------------------------
-    # Safe Neuron forward that auto‑pads inputs if the compile‑time
-    # context_length_estimate guard triggers.
-    # ------------------------------------------------------------------
-    def _safe_forward(self, *, input_ids, cache_ids=None,
-                      return_all_logits=False, **kwargs):
-        """
-        Wrapper around self.model.forward that retries with right‑padding
-        when the underlying Neuron graph raises:
-            ValueError: context_length (...) shouldn't be smaller than estimate (...)
-        """
-        try:
-            return self.model.forward(
-                input_ids=input_ids,
-                cache_ids=cache_ids,
-                return_all_logits=return_all_logits,
-                **kwargs,
-            )
-        except ValueError as e:
-            msg = str(e)
-            if "context_length" in msg and "estimate" in msg:
-                padded_ids = self._pad_ids(input_ids)
-                return self.model.forward(
-                    input_ids=padded_ids,
-                    cache_ids=cache_ids,
-                    return_all_logits=return_all_logits,
-                    **kwargs,
-                )
-            raise
+    #     # ② fill token pad with pad_id  (keep -1 only for cache_id)
+    #     pad_tokens = torch.full(
+    #         (1, pad_len),
+    #         pad_id,
+    #         dtype=input_ids.dtype,
+    #         device=input_ids.device,
+    #     )
+    #     return torch.cat([input_ids, pad_tokens], dim=1)
 
     def _sync_kv_pointer(self, sess: TargetSession):
-        self.model.cache_ids = sess.cache_ids.clone()
-        if hasattr(self.model, "_next_pos"):
-            self.model._next_pos = int(sess.cache_ids.item())
-        # ---- sanity check ----
-        assert int(self.model.cache_ids.item()) == int(sess.cache_ids.item()), \
-            "Target KV cache_ids desynchronised after sync"
-
-    # ------------------------------------------------------------
-    # Utility: sample from <scores, indices> row returned by top‑k
-    # ------------------------------------------------------------
-    def _sample_from_topk(self, scores_row, idx_row, temperature: float = 1.0, top_p: float = 0.9):
-        """
-        scores_row : 1‑D tensor, un‑normalised logits for top‑k tokens
-        idx_row    : 1‑D tensor, token‑ids that correspond to scores_row
-        """
-        logits = scores_row.float() / max(1e-8, temperature)
-        probs  = torch.softmax(logits, dim=-1)
-
-        cum_p = torch.cumsum(torch.sort(probs, descending=True)[0], dim=0)
-        cut   = torch.searchsorted(cum_p, top_p, right=True).item()
-        sorted_probs, sorted_idx = torch.sort(probs, descending=True)
-        keep_probs = sorted_probs[: cut + 1]
-        keep_idx   = idx_row[sorted_idx[: cut + 1]]
-        keep_probs = keep_probs / keep_probs.sum()
-
-        choice = torch.multinomial(keep_probs, 1).item()
-        return int(keep_idx[choice].item())
+        pass
+        # TODO: implement pointer sync check
+        # if self.model.get_batched_cache_id_vec() is not None:
+        #     assert int(self.model.get_batched_cache_id_vec()[sess.row_idx].item()) == \
+        #            int(sess.get_session_cache_id().item()), "KV desync"
 
 
     def StartGeneration(self, request, context):
@@ -173,452 +135,494 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
         prompt_text = request.prompt
         max_tokens = request.max_new_tokens
         gamma = request.gamma
-        logger.info(f"[session={session_id}] StartGeneration: prompt='{prompt_text}', max_new_tokens={max_tokens}, gamma={gamma}")
+        logger.debug(f"[session={session_id}] StartGeneration: prompt='{prompt_text}', max_new_tokens={max_tokens}, gamma={gamma}")
         with self.lock:
-            if session_id in self.sessions:
-                logger.warning(f"Session {session_id} already exists, overwriting.")
-            if prompt_text:
-                enc = self.tokenizer(prompt_text, return_tensors='pt')
-                current_ids = enc["input_ids"]
-            else:
-                current_ids = torch.zeros((1,0), dtype=torch.long)
-            # --- right‑pad the prompt so its length matches the compile‑time bucket ---
-            orig_len    = current_ids.shape[1]           # prompt tokens before padding
-            current_ids = self._pad_ids(current_ids)     # may extend to bucket size
-            self.sessions[session_id] = TargetSession(current_ids)
+            assert session_id == 0, \
+                f"Session id {session_id} must be 0 for StartGeneration."
+            assert not session_id in self.sessions, \
+                f"Session {session_id} should not exists."
+            assert prompt_text is not None, \
+                f"Prompt text is required for session."
+            # Generate a fresh, 32-bit random id
+            session_id = int(uuid.uuid4()) & 0xFFFFFFFF
+            enc = self.tokenizer(prompt_text, return_tensors='pt')
+            current_ids = enc["input_ids"]
+            # Allocate a free Neuron‑batch row for this session
+            row_idx = self._allocate_row()
+            self.sessions[session_id] = TargetSession(current_ids, row_idx)
+            # ------------------------------------------------------------------
+            # Priming Neuron KV cache for the prompt
+            # ------------------------------------------------------------------
+            # ----------------------------------------------------------
+            # Build a (B, ctx_len) tensor that preserves every *existing*
+            # session’s prompt so we never overwrite their KV banks.  Only
+            # the newly‑allocated row is filled with the new prompt; all
+            # unused rows remain PAD.
+            # ----------------------------------------------------------
+            ctx_len = self._ctx_estimate
+            B       = self.max_batch
+            pad_id  = 0
 
-            # --- prime Neuron KV cache on the (possibly padded) prompt ---
-            self.model.cache_ids = None
-            self.model._next_pos = 0
-
-            if current_ids.shape[1] > 0:
-                _ = self._safe_forward(
-                    input_ids=current_ids,
-                    cache_ids=None,   # let wrapper fabricate correct (1,L) cache_ids
-                )
-            # store pointer (next index) after the FULL prompt (incl. padding)
-            padded_len = current_ids.shape[1]            # equals self.model._next_pos after prime
-            self.sessions[session_id].cache_ids = torch.tensor(
-                [padded_len], dtype=torch.int32
+            # Start with all PAD tokens
+            batched_ids = torch.full(
+                (B, ctx_len),
+                pad_id,
+                dtype=current_ids.dtype,
+                device=current_ids.device,
             )
-        return inference_pb2.StartResponse(acknowledged=True)
 
-    # =============================
-    # BATCH calls for multi‑seq
-    # =============================
-    def VerifyBatchTokens(self, request, context):
+            # ① copy prompts for sessions that were already running
+            for s in self.sessions.values():
+                if s is self.sessions[session_id]:     # skip – new row handled below
+                    continue
+                row = s.row_idx
+                L_old = s.current_ids.shape[1]
+                batched_ids[row, :min(L_old, ctx_len)] = s.current_ids[0, :ctx_len]
+
+            # ② copy the *new* prompt into its assigned row
+            L_new = current_ids.shape[1]
+            batched_ids[row_idx, :min(L_new, ctx_len)] = current_ids[0, :ctx_len]
+
+            # cache_vec rows are always [0 … ctx_len‑1]
+            cache_vec = (
+                torch.arange(ctx_len, dtype=torch.int32, device=current_ids.device)
+                      .unsqueeze(0)
+                      .repeat(B, 1)
+            )
+
+            _ = self.model.forward(
+                input_ids=batched_ids,
+                cache_ids=cache_vec,
+            )
+
+            # --- Advance KV pointers by the prompt length (delta = L) ---
+            delta = current_ids.shape[1]            # how many tokens we just pref‑filled
+            self.model.update_batched_cache(delta, row_idx)          # target (B,) pointer
+            self.sessions[session_id].update_session_cache_id(delta) # draft‑side scalar
+
+            # record in session
+            # ----------------------------------------------------------
+            # DEBUG: show prompt length L, session‑side cache pointer and
+            #        model‑wrapper cache pointer right after pre‑fill
+            # ----------------------------------------------------------
+            logger.info(
+                "[StartGeneration] sid=%s   session.cache_id=%s  model.cache_id_vec=%s",
+                session_id,
+                self.sessions[session_id].cache_id.tolist(),
+                self.model.get_batched_cache_id_vec().tolist(),
+            )
+        return inference_pb2.StartResponse(acknowledged=True, session_id=session_id)
+    
+    def _commit_tokens_bulk(self, sess, tok_ids):
         """
-        Verify several session‑specific draft token chunks in one RPC.
-        Each element of request.sequences carries:
-            • session_id   - int
-            • draft_tokens - repeated int32
-        For every sequence we compute P_target(draft_token | context) **incrementally**
-        using the target KV cache (one forward per token).  No concat / pad.
+        Commit a list of tokens (accepted draft + bonus) in ONE Neuron
+        speculative_forward call so the KV cache advances in bulk.
+        We call `forward` (not speculative_forward) here so that the Neuron
+        wrapper's _postprocess() updates the Python‑side KV pointer.
         """
-        results = []
-        with self.lock:
-            for seq in request.sequences:
-                sid = seq.session_id
-                draft_tokens = list(seq.draft_tokens)
+        # Skip dummy padding rows (should never be called with None)
+        if sess is None:
+            return
 
-                # 1) Session validation
-                if sid not in self.sessions:
-                    logger.warning(f"[VerifyBatchTokens] Session {sid} not found.")
-                    results.append(
-                        inference_pb2.VerifyResult(
-                            session_id=sid,
-                            tokens_accepted=0,
-                            target_token=0,
-                            finished=True,            # treat as finished / invalid
-                        )
-                    )
-                    continue
+        if not tok_ids:
+            return
 
-                sess = self.sessions[sid]
-                if sess.finished:
-                    results.append(
-                        inference_pb2.VerifyResult(
-                            session_id=sid,
-                            tokens_accepted=0,
-                            target_token=0,
-                            finished=True,
-                        )
-                    )
-                    continue
+        row_idx = sess.row_idx
 
-                if not draft_tokens:
-                    # Empty chunk – nothing to verify
-                    results.append(
-                        inference_pb2.VerifyResult(
-                            session_id=sid,
-                            tokens_accepted=0,
-                            target_token=0,
-                            finished=False,
-                        )
-                    )
-                    continue
-
-                # 2) Incremental verify using the session’s KV cache
-                target_probs = self._verify_single_step(sess, draft_tokens)
-
-                # 3) Remember this chunk so FinalizeTokens can accept/rollback
-                sess.last_draft_chunk = draft_tokens
-
-                # 4) Return a VerifyResult (no tokens accepted yet;
-                #    acceptance happens in FinalizeTokens)
-                results.append(
-                    inference_pb2.VerifyResult(
-                        session_id=sid,
-                        tokens_accepted=0,
-                        target_token=0,
-                        finished=False,
-                    )
-                )
-
-        return inference_pb2.VerifyBatchResponse(results=results)
-
-
-    def FinalizeBatchTokens(self, request, context):
-        results = []
-        with self.lock:
-            for seq in request.sequences:
-                sid = seq.session_id
-                tokens = list(seq.tokens)
-                if sid not in self.sessions:
-                    logger.warning(f"Session {sid} not found in FinalizeBatchTokens.")
-                    results.append(inference_pb2.FinalizeBatchResult(session_id=sid, finished=True))
-                    continue
-                sess = self.sessions[sid]
-                if sess.finished:
-                    results.append(inference_pb2.FinalizeBatchResult(session_id=sid, finished=True))
-                    continue
-
-                # Accept these tokens into sess.current_ids
-                for t in tokens:
-                    new_tok = torch.tensor([[t]], dtype=sess.current_ids.dtype)
-                    sess.current_ids = torch.cat([sess.current_ids, new_tok], dim=1)
-                    if self.eos_token_id is not None and t == self.eos_token_id:
-                        sess.finished = True
-                results.append(inference_pb2.FinalizeBatchResult(session_id=sid, finished=sess.finished))
-        return inference_pb2.FinalizeBatchResponse(results=results)
-
-   
-    def _verify_single_step(self, sess: TargetSession, draft_tokens):
-        """
-        Forward the whole draft chunk through the Neuron target, capture logits.
-
-        Returns
-        -------
-        probs_all   : List[float]       – P_target(d_i) for each draft token
-        logits_rows : List[Tuple[scores, idx]]  – len = n_new
-        """
-        if not draft_tokens:
-            return [], []
+        # --------------------------------------------------------------
+        # Bump KV‑cache pointers by the number of tokens we just committed
+        # --------------------------------------------------------------
+        delta = len(tok_ids)                     # how many new tokens
+        self.model.update_batched_cache(delta, row_idx)   # target side (B,)
+        sess.update_session_cache_id(delta)               # draft/session side
 
         self._sync_kv_pointer(sess)
-        ids = torch.tensor([draft_tokens], dtype=sess.current_ids.dtype)
-        # No right‑padding for incremental steps – keep true length
-        logits, _ = self._safe_forward(
-            input_ids=ids,
-            cache_ids=None,          # wrapper builds (1,L) cache_ids internally
-            return_all_logits=True,
-        )
-        logits = logits[: len(draft_tokens)]               # keep real rows
 
-        # ---- DEBUG: dump one row so we can inspect distributions ----
-        logger.info("[verify] logits chunk shape=%s  row0_sum=%.3f",
-                    tuple(logits.shape),
-                    _row_softmax(logits[0]).sum())
+        # print(f"commit tokens: _next_pos={self.model._next_pos} -> current_shape{sess.current_ids.shape[1]} + {len(tok_ids)}")
 
-        scores_all, idx_all = torch.topk(logits, TOP_K_TARGET, dim=-1)     # (n, 512)
+        # Append committed ids to session's token history
+        new_tok_tensor = torch.tensor([tok_ids], dtype=sess.current_ids.dtype)
+        sess.current_ids = torch.cat([sess.current_ids, new_tok_tensor], dim=1)
 
-        probs_all = []
-        for step, tok in enumerate(draft_tokens):
-            idx_row  = idx_all[step]
-            scr_row  = scores_all[step]
-            hit = (idx_row == tok).nonzero(as_tuple=True)[0]
-            if hit.numel():
-                j = int(hit[0].item())
-                probs_all.append(float(_row_softmax(scr_row)[j].item()))
-            else:
-                probs_all.append(0.0)
+        # Optionally assert pointer is correct
+        if self.eos_token_id is not None and any(t == self.eos_token_id for t in tok_ids):
+            sess.finished = True
+            self._release_row(sess.row_idx)
 
-        logits_rows = [(scores_all[i], idx_all[i]) for i in range(len(draft_tokens))]
-        return probs_all, logits_rows
+    # def verify(self, sess: TargetSession, draft_tokens):
+    #     """
+    #     Fast path: score all draft_tokens and bonus in ONE forward pass.
+    #     Returns
+    #     -------
+    #     probs : List[float]   - P_target(d_i | prefix + d_<i)   for each i
+    #     bonus_probs : tensor  - P_target(vocab) for bonus token
+    #     """
+    #     # ---------- short‑circuit ----------
+    #     if not draft_tokens:
+    #         return [], None
+
+    #     # ==========================================
+    #     # get the last commit KV cache position
+    #     # ==========================================
+    #     orig_cache   = sess.cache_ids.clone()
+    #     orig_nextpos = int(orig_cache.item())
+
+    #     # ==========================================
+    #     # set indices for speculative forward
+    #     # ==========================================
+    #     prev_token_id = int(sess.current_ids[0, -1])
+    #     spec_tokens   = [prev_token_id] + draft_tokens          # γ + 1 tokens
+    #     spec_len      = len(spec_tokens)
+
+    #     input_ids = torch.tensor([spec_tokens], dtype=sess.current_ids.dtype)
+    #     cache_vec = torch.arange(spec_len, dtype=torch.int32) + orig_nextpos - 1
+
+    #     # ------------------------------------
+    #     # ------------------------------------
+    #     assert cache_vec.numel() == spec_len, (
+    #         f"VERIFY cache_vec length {cache_vec.numel()} must equal spec token length {spec_len}"
+    #     )
+    #     logger.debug(
+    #         f"VERIFY cache_vec length {cache_vec.numel()} must equal spec token length {spec_len}"
+    #     )
+    #     # # ------------------------------------
+    #     # # ------------------------------------
+    #     # token_texts = [self.tokenizer.decode([tid], clean_up_tokenization_spaces=False)
+    #     #        for tid in spec_tokens]
+    #     # logger.debug("verify call K(gamma[%d] + 1)=%d tokens(text)=%s ids=%s",
+    #     #             len(draft_tokens), input_ids.shape[1], token_texts, input_ids.tolist())
+    #     # #------------------------------------
+    #     # # ------------------------------------
+        
+    #     logits_all = self.model.speculative_forward(
+    #         input_ids=input_ids,
+    #         cache_ids=cache_vec,
+    #         # start_ids = torch.tensor([0], dtype=torch.int32), # can pass multiple batches in the future
+    #         spec_length=spec_len,
+    #     )
+        
+    #     # (B, N, V)  → after squeeze  (N, V) where N = γ + 1
+    #     if logits_all.dim() == 3:
+    #         logger.debug(f"speculative_forward logits_all shape={logits_all.shape}")
+    #         logits_all = logits_all.squeeze(-1)          # (N, V)
+
+    #     #-----------------------------------
+    #     # print the shape of the logits
+    #     #-----------------------------------
+    #     # logger.debug("verify logits_all shape=%s", logits_all.shape)
+
+    #     # ------------------------------------------------------------------
+    #     # Library-style masking of BOS / PAD with SuppressTokensLogitsProcessor
+    #     # ------------------------------------------------------------------
+    #     # special_ids = []
+    #     # for attr in ("bos_token_id", "pad_token_id"):
+    #     #     tid = getattr(self.tokenizer, attr, None)
+    #     #     if tid is not None:
+    #     #         special_ids.append(tid)
+
+    #     # if special_ids:
+    #     #     processors = LogitsProcessorList(
+    #     #         [SuppressTokensLogitsProcessor(special_ids)]
+    #     #     )
+    #     #     # dummy_input_ids shape (N,1) – only the seq-len matters
+    #     #     dummy_input_ids = torch.zeros(
+    #     #         (logits_all.size(0), 1), dtype=torch.long, device=logits_all.device
+    #     #     )
+    #     #     logits_all = processors(dummy_input_ids, logits_all)
+    #     # ===========================================================
+
+    #     # # ---------- restore snapshot ----------
+    #     # self.model.cache_ids = orig_cache.clone()
+    #     # self.model._next_pos = orig_nextpos
+    #     # sess.cache_ids = orig_cache
+    #     # # self.model.adapter.model.reset_cache(orig_cache)   # hypothetical helper
+    #     # assert int(self.model.cache_ids.item()) == int(sess.cache_ids.item()), \
+    #     #     "KV desync detected on verify exit"
+        
+    #     return logits_all
 
     def VerifyDraftTokens(self, request, context):
-        sid = request.session_id
-        draft_tokens = list(request.draft_tokens)
-        draft_probs  = list(request.draft_probs)
-        if len(draft_probs) != len(draft_tokens):
-            context.abort(grpc.StatusCode.INVALID_ARGUMENT,
-                          "draft_probs length must equal draft_tokens length")
+        """
+        Non-blocking enqueue: place request in scheduler queue, wait for result.
+        """
+        start_verify_t = time.perf_counter()
+        sid           = request.session_id
+        draft_tokens  = list(request.draft_tokens)
+        draft_probs   = list(request.draft_probs)
 
-        with self.lock:
-            if sid not in self.sessions:
-                return inference_pb2.VerifyResponse(committed_ids=[],
-                                                    accepted_count=0,
-                                                    finished=True)
-
-            sess = self.sessions[sid]
-            if sess.finished or not draft_tokens:
-                return inference_pb2.VerifyResponse(committed_ids=[],
-                                                    accepted_count=0,
-                                                    finished=sess.finished)
-
-            committed    = []
-            accepted_cnt = 0
-
-            # ----- single forward pass (scores + per‑step logits) -----
-            probs_all, logits_rows = self._verify_single_step(sess, draft_tokens)
-
-            # Walk until first rejection (Metropolis–Hastings acceptance)
-            for idx, tok in enumerate(draft_tokens):
-                current_scores, current_idx = logits_rows[idx]
-                p_target = probs_all[idx]
-                q_draft  = max(draft_probs[idx], 1e-8)
-                ratio    = min(1.0, p_target / q_draft)
-                if random.random() < ratio:
-                    accepted_cnt += 1
-                    self._commit_token(sess, tok)
-                    committed.append(tok)
-                    if tok == self.eos_token_id:
-                        break
-                else:
-                    fallback = self._sample_from_topk(
-                        current_scores, current_idx,
-                        temperature=self.temperature,
-                        top_p=self.top_p,
-                    )
-                    self._commit_token(sess, fallback)
-                    committed.append(fallback)
-                    break
-            else:
-                bonus_scores, bonus_idx = logits_rows[-1]
-                bonus = self._sample_from_topk(
-                    bonus_scores, bonus_idx,
-                    temperature=self.temperature,
-                    top_p=self.top_p,
-                )
-                self._commit_token(sess, bonus)
-                committed.append(bonus)
-
+        if not draft_tokens:
             return inference_pb2.VerifyResponse(
-                committed_ids=committed,
-                accepted_count=accepted_cnt,
-                finished=sess.finished,
+                committed_ids=[], accepted_count=0,
+                verify_time_ms=0.0, finished=True
             )
 
-    # helper used above
-    def _commit_token(self, sess, tok_id):
-        tok = torch.tensor([[tok_id]], dtype=sess.current_ids.dtype)
-        sess.current_ids = torch.cat([sess.current_ids, tok], dim=1)
-        self._sync_kv_pointer(sess)
-        # inference/target_worker.py  – helper _commit_token
-        tok_ids = torch.tensor([[tok_id]], dtype=sess.current_ids.dtype)
-        _, _ = self._safe_forward(
-            input_ids=tok_ids,
+        # Prepare per‑call rendez‑vous Queue
+        resp_q = queue.Queue(maxsize=1)
+        self.result_queues[sid] = resp_q
+
+        # Enqueue work for the scheduler thread
+        self.verify_queue.put({
+            "session_id":    sid,
+            "draft_tokens":  draft_tokens,
+            "draft_probs":   draft_probs,
+            "enqueue_time":  start_verify_t,
+        })
+
+        # Block until scheduler puts result
+        committed_ids, accepted_cnt, verify_ms, finished = resp_q.get()
+
+        return inference_pb2.VerifyResponse(
+            committed_ids=committed_ids,
+            accepted_count=accepted_cnt,
+            verify_time_ms=verify_ms,
+            finished=finished,
         )
-        sess.cache_ids = torch.tensor([self.model._next_pos], dtype=torch.int32)
-        if self.eos_token_id == tok_id:
-            sess.finished = True
 
-    def _sample_from_logits(self, logits, temperature=1.0, top_p=0.9):
+    # ------------------------------------------------------------------
+    # STAGE‑2: scheduler thread that batches requests
+    # ------------------------------------------------------------------
+    def _scheduler_loop(self):
         """
-        Sample a token from 'logits' using:
- 
-            1. Optional temperature scaling
-            2. Hard top‑k cutoff (k = TOP_K_TARGET)
-            3. Nucleus (top‑p) sampling inside that slice
- 
-        Keeping the same top‑k (512) as the draft side ensures both
-        models see the same candidate set size, which reduces divergence.
+        Drain self.verify_queue; batch together all requests that (a) arrive
+        within self.batch_timeouts *or* (b) fill up to self.max_batch items.
+        For the first implementation we assume *all* requests use the same
+        γ (chunk length) so they share one compiled Neuron graph.
         """
-        logits = logits.float() / max(1e-8, temperature)      # temp‑scale (float32)
-        probs  = torch.softmax(logits, dim=-1)
- 
-        # ---------- hard top‑k (512) ----------
-        k = min(TOP_K_TARGET, probs.shape[-1])
-        top_vals, top_idx = torch.topk(probs, k)              # (k,) each
- 
-        # ---------- nucleus filter ----------
-        cum_p = torch.cumsum(top_vals, dim=0)
-        cutoff = torch.searchsorted(cum_p, top_p, right=True).item()
-        nucleus_idx   = top_idx[: cutoff + 1]
-        nucleus_probs = top_vals[: cutoff + 1]
-        nucleus_probs = nucleus_probs / nucleus_probs.sum()
- 
-        choice = torch.multinomial(nucleus_probs, 1).item()
-        return int(nucleus_idx[choice].item())
+        pending = []
+        last_pop = time.monotonic()
+        while True:
+            try:
+                # Non‑blocking get with small timeout so we can flush
+                req = self.verify_queue.get(timeout=self.batch_timeout)
+                pending.append(req)
+                # Flush if we filled the batch
+                flush = len(pending) >= self.max_batch
+            except queue.Empty:
+                flush = len(pending) > 0
 
-    def FinalizeTokens(self, request, context):
-        sid              = request.session_id
-        accepted_count   = request.accepted_count
-        draft_chunk_size = request.draft_chunk_size
+            now = time.monotonic()
+            if flush or (pending and (now - last_pop) >= self.batch_timeout):
+                self._process_batch(pending)
+                pending.clear()
+                last_pop = now
 
-        with self.lock:
-            # ---------- session checks ----------
-            if sid not in self.sessions:
-                logger.warning(f"Session {sid} not found.")
-                return inference_pb2.FinalizeResponse(final_token=0, finished=True)
+    def _process_batch(self, batch_reqs):
+        """
+        batch_reqs: List[dict] with keys session_id, draft_tokens, draft_probs.
+        Performs one batched speculative_forward and writes result to each
+        caller's result_queue.
+        """
+        if not batch_reqs:
+            return
 
+        # Group tensors
+        sess_list      = []
+        draft_tok_lens = {len(r["draft_tokens"]) for r in batch_reqs}
+        # Simple: require identical γ; otherwise process sequentially.
+        # TODO: Changed to "padding-to-max" and adjust accept/reject rule to ignore padded slots. 
+        assert len(draft_tok_lens) == 1, \
+            f"Only support same γ for multiple draft models: {draft_tok_lens} (expected 1)"
+
+        gamma = draft_tok_lens.pop()
+        B     = len(batch_reqs)
+        real_B = B            # remember how many *real* rows we have
+
+        # Log real_B, gamma, session ids
+        logger.info(
+            "[Batch] real_B=%d  gamma=%d  session_ids=%s",
+            real_B, gamma, [r['session_id'] for r in batch_reqs]
+        )
+
+        # ------------------------------------------------------------------
+        # Build input tensors (B, γ+1) and cache_vec (B, γ+1)
+        # ------------------------------------------------------------------
+        input_ids  = []
+        cache_vecs = []
+        for r in batch_reqs:
+            sid  = r["session_id"]
             sess = self.sessions[sid]
-            if sess.finished:
-                return inference_pb2.FinalizeResponse(final_token=0, finished=True)
+            self._sync_kv_pointer(sess)
 
-            # ---------- retrieve last draft chunk ----------
-            chunk = sess.last_draft_chunk or []
-            accepted = chunk[:accepted_count]
+            prev_token = int(sess.current_ids[0, -1].item())
+            toks = [prev_token] + r["draft_tokens"]          # γ+1
 
-            # ---------- 1) commit accepted tokens ----------
-            for t in accepted:
-                sess.current_ids = torch.cat(
-                    [sess.current_ids,
-                     torch.tensor([[t]], dtype=sess.current_ids.dtype)],
-                    dim=1)
-                self._sync_kv_pointer(sess)
-                lgts, _ = self._safe_forward(
-                    input_ids=torch.tensor([[t]], dtype=sess.current_ids.dtype),
-                    cache_ids=torch.tensor([self.model._next_pos], dtype=torch.int32),
-                )
-                sess.pending_logits = lgts[0] if lgts.dim()==2 else lgts
-                sess.cache_ids = torch.tensor([self.model._next_pos], dtype=torch.int32)
-                if self.eos_token_id is not None and t == self.eos_token_id:
-                    sess.finished = True
+            start_pos = int(sess.get_session_cache_id().item())
+            vec = torch.arange(len(toks), dtype=torch.int32) + start_pos
 
-            # ---------- 2) always generate ONE token from target ----------
-            # fallback_token = self._generate_one_token(sess)
-            start_t = time.perf_counter()
-            fallback_token = self._generate_one_token(
-                sess,
-                temperature=self.temperature,
-                top_p=self.top_p,
-            )
-            
-
-            # clear chunk for next round
-            sess.last_draft_chunk = None
-
-            # ---------- EOS handling ----------
-            if (
-                fallback_token != 0
-                and self.eos_token_id is not None
-                and fallback_token == self.eos_token_id
-            ):
-                sess.finished = True
-            # Log cumulative verification latency **once** when the session ends
-            if sess.finished:
-                logger.info("[session=%s] total verification latency: %.3f s",
-                            sid, sess.verification_time)
-
-            # ---------- periodic verification‑time log ----------
-            sess.finalize_calls += 1
-            should_log = (
-                sess.finished or
-                sess.finalize_calls % 10 == 0 or
-                (accepted_count == 0 and draft_chunk_size == 0)   # client flush / end
-            )
-            if should_log:
-                logger.info(
-                    "[session=%s] cumulative verification latency: %.3f s  calls=%d",
-                    sid, sess.verification_time, sess.finalize_calls
-                )
-
-            token_text = self.tokenizer.decode([fallback_token]).strip() if fallback_token != 0 else "<none>"
-            logger.debug(f"[Finalize] returning token_id={fallback_token} ‹{token_text}› to draft model")
-            return inference_pb2.FinalizeResponse(
-                final_token=fallback_token,
-                finished=sess.finished,
+            # Decode the first five token-ids to human‑readable strings
+            token_words = [
+                self.tokenizer.decode([tid], clean_up_tokenization_spaces=False)
+                for tid in toks[:5]
+            ]
+            logger.info(
+                "[BatchRow %d] sid=%s  ids=%s  words=%s  cache_vec=%s",
+                len(sess_list), sid, toks[:5], token_words, vec[:5].tolist()
             )
 
-    def GenerateFull(self, request, context):
-        # baseline target-only decoding, optional
-        return super().GenerateFull(request, context)
+            input_ids.append(torch.tensor(toks, dtype=torch.int32))
+            cache_vecs.append(vec)
+            sess_list.append(sess)
 
-    def _generate_one_token(self, sess: TargetSession, temperature: float = 1.0, top_p: float = 0.9):
-        """
-        Sample one token from the target model’s distribution (temperature +
-        nucleus/top‑p).  This replaces the old greedy argmax, which caused the
-        same fallback tokens (e.g. “and”, token‑ID 323) to repeat and poison
-        the context.
+        # --------------------------------------------------------------
+        # Pad *lists* before stacking so the final stacked tensor keeps
+        # the original (B, N, V) layout coming out of Neuron.  This avoids
+        # collapsing the vocab axis down to 2 columns.
+        # Also pad sess_list with None for dummy rows.
+        # --------------------------------------------------------------
+        assert real_B <= self.max_batch, \
+            f"Batch size {real_B} compiled now should be the less than max_batch {self.max_batch}"
+        if real_B < self.max_batch:
+            pad_n = self.max_batch - real_B
 
-        Parameters
-        ----------
-        sess        : TargetSession
-        temperature : float  (default = 1.0)
-        top_p       : float  (default = 0.9)
-        """
-        self._sync_kv_pointer(sess)
-        input_ids = sess.current_ids  # shape (1, L)
-        out_ids = self.model.sample(
-            input_ids,
-            sequence_length=input_ids.shape[1] + 1,
-            temperature=temperature,
-            top_p=top_p,
-            do_sample=True,
+            # Use explicit padding instead of cloning row‑0 data
+            pad_token_id = 0
+            pad_ids = torch.full_like(input_ids[0], pad_token_id)     # (γ+1,) all PAD
+            pad_vec = torch.zeros_like(cache_vecs[0])                 # (γ+1,) all zeros
+
+            for _ in range(pad_n):
+                input_ids.append(pad_ids)
+                cache_vecs.append(pad_vec)
+                sess_list.append(None)        # placeholder for dummy row
+
+        input_ids  = torch.stack(input_ids, 0)        # (B, γ+1)
+        cache_vecs = torch.stack(cache_vecs, 0)       # (B, γ+1)
+
+        # ------------------------------------------------------------------
+        # Batched speculative_forward
+        # ------------------------------------------------------------------
+        # --------------------------------------------------------------
+        # DEBUG: show the raw tensors that will be fed to speculative_forward
+        # --------------------------------------------------------------
+        logger.info(
+            "[SpecForward] γ=%d  input_ids=%s  cache_vecs(row0…)=%s",
+            gamma,
+            input_ids.tolist(),
+            cache_vecs.tolist()[:2]   # print first 2 rows to avoid log spam
         )
-
-        token_id = int(out_ids[0, -1].item())
-
-        # Advance KV cache inside the Neuron model to reflect the new token
-        _, _ = self._safe_forward(
-            input_ids=torch.tensor([[token_id]], dtype=sess.current_ids.dtype),
-            cache_ids=torch.tensor([self.model._next_pos], dtype=torch.int32),
+        t0 = time.perf_counter()
+        logits = self.model.speculative_forward(
+            input_ids   = input_ids,
+            cache_ids   = cache_vecs,
+            spec_length = gamma + 1,
         )
-        sess.cache_ids = torch.tensor([self.model._next_pos], dtype=torch.int32)
+        logger.info("[scheduler - process_batch] speculative_forward raw shape = %s", tuple(logits.shape))
+        # Raw Neuron layout is (N, V, B)  where:
+        #   N = γ + 1, V = vocab shards (≈ vocab_size × TP), B = batch
+        # We keep this layout to avoid the transpose overhead.
+        verify_ms = (time.perf_counter() - t0) * 1000.0
 
-        # Append token to context
-        sess.current_ids = out_ids
-        if self.eos_token_id is not None and token_id == self.eos_token_id:
-            sess.finished = True
-        sess.tokens_generated += 1
-        return token_id
+        # logits: (N, V, B)  → split per session
+        for b, req in enumerate(batch_reqs):
+            # Skip the padded dummy rows – they have no corresponding request
+            sess = sess_list[b]
+            if sess is None:
+                continue
+            sid          = req["session_id"]
+            draft_tokens = req["draft_tokens"]
+            draft_probs  = req["draft_probs"]
+
+            # logits[:, :, b] → (N, V) for this session
+            all_row_probs = torch.softmax(
+                logits[:, :, b].float(), dim=-1
+            )                               # (γ+1, V)
+            # ----------------------------------------------------------
+            # DEBUG: sample *one* token from the target distribution for
+            #        each position i (0…γ) so we can see what the large
+            #        model "wants" to emit.  Decode to words.
+            # ----------------------------------------------------------
+            sampled_ids = []
+            sampled_words = []
+            for i in range(all_row_probs.size(0)):
+                samp_id = int(torch.multinomial(all_row_probs[i], 1).item())
+                sampled_ids.append(samp_id)
+                sampled_words.append(
+                    self.tokenizer.decode([samp_id], clean_up_tokenization_spaces=False)
+                )
+            logger.info(
+                "[TargetSample] sid=%s  sampled_ids=%s  words=%s",
+                sid, sampled_ids, sampled_words
+            )
+            tgt_row_probs = all_row_probs[:-1]
+
+            device = tgt_row_probs.device
+            dr_tokens = torch.tensor(draft_tokens, device=device)
+            row_idx   = torch.arange(len(draft_tokens), device=device)
+            p_tgt   = tgt_row_probs[row_idx, dr_tokens]
+            q_draft = torch.tensor(draft_probs, device=device)
+
+            ratio  = p_tgt / q_draft
+            rand_v = torch.rand_like(ratio)
+            accept = (p_tgt >= q_draft) | (rand_v < ratio)
+            rej    = (~accept).nonzero(as_tuple=False)
+            first_rej = int(rej[0].item()) if rej.numel() > 0 else len(draft_tokens)
+            logger.info(
+                f"[ACCEPTANCE DEBUG] "
+                f"accept={accept.cpu().tolist()} "
+                f"reject_indices={(rej.squeeze(-1).cpu().tolist() if rej.numel() else [])} "
+                f"first_rej={first_rej}"
+            )
 
 
-def _extract_logits(outputs):
-    if isinstance(outputs, (tuple, list)):
-        out_t = outputs[0]
-    elif hasattr(outputs, "logits"):
-        out_t = outputs.logits[:, -1, :]
-    else:
-        out_t = outputs
-    if len(out_t.shape) == 3:
-        return out_t[:, -1, :].float()
-    elif len(out_t.shape) == 2:
-        return out_t.float()
-    elif len(out_t.shape) == 1:
-        return out_t.unsqueeze(0).float()
-    else:
-        raise ValueError(f"Unknown shape for outputs: {out_t.shape}")
+            accepted_cnt = first_rej
+            committed    = draft_tokens[:accepted_cnt]
 
+            if accepted_cnt < len(draft_tokens):
+                bonus_id = int(torch.multinomial(all_row_probs[first_rej], 1).item())
+            else:
+                bonus_id = int(torch.multinomial(all_row_probs[-1], 1).item())
+            committed.append(bonus_id)
 
-def _extract_logits_all(outputs):
-    if isinstance(outputs, (tuple, list)):
-        out_t = outputs[0]
-    elif hasattr(outputs, "logits"):
-        return outputs.logits.float()
-    else:
-        out_t = outputs
-    if len(out_t.shape) == 3:
-        return out_t.float()
-    elif len(out_t.shape) == 2:
-        return out_t.unsqueeze(1).float()
-    elif len(out_t.shape) == 1:
-        return out_t.unsqueeze(0).unsqueeze(0).float()
-    else:
-        raise ValueError(f"Unhandled shape for model output: {out_t.shape}")
+            # ----------------------------------------------------------
+            # DEBUG: Show draft proposals, target predictions, accept/reject,
+            #        and final committed chunk in **human‑readable words**
+            # ----------------------------------------------------------
+            draft_words = [
+                self.tokenizer.decode([tid], clean_up_tokenization_spaces=False)
+                for tid in draft_tokens
+            ]
+            tgt_preds = torch.argmax(tgt_row_probs, dim=-1).tolist()
+            tgt_words = [
+                self.tokenizer.decode([tid], clean_up_tokenization_spaces=False)
+                for tid in tgt_preds
+            ]
+            committed_words = [
+                self.tokenizer.decode([tid], clean_up_tokenization_spaces=False)
+                for tid in committed
+            ]
+            status = (
+                "all_accepted"
+                if accepted_cnt == len(draft_tokens)
+                else f"rejected_from_pos_{accepted_cnt}"
+            )
+            logger.info(
+                "[Verify] sid=%s  status=%s\n"
+                "  draft  = %s\n"
+                "  target = %s\n"
+                "  commit = %s",
+                sid, status,
+                draft_words, tgt_words, committed_words,
+            )
 
+            self._commit_tokens_bulk(sess, committed)
+            finished = sess.finished
+
+            # Respond to the waiting gRPC handler
+            self.result_queues[sid].put(
+                (committed, accepted_cnt, verify_ms, finished)
+            )
 
 def run_server(model_path, port=50051, sequence_length=128,
                spec_length=None, profile=False,
-               temperature: float = 1.0, top_p: float = 0.9):
+               temperature: float = 1.0, top_p: float = 0.9,
+               batch_size: int = 1):
     logging.basicConfig(level=logging.INFO)
-    logger.info(f"Loading target model from {model_path} seq_len={sequence_length}")
+    logger.info(f"Initializing target server with model: {model_path}")
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=16))
     servicer = SpeculativeServiceServicer(
         model_path,
         sequence_length=sequence_length,
         spec_length=spec_length,
+        batch_size=batch_size,
         temperature=temperature,
         top_p=top_p,
     )
@@ -628,8 +632,3 @@ def run_server(model_path, port=50051, sequence_length=128,
     server.add_insecure_port(server_address)
     server.start()
     server.wait_for_termination()
-
-
-def run_local(model_path, prompt="", max_new_tokens=50, sequence_length=128, spec_length=None, profile=False):
-    # same as before
-    pass

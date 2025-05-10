@@ -1,4 +1,3 @@
-
 import os
 import logging
 import shutil
@@ -9,99 +8,175 @@ from transformers_neuronx import LlamaForSampling
 from transformers_neuronx.module import save_pretrained_split
 from transformers_neuronx.generation_utils import HuggingFaceGenerationModelAdapter
 import torch
+from transformers_neuronx.config import NeuronConfig
 from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers_neuronx.fused_speculation import FusedSpeculativeDecoder
-# fused speculative decoding utilities
-# generic Neuron interfaces (present in transformers‑neuronx >= 0.13)
-from transformers_neuronx import NeuronConfig, GenerationConfig
-
+import types
+# Fused Speculative Decoding is supported.
+# fsd = FusedSpeculativeDecoder(draft_model, target_model, spec_length)
+# fsd.to_neuron()  # Compile the fused speculative model
+SPEC_LENGTH_BUCKETS = [1, 2, 3, 4, 5]
 logger = logging.getLogger(__name__)
-
-# ------------------------------------------------------------------
-# Utility: disable the compile‑time `context_length_estimate` guard
-# ------------------------------------------------------------------
-def _disable_ctx_estimate(obj):
-    """
-    Recursively set `.context_length_estimate` to 0 on the Neuron model
-    and any nested `.model` that also carries the attribute, so incremental
-    forwards with <64 tokens no longer throw
-        ValueError: context_length (…) shouldn't be smaller than estimate (…)
-    """
-    if hasattr(obj, "context_length_estimate"):
-        obj.context_length_estimate = 0
-    if hasattr(obj, "model"):
-        _disable_ctx_estimate(obj.model)
-
 
 class NeuronHFAdapterWrap(torch.nn.Module):
     """
-    Thin wrapper so .forward accepts input_ids, cache_ids=None
-    and returns (logits, cache_ids) packaged as CausalLMOutputWithPast.
+    Thin wrapper mainly used to manage the KV cache pointer for the
+    underlying Neuron model.
     """
-    def __init__(self, adapter, cache_ids_rank2: bool = False):
+    def __init__(self, adapter, batch_size: int = 1):
         super().__init__()
         self.adapter = adapter
-        self._cache2d = cache_ids_rank2   # True ⇒ build (1,L) position tensors
-        self.cache_ids = None  # Initialize KV cache pointer storage
-        self._next_pos = 0  # next position index in the KV cache
+        # Initialise KV‑cache pointer storage
+        self.cache_id = torch.tensor([0], dtype=torch.int32)               # shape (1,)
+        self.batched_cache_ids = torch.zeros(batch_size, dtype=torch.int32) # shape (B,)
         self.config = adapter.config
+
+    def update_cache(self, delta):
+        """
+        Increment the *single‑row* KV‑cache pointer by `delta`.
+        `delta` may be an int, float, or 0‑D tensor; it is cast to int.
+        """
+        # Normalise delta to Python int
+        if isinstance(delta, torch.Tensor):
+            delta = int(delta.item())
+        else:
+            delta = int(delta)
+
+        # Lazily initialise cache_ids on first call
+        assert self.cache_id is not None, "cache_ids should not be None"
+
+        self.cache_id = self.cache_id + delta
+
+    def update_batched_cache(self, delta, row_idx):
+        """
+        Increment specific rows of the batched `(B,)` KV‑cache pointer by `delta`.
+        `delta` may be an int, float, or 0‑D tensor; it is cast to int.
+        The rows to update are specified by `row_idx`, which may be an int, list, tuple, or tensor.
+        Only manipulates self.batched_cache_ids.
+        """
+        # --------------------------------------------------------------
+        # Normalize delta to an int
+        # --------------------------------------------------------------
+        if isinstance(delta, torch.Tensor):
+            delta = int(delta.item())
+        else:
+            delta = int(delta)
+
+        # --------------------------------------------------------------
+        # Ensure batched pointer tensor exists
+        # --------------------------------------------------------------
+        assert self.batched_cache_ids is not None, "batched_cache_ids should not be None"
+
+        # --------------------------------------------------------------
+        # Convert row_idx into a flat list of integer indices
+        # --------------------------------------------------------------
+        if isinstance(row_idx, torch.Tensor):
+            indices = row_idx.flatten().tolist()
+        elif isinstance(row_idx, (list, tuple)):
+            indices = list(row_idx)
+        else:
+            indices = [int(row_idx)]
+
+        # Validate all indices
+        B = self.batched_cache_ids.shape[0]
+        assert all(0 <= idx < B for idx in indices), (
+            f"row_idx values {indices} out of range for batched_cache_ids with length {B}"
+        )
+        # --------------------------------------------------------------
+        # Increment only the requested rows
+        # --------------------------------------------------------------
+        for idx in indices:
+            self.batched_cache_ids[idx] += delta
+
+    # ------------------------------------------------------------------
+    # Accessors for external components
+    # ------------------------------------------------------------------
+    def get_cache_id_vec(self):
+        """
+        Return a **clone** of the single‑row KV‑cache pointer vector so
+        callers cannot mutate internal state accidentally.
+        """
+        assert self.cache_id is not None, "cache_id should not be None"
+        return self.cache_id.clone()
+
+    def get_batched_cache_id_vec(self):
+        """
+        Return a **clone** of the batched `(B,)` KV‑cache pointer vector.
+        """
+        assert self.batched_cache_ids is not None, "batched_cache_ids should not be None"
+        return self.batched_cache_ids.clone()
+
 
     # ------------------------------------------------------------------  
     # helper: build a (batch, length) int32 tensor [start, …, start+L‑1]  
     # ------------------------------------------------------------------
-    # def _build_pos(self, start: int, length: int, batch: int = 1):
-    #     return (torch.arange(start, start + length, dtype=torch.int32)
-    #                    .unsqueeze(0)            # -> (1, L)
-    #                    .repeat(batch, 1))       # -> (B, L)
-    # inference/model_loader.py  – inside class NeuronHFAdapterWrap
+    def _build_pos(self, start: int, length: int, batch: int = 1):
+        return (torch.arange(start, start + length, dtype=torch.int32)
+                       .unsqueeze(0)            # -> (1, L)
+                       .repeat(batch, 1))       # -> (B, L)
 
-    # helper: build a position tensor of the shape expected by the compiled graph
-    def _build_pos(self, start: int, length: int):
+    # ------------------------------------------------------------------
+    # Speculative helpers – expose Neuron-native multi-token kernels
+    # ------------------------------------------------------------------
+    def speculative_forward(self, input_ids, *, cache_ids=None,
+                            spec_length=None, **kwargs):
         """
-        When self._cache2d is False  → return 1‑D  (L,)
-        When self._cache2d is True   → return 2‑D  (1, L)
+        Pass-through to the Neuron graph that returns logits for **all**
+        tokens in `input_ids` (shape = (B, N, V)).
         """
-        pos = torch.arange(start, start + length, dtype=torch.int32)
-        if self._cache2d:
-            pos = pos.unsqueeze(0)            # (1, L)
-        return pos
 
-    def forward(self, input_ids, cache_ids=None, return_all_logits=False, **kwargs):
-        """
-        Run one incremental forward on the Neuron adapter, fabricating an explicit position
-        tensor for models that require it, but passing `cache_ids=None` for draft models
-        that expose a speculative‑decoder interface (i.e., have attribute `spec_length`).
+        # Ensure speculation length default mirrors input_ids length
+        if spec_length is None:
+            raise RuntimeError("spec_length must be provided for speculative_forward")
+            # spec_length = input_ids.shape[1]
 
-        Parameters
-        ----------
-        input_ids : torch.LongTensor  shape (B, L_new)
-        cache_ids : torch.IntTensor   shape (B, L_new) OR None
-        """
-        B, L = input_ids.shape
-        if cache_ids is None:
-            cache_ids = self._build_pos(self._next_pos, L)
-
-        out = self.adapter(
+        return self.adapter.model.speculative_forward(
             input_ids=input_ids,
             cache_ids=cache_ids,
-            start_ids=cache_ids,   # propagate position tensor for compiled graph
-            return_dict=False,
+            speculation_length=spec_length, # or input_ids.shape[1],
+            **kwargs
+        )
+
+    def tree_speculative_forward(self, input_ids, *, cache_ids=None,
+                                 spec_length=None, **kwargs):
+
+        # Ensure speculation length default mirrors input_ids length
+        if spec_length is None:
+            raise RuntimeError("spec_length must be provided for tree_speculative_forward")
+            # spec_length = input_ids.shape[1]
+        logger.info(f"Calling tree_speculative_forward with spec_length={spec_length}")
+        return self.adapter.model.tree_speculative_forward(
+            input_ids=input_ids,
+            cache_ids=cache_ids,
+            speculation_length=spec_length,
             **kwargs,
         )
 
-        self._next_pos = int(cache_ids.max().item()) + 1
-        self.cache_ids = torch.tensor([self._next_pos], dtype=torch.int32)
+    def forward(self, input_ids, cache_ids=None, **kwargs):
+        """
+        Thin pass‑through to the underlying Neuron adapter.
 
-        logits = out[0] if isinstance(out, (tuple, list)) else (
-                 out.logits if hasattr(out, "logits") else out)
+        All KV‑cache management (cache_ids and next_pos) is handled by the
+        caller.  This wrapper simply forwards the tensors and returns the
+        logits for the last token plus the same `cache_ids` object so
+        existing call‑sites that expect `(logits, pos_tensor)` keep working.
+        """
+        out = self.adapter(input_ids=input_ids,
+                           cache_ids=cache_ids,
+                           return_dict=False,
+                           **kwargs)
 
-        if logits.ndim == 3:                           # (B, L, V)
-            if return_all_logits:
-                logits = logits.squeeze(0) if logits.size(0) == 1 else logits
-            else:
-                logits = logits[:, -1, :]              # last step only
-        if logits.ndim == 2 and logits.size(0) == 1 and not return_all_logits:
-            logits = logits[0]                         # → (V,)
+        # Extract logits tensor
+        if isinstance(out, (tuple, list)):
+            logits = out[0]
+        else:
+            logits = out.logits if hasattr(out, "logits") else out
+
+        # Reduce shape to (V)
+        if logits.dim() == 3:       # (B, L, V)
+            logits = logits[0, -1, :]
+        elif logits.dim() == 2:     # (B, V)
+            logits = logits[0]
 
         return logits, cache_ids
 
@@ -134,33 +209,30 @@ class NeuronHFAdapterWrap(torch.nn.Module):
             eos_token_id=self.config.eos_token_id,
         )
         return out
-    
-    # inference/model_loader.py  – inside class NeuronHFAdapterWrap
-
 
 # Default sequence length (can be overridden by function arguments)
 DEFAULT_SEQUENCE_LENGTH = 128
 
-def load_model(model_path: str, sequence_length: int = DEFAULT_SEQUENCE_LENGTH, spec_length: int = None):
+def load_model(model_path: str,
+               sequence_length: int = DEFAULT_SEQUENCE_LENGTH,
+               spec_length: int | None = None,
+               batch_size: int = 1):
     """
     Load or compile a model for inference.
     """
     logger.info(f"Attempting to download/compile from source.")
-    model = compile_model(model_path, sequence_length=sequence_length, spec_length=spec_length)
+    model = compile_model(model_path, sequence_length=sequence_length, spec_length=spec_length, batch_size=batch_size)
     return model
 
-def compile_model(model_path: str, sequence_length: int = DEFAULT_SEQUENCE_LENGTH, spec_length: int = None):
+def compile_model(model_path: str,
+                  sequence_length: int = DEFAULT_SEQUENCE_LENGTH,
+                  spec_length: int | None = None,
+                  batch_size: int = 1):
     """
     Compile a model for AWS Neuron. Loads the model (from HF Hub or local checkpoint),
     compiles it to a TorchScript that can run on NeuronCores, and saves the compiled model
     and tokenizer to a local folder for future use.
     """
-    # ------------------------------------------------------------------
-    # Ensure the compiled graph supports “prompt + max γ + safety”
-    # ------------------------------------------------------------------
-    ctx_len = sequence_length
-    base_name = os.path.basename(os.path.normpath(model_path))
-    compiled_dir = f"{base_name}-compiled-{sequence_length}"
     logger.info(f"Compiling model '{model_path}' to Neuron (sequence_length={sequence_length})...")
 
     model_type = ""
@@ -177,101 +249,168 @@ def compile_model(model_path: str, sequence_length: int = DEFAULT_SEQUENCE_LENGT
 
     tp_degree = int(os.environ.get("NEURON_RT_NUM_CORES", "2"))
     if model_type.lower() == "llama" or "llama" in model_path.lower():
-        logger.info("Compiling LLama model using LlamaForSampling ...")
-        # LlamaForSampling already exposes a Neuron‑optimised incremental graph
+        logger.info(f"Compiling model using optimized LLaMA for Neuron ...")
+        neuron_cfg = NeuronConfig(
+            padding_side="right",
+        )
         model = LlamaForSampling.from_pretrained(
             model_path,
-            batch_size=1,
-            n_positions=ctx_len,
-            context_length_estimate=ctx_len,
+            batch_size=batch_size,
+            amp='bf16',
+            n_positions=sequence_length,
+            context_length_estimate=sequence_length,
+            spec_length=spec_length,
+            neuron_config=neuron_cfg,
             tp_degree=tp_degree,
-            amp="bf16",
+            on_device_generation=False,
+            return_all_logits=True,
+            return_dict=True,
+            torchscript=True,
+            use_cache=True,
+            trust_remote_code=True,
+            fuse_qkv=True,
+            attention_layout="BSH",
+            enable_chunked_prefill=False,
+            use_2d_cache_ids=True,
         )
         model.to_neuron()
+        # ------------------------------------------------------------------
+        # Ensure tokenizer & configs have an explicit PAD token.
+        # This silences HF warnings and lets Neuron skip attention‑mask logic.
+        # ------------------------------------------------------------------
+        tokenizer = AutoTokenizer.from_pretrained(model_path,
+                                                  trust_remote_code=True,
+                                                  use_fast=False)
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token           # reuse </s>
+        # Make the id available everywhere
+        tokenizer.pad_token_id = tokenizer.eos_token_id
+        hf_config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+        if hf_config.pad_token_id is None:
+            hf_config.pad_token_id = tokenizer.pad_token_id
+        model.config.pad_token_id = hf_config.pad_token_id
+        adapter = HuggingFaceGenerationModelAdapter(hf_config, model)
+        # --------------------------------------------------------------
+        # DEBUG: Inspect raw Neuron model output shape *before* wrapping
+        # --------------------------------------------------------------
+        # try:
+        #     # create a small random batch (1, 4) just to probe the output
+        #     debug_batch = torch.randint(
+        #         low=0,
+        #         high=hf_config.vocab_size,
+        #         size=(1, 4),
+        #         dtype=torch.int64
+        #     )
+        #     raw_out = adapter(input_ids=debug_batch, cache_ids=None, return_dict=True)
+        #     logger.info(f"[DEBUG] raw adapter logits shape: {raw_out.logits.shape}")
+        # except Exception as e:
+        #     logger.warning(f"[DEBUG] raw adapter call failed: {e}")
 
-        # Wrap so .forward returns logits and accepts cache_ids=None
-        hf_cfg  = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
-        adapter = HuggingFaceGenerationModelAdapter(hf_cfg, model)
 
-        # Disable compile‑time context‑length guard so short chunks don’t throw
-        _disable_ctx_estimate(model)
+        # --------------------------------------------------------------
+        # Quick sanity‑check: call the underlying model.forward so we can pass spec_length.
+        # --------------------------------------------------------------
+        # debug_batch = torch.randint(0, hf_config.vocab_size, (1, 4))
+        # # Call the underlying LlamaForSampling forward so we can pass spec_length.
+        # raw_out = model.forward(
+        #     input_ids=debug_batch,
+        #     cache_ids=None,
+        #     spec_length=debug_batch.shape[1],   # ask for all-token logits
+        #     return_dict=True,
+        # )
+        # logger.info(
+        #     "[DEBUG] LlamaForSampling raw logits shape %s",
+        #     raw_out.shape,
+        # )
 
-        return NeuronHFAdapterWrap(adapter, cache_ids_rank2=False)
+        # Wrap the adapter so downstream code keeps the KV‑pointer logic
+        return NeuronHFAdapterWrap(adapter, batch_size=batch_size)
     else:
-        RuntimeError(f"Model type '{model_type}' not supported for compilation.")
         model = AutoModelForCausalLM.from_pretrained(model_path)
-        model.save_pretrained(compiled_dir)
         tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=False)
-        tokenizer.save_pretrained(compiled_dir)
-        logger.info(f"Model and tokenizer saved to '{compiled_dir}' (no Neuron compilation performed).")
-        return model
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+        tokenizer.pad_token_id = tokenizer.eos_token_id
+        logger.info("Non‑Neuron path: loaded model & tokenizer; skipping on‑disk save because we re‑compile on every run.")
+        return NeuronHFAdapterWrap(HuggingFaceGenerationModelAdapter(model.config, model), batch_size=batch_size)
     
-# ---------------------------------------------------------------------------
-# Target‑only helpers: compile a fused speculative decoder (γ draft + 1 bonus)
-# ---------------------------------------------------------------------------
 
-def compile_target_model(
-    model_path: str,
-    sequence_length: int = DEFAULT_SEQUENCE_LENGTH,
-    spec_length: int = 4,
-    top_k: int = 512,
-    top_p: float = 0.9,
-    temperature: float = 1.0,
-):
+def compile_target_model(model_path: str,
+                         sequence_length: int = DEFAULT_SEQUENCE_LENGTH,
+                         spec_buckets: list[int] | None = None,
+                         batch_size: int = 1):
     """
-    Compile ONE Neuron target model (no fused graph) so we can
-    capture FULL logits for every draft token.
+    Compile the *target* model.  Differs from `compile_model` (used for
+    the draft model) in that we always expose **all** logits for the
+    tokens supplied in each forward pass so the verification step can
+    access the full distribution.  No other behavioural changes are
+    introduced.
+    """
+    # Compile γ + 1 buckets so verify pass includes the bonus‑token row
+    spec_buckets = SPEC_LENGTH_BUCKETS
 
-    Returns
-    -------
-    NeuronHFAdapterWrap  – exposes .forward returning logits
-    """
-    logger.info(
-        "[compile_target_model] building Neuron target‑only model %s  γ=%d  seq_len=%d",
-        model_path, spec_length, sequence_length,
+    logger.info(f"[Target-compile] Compiling '{model_path}' -> Neuron "
+                f"(sequence_length={sequence_length})")
+
+    tp_degree = int(os.environ.get("NEURON_RT_NUM_CORES", "2"))
+    neuron_cfg = NeuronConfig(
+        is_eagle_target=False,
+        cast_logits_dtype="bfloat16",
+        padding_side="right",
     )
-
-    # Use the same LlamaForSampling backend for the target so interfaces match
-    ctx_len = max(sequence_length, 512)   # safety slack
-    tp_deg  = int(os.environ.get("NEURON_RT_NUM_CORES", "2"))
-
-    logger.info("[compile_target_model] Compiling target with LlamaForSampling …")
-
-    target = LlamaForSampling.from_pretrained(
+    model = LlamaForSampling.from_pretrained(
         model_path,
-        batch_size=1,
-        n_positions=ctx_len,
-        context_length_estimate=ctx_len,
-        tp_degree=tp_deg,
-        amp="bf16",
+        batch_size            = batch_size,
+        amp                   = "bf16",
+        n_positions           = sequence_length,
+        context_length_estimate = sequence_length,
+        # Provide the *largest* bucket to the base model so positional buffers
+        # are sized correctly; per‑length graphs are added by
+        # enable_speculative_decoder() below.
+        spec_length           = max(spec_buckets),
+        neuron_config         = neuron_cfg,
+        tp_degree             = tp_degree,
+        on_device_generation  = False,        # we need raw logits on host
+        return_all_logits     = True,          # need full vocab probs for verification
+        return_all_outputs    = True,
+        return_dict           = True,
+        torchscript           = True,
+        use_cache             = True,
+        trust_remote_code     = True,
+        fuse_qkv              = True,
+        attention_layout      = "BSH",
+        use_2d_cache_ids      = True,
+        enable_chunked_prefill=False,
     )
-    target.to_neuron()
+    model.enable_speculative_decoder(spec_buckets)
+    model.to_neuron()
 
-    # Disable compile‑time guard
-    _disable_ctx_estimate(target)
+    logger.info("Requested spec-length buckets: %s", spec_buckets)
+    logger.info("Compiled speculation buckets: %s", list(model.decoder_lm_head_for_speculation.keys()))
 
-    cfg = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
-    adapter = HuggingFaceGenerationModelAdapter(cfg, target)
-    return NeuronHFAdapterWrap(adapter, cache_ids_rank2=False)
+    # Ensure PAD token is defined so we can always right‑pad inputs.
+    tokenizer = AutoTokenizer.from_pretrained(model_path,
+                                              trust_remote_code=True,
+                                              use_fast=False)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.pad_token_id = tokenizer.eos_token_id
+
+    hf_config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+    if hf_config.pad_token_id is None:
+        hf_config.pad_token_id = tokenizer.pad_token_id
+    model.config.pad_token_id = hf_config.pad_token_id
+
+    adapter = HuggingFaceGenerationModelAdapter(hf_config, model)
+    return NeuronHFAdapterWrap(adapter, batch_size=batch_size)
 
 
-def load_target_model(
-    model_path: str,
-    sequence_length: int = DEFAULT_SEQUENCE_LENGTH,
-    spec_length: int = 4,
-    top_k: int = 512,
-    top_p: float = 0.9,
-    temperature: float = 1.0,
-):
+def load_target_model(model_path: str,
+                      sequence_length: int = DEFAULT_SEQUENCE_LENGTH,
+                      batch_size: int = 1):
     """
-    Always (re)compile the fused target graph.  No on‑disk caching to keep the
-    code path simple and stateless.
+    Convenience wrapper the *target* side should call instead of `load_model`.
     """
-    return compile_target_model(
-        model_path,
-        sequence_length=sequence_length,
-        spec_length=spec_length,
-        top_k=top_k,
-        top_p=top_p,
-        temperature=temperature,
-    )
+    return compile_target_model(model_path,
+                                sequence_length=sequence_length,
+                                batch_size=batch_size)

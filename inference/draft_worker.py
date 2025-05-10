@@ -6,15 +6,366 @@ import json
 import threading
 import uuid
 from datetime import datetime
-
 from grpc_comm import inference_pb2_grpc, inference_pb2, grpc_client
 from inference.model_loader import load_model
-from inference.speculative import speculative_decode
 from transformers import AutoTokenizer
 import torch
+import random
+import collections
+import concurrent.futures
+from transformers_neuronx import sampling
+from inference.model_loader import SPEC_LENGTH_BUCKETS
 
 logger = logging.getLogger(__name__)
 
+# Repetition‑penalty strength (0 < α ≤ 1).  Smaller → stronger penalty
+REP_PENALTY = 0.4
+NGRAM_WINDOW = 3    # penalise 1‑ to 3‑gram repeats
+TOP_K = 128
+
+if not logger.hasHandlers():
+    h = logging.StreamHandler()
+    h.setLevel(logging.INFO)
+    fmt = logging.Formatter('%(asctime)s %(levelname)s %(name)s: %(message)s')
+    h.setFormatter(fmt)
+    logger.addHandler(h)
+    logger.setLevel(logging.INFO)
+
+def speculative_decode(
+    draft_model,
+    tokenizer,
+    stub,
+    prompt,
+    max_new_tokens,
+    gamma,
+    profile=False,
+    top_p=0.9,
+    temperature=1.0,
+    session_id=0
+):
+    """
+    Perform probability-based speculative decoding using a draft model and a target model via gRPC,
+    with full rollback of the draft model's past states.
+    Extended to handle a session_id so multiple prompts can run concurrently on the server.
+    """
+    # snap initial γ to the largest compiled bucket ≤ user request
+    # Derive valid gammas and gamma_max from the bucket list
+    valid_gammas = tuple(b - 1 for b in SPEC_LENGTH_BUCKETS if b > 1)
+    gamma_max    = max(valid_gammas)
+    current_gamma = max(g for g in valid_gammas if g <= max(1, gamma))
+    current_temp  = temperature            # draft temperature we can tweak
+    target_accept = 0.5                    # desired per‑loop acceptance rate
+
+    logger.debug(
+        f"[session={session_id}] Starting speculative_decode: "
+        f"prompt='{prompt[:60]}...' max_new_tokens={max_new_tokens} gamma={gamma}"
+    )
+
+    # Initial setup: process prompt through draft model to initialize cache
+    output_tokens = []
+    # draft_model.cache_ids = None
+    # draft_model._next_pos = 0  # next position index in the KV cache
+
+    # pre-filling: Feed the entire prompt once so the draft model builds its KV cache
+    prompt_ids = tokenizer(prompt, return_tensors='pt').input_ids
+    assert prompt_ids is not None, "Prompt tokenization failed due to empty input."
+    prev_token_id = int(prompt_ids[0, -1].item())
+
+    # --------------------------------------------------------------
+    # Per‑stage timing buckets (all values in seconds)
+    # --------------------------------------------------------------
+    timing = {
+        "draft_prefill_time":       0.0,
+        "draft_generation_time":    0.0,
+        "grpc_roundtrip_time":      0.0,   # pure network + (de)serialisation latency
+        "target_verification_time": 0.0,   # server‑side compute only
+        "sampling_filter_time":     0.0,   # time spent on n‑gram mask + top‑k/p filter
+    }
+    
+    # Feed the prompt so Neuron caches 0…L‑1, then set pointer to NEXT index (=L)
+    # build the KV cache for the prompt
+    time_draftprefill = time.perf_counter()
+    L = prompt_ids.shape[1]
+    cache_vec = torch.arange(L, dtype=torch.int32).unsqueeze(0)   # (1, L)
+    _ = draft_model.forward(
+        input_ids=prompt_ids,
+        cache_ids=cache_vec,          # avoid AttributeError in Neuron _prepare_for_par_ctx_rhs_padding
+    )                                 # fills 0…L‑1
+    timing["draft_prefill_time"] += time.perf_counter() - time_draftprefill
+    # Overwrite cache pointer with a single‑index tensor [L]
+    draft_model.update_cache(L)
+    # draft_model.cache_ids = torch.tensor([L], dtype=torch.int32)
+    # draft_model._next_pos = L
+
+    tokens_generated = 0
+    # reusable scratch tensor (1,1) for single-token forwards
+    scratch_token = torch.empty((1, 1), dtype=torch.int64)
+    # fixed-size deque for fast repetition penalty history
+    recent_deque  = collections.deque(maxlen=50)
+    finished = False
+    accepted_tokens_total = 0
+    target_tokens_total = 0
+
+    while not finished and tokens_generated < max_new_tokens:
+        # The draft model proposes up to 'gamma' tokens
+        speculative_tokens = []
+        speculative_probs = []
+        # # ---------- just before the debug call, print he actual word generated ----------
+        # token_texts = [tokenizer.decode([tid], clean_up_tokenization_spaces=False)
+        #             for tid in speculative_tokens]
+
+        # past_states = [draft_model.cache_ids]
+        for i in range(current_gamma):
+            scratch_token[0, 0] = prev_token_id
+            # Compute the absolute KV-cache position for this token
+            current_ptr = int(draft_model.get_cache_id_vec().item())
+            next_pos = current_ptr + i
+            # Neuron decoder expects (B, 1) – wrap pos in an extra bracket
+            cache_vec = torch.tensor([[next_pos]],
+                                     dtype=torch.int32,
+                                     device=scratch_token.device)   # shape = (1, 1)
+            time_draftgen = time.perf_counter()            
+            logits, _ = draft_model.forward(input_ids=scratch_token, cache_ids=cache_vec)
+            timing["draft_generation_time"] += time.perf_counter() - time_draftgen
+            # logits = logits.float()
+
+            # ---- Our improved numeric stability start ----
+            # Temperature‑scale logits then apply classic nucleus (top‑p) filter
+            time_sample = time.perf_counter()
+            # apply ngram filter
+            masked = sampling.filter_ngrams(
+                NGRAM_WINDOW,
+                torch.tensor(output_tokens + speculative_tokens).unsqueeze(0),
+                logits.unsqueeze(0),    # (1, V) expected
+                next_pos
+            )
+
+            # apply temperature scaling
+            logits = logits / current_temp
+
+            # apply top‑k and top‑p filtering
+            masked, candidate_idx = sampling.top_k_top_p_filtering(
+                logits.unsqueeze(0),             # (1, V) expected
+                top_k=TOP_K,
+                top_p=top_p
+            )
+            timing["sampling_filter_time"] += time.perf_counter() - time_sample
+
+            probs = torch.softmax(masked, dim=-1).squeeze(0)
+            sample_in_topk = torch.multinomial(probs, 1).item()
+            token_id   = int(candidate_idx[0, sample_in_topk])
+            token_prob = float(probs[sample_in_topk])
+ 
+            # store the token and its probability for later verification
+            speculative_tokens.append(token_id)
+            speculative_probs.append(token_prob)
+            
+            prev_token_id = token_id
+            # past_states.append(draft_model.cache_ids + i)   # save pointer to next slot
+            # Stop if end-of-sequence or max_new_tokens reached
+            if tokenizer.eos_token_id is not None and token_id == tokenizer.eos_token_id:
+                finished = True
+                break
+            if tokens_generated + len(speculative_tokens) >= max_new_tokens:
+                break
+ 
+        # # If overshoot
+        # if len(speculative_tokens) > 0 and tokens_generated > max_new_tokens:
+        #     overshoot = tokens_generated - max_new_tokens
+        #     speculative_tokens = speculative_tokens[:-overshoot]
+        #     speculative_probs = speculative_probs[:-overshoot]
+        #     output_tokens = output_tokens[:-overshoot]
+        #     tokens_generated = max_new_tokens
+        #     finished = True
+
+        if not speculative_tokens:
+            break
+
+        # 8) Verify tokens with target model
+        # --------------------------------------------------------------
+        # Fast‑fail if the speculative chunk length is NOT one of the
+        # compiled γ buckets.  We no longer truncate; instead we raise to
+        # surface a configuration / logic error immediately.
+        # --------------------------------------------------------------
+
+        # ==============================================================
+        # if len(speculative_tokens) not in valid_gammas:
+        #     assert len(speculative_tokens) in valid_gammas, (
+        #         f"Speculative chunk length {len(speculative_tokens)} is not "
+        #         f"supported by the compiled target model; valid γ buckets = "
+        #         f"{valid_gammas}"
+        #     )
+        # ============================================================
+
+        # ============================================================
+        # Ensure speculative_probs is the same length as speculative_tokens.
+        # This can become mismatched when we break early from the inner loop
+        # (e.g. EOS or token‑budget exhaustion).  Truncate to the shorter
+        # length so we never advance _next_pos past the compiled context.
+        # ============================================================
+        
+        # # ====================================================================
+        # # --- Verify + commit in one RPC ---
+        # # logger.debug("[session=%s] Proposed tokens: %s", session_id, speculative_tokens)
+        # # --- show draft chunk as words instead of IDs -----------------
+        # token_texts_dbg = [
+        #     tokenizer.decode([tid], clean_up_tokenization_spaces=False)
+        #     for tid in speculative_tokens
+        # ]
+        # logger.debug("[session=%s] draft model proposed: chunk len=%d, proposed tokens (text)=%s, ids=%s, probs=%s", session_id, len(speculative_tokens), token_texts_dbg, speculative_tokens, speculative_probs)
+        # # ====================================================================
+
+
+        # ----- measure RPC round‑trip and split into network vs. verify compute -----
+        time_roundtrip = time.perf_counter()
+        commit_ids, accepted_count, verify_time_ms, target_finished = grpc_client.verify_draft_tokens(
+            stub, speculative_tokens, speculative_probs, session_id=session_id
+        )
+        rpc_roundtrip = time.perf_counter() - time_roundtrip
+
+        verify_sec   = verify_time_ms / 1000.0
+        # Network + (de)serialisation + client/server scheduling
+        network_sec  = max(0.0, rpc_roundtrip - verify_sec)
+
+        timing["grpc_roundtrip_time"]      += network_sec
+        timing["target_verification_time"] += verify_sec
+
+        # ------------------------------------------------------------------
+        # Respect the remaining token budget so we never exceed max_new_tokens.
+        # If the target returned more tokens than we can still emit, truncate
+        # the commit list *before* we touch any state‑tracking counters.
+        # ------------------------------------------------------------------
+        tokens_generated += len(commit_ids)
+        remaining_budget = max_new_tokens - tokens_generated
+        if remaining_budget <= 0:
+            finished = True
+            commit_ids = []
+            break
+        elif len(commit_ids) > remaining_budget:
+            commit_ids = commit_ids[:remaining_budget]
+            # clamp accepted_count as well
+            if accepted_count > len(commit_ids):
+                accepted_count = len(commit_ids)
+
+        # Now that commit_ids is final, update global counters
+        accepted_tokens_total += accepted_count
+        # Track how many tokens were generated by the target model this loop
+        target_tokens_total += max(0, len(commit_ids) - accepted_count)
+
+        # --------------------------------------------------------------
+        # ROLLBACK draft KV pointer to the state *before* the first
+        # rejected token so we don't "leak" unused cache slots.
+        # past_states[0] is the pointer *before* emitting any speculative
+        # token; past_states[k] is after accepting k tokens.
+        # --------------------------------------------------------------
+        # rollback_ptr = past_states[accepted_count].clone()
+        # draft_model.cache_ids = rollback_ptr
+        # draft_model._next_pos = int(rollback_ptr.item())
+
+        # ---------------- Hierarchical KV cache update -----------------
+        # 1) Roll back the cache pointer so the *rejected* draft tokens
+        #    disappear from the device KV.  They occupy the range
+        #       [_next_pos - len(speculative_tokens), _next_pos)
+        #    so we rewind by (len(speculative_tokens) - accepted_count).
+
+
+
+        # 2) Forward **one** bonus token; accepted tokens already occupy 0…A‑1.
+        bonus_id = commit_ids[-1]           # always present
+        scratch_token[0, 0] = bonus_id
+
+        # ============================================================
+        # set bonus id to the next beginning of generating new draft tokens
+        prev_token_id = bonus_id
+        # ==============================================================
+        # # 3) Advance pointer past the newly‑written bonus token.
+        # this is used to update the KV cache ptr
+        # --------------------------------------------------------------
+        # Advance the draft model’s KV pointer by (accepted_count + bonus)
+        # --------------------------------------------------------------
+        delta = accepted_count + 1          # bonus token counts as +1
+        draft_model.update_cache(delta)     # unified, increment-by-delta API
+        # ==============================================================
+
+        # Record every token that will appear in the final text
+        output_tokens.extend(commit_ids)
+        recent_deque.extend(commit_ids)
+        if tokens_generated >= max_new_tokens:
+            finished = True
+            break
+        if tokenizer.eos_token_id is not None and bonus_id == tokenizer.eos_token_id:
+            finished = True
+
+        logger.debug("ACCEPT cnt=%d  committed=%s",
+             accepted_count,
+             speculative_tokens[:accepted_count])
+        # Propagate server‑side finished flag
+        finished = finished or target_finished
+
+        # ---------- adaptive γ and temperature (P‑controller) ----------
+        # if current_gamma > 0:
+        #     loop_accept_rate = accepted_count / current_gamma
+        #     error = target_accept - loop_accept_rate
+
+        #     # PID suggestion
+        #     desired_gamma = int(max(1, min(gamma_max,
+        #                                    current_gamma + 0.5 * error * current_gamma)))
+        #     # snap to nearest compiled bucket _not exceeding_ desired_gamma
+        #     new_gamma = max(g for g in valid_gammas if g <= desired_gamma)
+        #     if new_gamma != current_gamma:
+        #         logger.debug("[session=%s] Adjust γ %d → %d (acc_rate=%.2f, desired=%d)",
+        #                      session_id, current_gamma, new_gamma, loop_accept_rate, desired_gamma)
+        #     current_gamma = new_gamma
+
+        #     new_temp = max(0.3, min(2.0, current_temp * (1 + 0.2 * error)))
+        #     if abs(new_temp - current_temp) > 1e-3:
+        #         logger.debug("[session=%s] Adjust draft temperature %.3f → %.3f",
+        #                      session_id, current_temp, new_temp)
+        #     current_temp = new_temp
+
+        # =======================================================================
+        if target_finished or tokens_generated >= max_new_tokens:
+            finished = True
+
+    # Build final text
+    generated_text = tokenizer.decode(
+            output_tokens[-tokens_generated:],
+            skip_special_tokens=True,               # ← strip EOS / PAD / BOS
+            clean_up_tokenization_spaces=False,
+        ) if output_tokens else ""
+
+    # Performance stats
+    perf_stats = {}
+    # Compute total tokens produced by both draft (accepted) and target
+    total_output_tokens = accepted_tokens_total + target_tokens_total
+    if profile:
+        tokens_generated_total = total_output_tokens
+        perf_stats["tokens_generated"] = tokens_generated_total
+        perf_stats.update({
+            "draft_prefill_time":       timing["draft_prefill_time"],
+            "draft_generation_time":    timing["draft_generation_time"],
+            "grpc_roundtrip_time":      timing["grpc_roundtrip_time"],
+            "target_verification_time": timing["target_verification_time"],
+            "sampling_filter_time":     timing["sampling_filter_time"],
+        })
+
+    if total_output_tokens > 0:
+        match_rate = accepted_tokens_total / total_output_tokens
+        perf_stats["token_match_rate"] = match_rate
+
+    if total_output_tokens > 0:
+        logger.debug(
+            f"Speculative decoding match rate: {match_rate:.2%} "
+            f"(Draft accepted: {accepted_tokens_total}, Target generated: {target_tokens_total})"
+        )
+
+    logger.debug(
+        f"[session={session_id}] Finished: generated_text='{generated_text[:120]}...'"
+    )
+    # Make these counters available to callers even when profiling is off
+    perf_stats["accepted_tokens_total"] = accepted_tokens_total
+    perf_stats["target_tokens_total"] = target_tokens_total
+    return generated_text, perf_stats
 
 def save_perf_stats(perf_stats: dict, file_prefix: str):
     """
@@ -34,10 +385,12 @@ def save_perf_stats(perf_stats: dict, file_prefix: str):
                 return f"0.0%({t:.3f})"
         
         # Append CSV row; write header if file does not exist
-        header = ["total_time", "tokens_generated", "tokens_per_second",
-                  "avg_token_time", "token_match_rate",
-                  "draft_forward_time", "grpc_server_time",
-                  "target_verification_time", "rollback_time"]
+        header = ["total_time","tokens_generated","tokens_per_second",
+                "avg_token_time","token_match_rate",
+                "target_prefill_time","draft_prefill_time",
+                "draft_generation_time",
+                "grpc_roundtrip_time","target_verification_time",
+                "sampling_filter_time"]
 
         write_header = not os.path.exists(csv_path)
         with open(csv_path, "a", newline='') as cf:
@@ -49,10 +402,12 @@ def save_perf_stats(perf_stats: dict, file_prefix: str):
                 perf_stats.get("throughput", ""),
                 perf_stats.get("avg_token_time", ""),
                 perf_stats.get("token_match_rate", ""),
-                fmt(perf_stats.get("draft_forward_time", 0.0)),
-                fmt(perf_stats.get("grpc_server_time", 0.0)),
+                fmt(perf_stats.get("target_prefill_time", 0.0)),
+                fmt(perf_stats.get("draft_prefill_time", 0.0)),
+                fmt(perf_stats.get("draft_generation_time", 0.0)),
+                fmt(perf_stats.get("grpc_roundtrip_time", 0.0)),
                 fmt(perf_stats.get("target_verification_time", 0.0)),
-                fmt(perf_stats.get("rollback_time", 0.0)),
+                fmt(perf_stats.get("sampling_filter_time", 0.0)),
             ]
             cf.write(",".join(str(x) for x in row) + "\n")
 
@@ -64,7 +419,7 @@ def save_perf_stats(perf_stats: dict, file_prefix: str):
         logger.error(f"Failed to save performance data: {e}")
 
 
-def run_batched_prompt_file(
+def run_client(
     draft_model_name: str,
     target_host: str = "localhost",
     port: int = 50051,
@@ -75,7 +430,8 @@ def run_batched_prompt_file(
     gamma: int = 4,
     profile: bool = False,
     top_p: float = 0.9,
-    temperature: float = 1.0
+    temperature: float = 1.0,
+    batch_size: int = 1,
 ):
     if not os.path.exists(prompt_text_file):
         logger.error(f"Prompt text file not found: {prompt_text_file}")
@@ -86,16 +442,18 @@ def run_batched_prompt_file(
         logger.error("No valid lines in the prompt file.")
         return
 
-    logger.info(f"Loading draft model '{draft_model_name}' (sequence_length={sequence_length}) for batched decoding...")
+    logger.info(f"Loading draft model '{draft_model_name}' (sequence_length={sequence_length}) for speculative decoding...")
     if isinstance(draft_model_name, str):
         # draft_model_name is a path → load the model
         draft_model = load_model(
             draft_model_name,
             sequence_length=sequence_length,
-            spec_length=gamma
+            spec_length=gamma,
+            batch_size=batch_size
         )
         model_path_str = draft_model_name
     else:
+        TypeError("draft_model_name must be a string (path).")
         # never happens in Neuron
         # already a model instance
         draft_model = draft_model_name
@@ -110,230 +468,76 @@ def run_batched_prompt_file(
     else:
         raise ValueError(
             "Cannot determine tokenizer_source: provide --target_tokenizer when "
-            "passing a pre‑loaded draft model."
+            "passing a pre-loaded draft model."
         )
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_source, use_fast=False)
-    
+
+    # ------------------------------------------------------------------
+    # Stage‑3: run one *thread* per prompt so draft‑side generation
+    # overlaps network verification latency.  Each thread owns its own
+    # session_id, cache, and speculative_decode() loop.
+    # ------------------------------------------------------------------
+    def _worker(prompt_idx, prompt_text):
+        # Prime target
+        # Ask the target to assign a canonical session-id
+        start_resp = stub.StartGeneration(
+            inference_pb2.StartRequest(
+                session_id=0,                 # 0 → “please assign one for me”
+                prompt=prompt_text,
+                max_new_tokens=max_new_tokens,
+                gamma=gamma,
+            )
+        )
+        sid = start_resp.session_id
+        t0 = time.time()
+        gen_text, perf_stats = speculative_decode(
+            draft_model, tokenizer, stub,
+            prompt_text, max_new_tokens, gamma,
+            profile=profile, top_p=top_p, temperature=temperature,
+            session_id=sid
+        )
+        latency = time.time() - t0
+        final_text = prompt_text + gen_text
+        logger.info(
+            "[Thread %d] completed in %.2fs, tokens=%d, throughput=%.2f t/s",
+            prompt_idx, latency,
+            perf_stats.get("tokens_generated", 0),
+            perf_stats.get("throughput", 0.0),
+        )
+        return {
+            "prompt_idx": prompt_idx,
+            "text": final_text,
+            "latency": latency,
+            "perf": perf_stats,
+        }
+
+    start_time = time.time()
     address = f"{target_host}:{port}"
+    logger.info(f"Connecting to target server at {address} (host={target_host}, port={port})...")
     channel = grpc.insecure_channel(address)
     stub = inference_pb2_grpc.SpeculativeServiceStub(channel)
 
-    # We'll create a single session_id for each prompt, or we can unify them.
-    # For now, let's do one session per prompt, but handle them in a single pass.
+    results = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(prompts), 8)) as pool:
+        fut2idx = {pool.submit(_worker, i, p): i for i, p in enumerate(prompts)}
+        for fut in concurrent.futures.as_completed(fut2idx):
+            results.append(fut.result())
 
-    # Step 1) StartGeneration for each prompt
-    session_ids = []
-    for prompt in prompts:
-        sid = _gen_session_id()
-        session_ids.append(sid)
-        stub.StartGeneration(
-            inference_pb2.StartRequest(
-                session_id=sid,
-                prompt=prompt,
-                max_new_tokens=max_new_tokens,
-                gamma=gamma
-            )
-        )
+    # Sort results by original prompt order
+    results.sort(key=lambda r: r["prompt_idx"])
 
-    final_texts = [prompts[i] for i in range(len(prompts))]
-    finished_mask = [False]*len(prompts)
-    tokens_generated = [0]*len(prompts)
-    accepted_counts = [0]*len(prompts)
-    target_counts = [0]*len(prompts)
+    # Pretty‑print outputs
+    print("\n=== Final Outputs (CONCURRENT) ===")
+    for r in results:
+        print(f"[Prompt {r['prompt_idx']} Output]:\n{r['text']}\n")
 
-    # do up to max_new_tokens steps in batch
-    import time
-    start_time = time.time()
+    # Aggregate CSV if profiling
+    if profile:
+        for r in results:
+            save_perf_stats(r["perf"], file_prefix="performance_speculative")
 
-    # a loop in Python that calls speculative_decode for each prompt in sequence
-    for i, prompt in enumerate(prompts):
-        logger.info(f"[BATCH] Decoding prompt {i}: {prompt}")
-        gen_text, perf_stats = speculative_decode(
-            draft_model, tokenizer, stub,
-            prompt, max_new_tokens, gamma,
-            profile=profile, top_p=top_p, temperature=temperature,
-            session_id=session_ids[i]
-        )
-        final_texts[i] = prompt + gen_text
-        if perf_stats:
-            accepted_counts[i] = perf_stats.get("accepted_tokens_total", 0)
-            target_counts[i] = perf_stats.get("target_tokens_total", 0)
-            if profile:
-                # Record prompt index so rows can be distinguished, but
-                # append all rows to a single CSV file.
-                perf_stats["prompt_id"] = i
-                save_perf_stats(perf_stats, file_prefix="performance_speculative")
-
-    end_time = time.time()
-    total_time = end_time - start_time
-    logger.info(f"Batched decode completed in {total_time:.2f}s.")
-
-    print("\n=== Final Outputs (BATCH approach) ===")
-    for i, text in enumerate(final_texts):
-        print(f"[Prompt {i} Output]:\n{text}\n")
-
-
-def run_client(draft_model_name: str,
-               target_host: str = "localhost",
-               port: int = 50051,
-               prompt: str = "",
-               target_tokenizer: str = None,
-               max_new_tokens: int = 50,
-               sequence_length: int = 128,
-               gamma: int = 4,
-               profile: bool = False,
-               no_target: bool = False,
-               top_p: float = 0.9,
-               temperature: float = 1.0):
-    # same as existing
-    logger.info(f"Loading draft model '{draft_model_name}' (sequence_length={sequence_length})...")
-    draft_model = load_model(
-        draft_model_name,
-        sequence_length=sequence_length,
-        spec_length=gamma
-    )
-    tokenizer_source = target_tokenizer or draft_model_name
-    tokenizer = AutoTokenizer.from_pretrained(tokenizer_source, use_fast=False)
-    if not prompt:
-        logger.error("No prompt provided.")
-        return
-    if no_target:
-        return _run_standalone_draft(draft_model, tokenizer, prompt, max_new_tokens, profile)
-    else:
-        address = f"{target_host}:{port}"
-        logger.info(f"Connecting to target server at {address}...")
-        channel = grpc.insecure_channel(address)
-        stub = inference_pb2_grpc.SpeculativeServiceStub(channel)
-        session_id = _gen_session_id()
-        stub.StartGeneration(
-            inference_pb2.StartRequest(
-                session_id=session_id,
-                prompt=prompt,
-                max_new_tokens=max_new_tokens,
-                gamma=gamma
-            )
-        )
-        logger.info(f"Starting speculative decoding (single) for prompt: '{prompt}'")
-        generated_text, perf_stats = speculative_decode(
-            draft_model, tokenizer, stub, prompt, max_new_tokens, gamma,
-            profile=profile, top_p=top_p, temperature=temperature,
-            session_id=session_id
-        )
-        full_output = prompt + generated_text
-        print("\n=== Final Output ===\n" + full_output)
-        if profile and perf_stats:
-            save_perf_stats(perf_stats, file_prefix="performance_speculative")
-        return full_output
-
-
-def _run_standalone_draft(draft_model, tokenizer, prompt, max_new_tokens, profile):
-    # same as existing
-    output_text = ""
-    input_ids = tokenizer(prompt, return_tensors='pt').input_ids
-    tokens_generated = 0
-    start_time = time.time() if profile else None
-    for i in range(max_new_tokens):
-        try:
-            output = draft_model.sample(input_ids, sequence_length=input_ids.shape[1] + 1)
-        except Exception as e:
-            logger.error(f"Draft model generation failed: {e}")
-            break
-        token_id = int(output[0, -1]) if not isinstance(output, (list, tuple)) else int(output[0][-1])
-        token_text = tokenizer.decode([token_id], clean_up_tokenization_spaces=False)
-        output_text += token_text
-        new_token_tensor = torch.tensor([[token_id]], dtype=input_ids.dtype)
-        input_ids = torch.cat([input_ids, new_token_tensor], dim=1)
-        tokens_generated += 1
-        if tokenizer.eos_token_id is not None and token_id == tokenizer.eos_token_id:
-            break
-    end_time = time.time() if profile else None
-    if profile and start_time is not None:
-        total_time = end_time - start_time
-        throughput = tokens_generated / total_time if total_time > 0 else float('inf')
-        logger.info(f"Draft model generation completed in {total_time:.2f} seconds. Throughput={throughput:.2f} t/s")
-    full_output = prompt + output_text
-    print("\n=== Final Output ===\n" + full_output)
-    return full_output
-
-
-def run_concurrent_clients(draft_model_name: str,
-                           target_host: str = "localhost",
-                           port: int = 50051,
-                           prompt_text_file: str = "",
-                           target_tokenizer: str = None,
-                           max_new_tokens: int = 50,
-                           sequence_length: int = 128,
-                           gamma: int = 4,
-                           profile: bool = False,
-                           no_target: bool = False,
-                           top_p: float = 0.9,
-                           temperature: float = 1.0):
-    # same as existing concurrency approach
-    if not os.path.exists(prompt_text_file):
-        logger.error(f"Prompt text file not found: {prompt_text_file}")
-        return
-    with open(prompt_text_file, 'r', encoding='utf-8') as f:
-        prompts = [line.strip() for line in f if line.strip()]
-    if not prompts:
-        logger.error("No valid lines in prompt file.")
-        return
-    logger.info(f"Loading draft model '{draft_model_name}' (sequence_length={sequence_length}) for concurrency...")
-    draft_model = load_model(
-        draft_model_name,
-        sequence_length=sequence_length,
-        spec_length=gamma
-    )
-    tokenizer_source = target_tokenizer or draft_model_name
-    tokenizer = AutoTokenizer.from_pretrained(tokenizer_source, use_fast=False)
-    address = f"{target_host}:{port}"
-    channel = None
-    stub = None
-    if not no_target:
-        logger.info(f"Connecting to target server at {address} for concurrency...")
-        channel = grpc.insecure_channel(address)
-        stub = inference_pb2_grpc.SpeculativeServiceStub(channel)
-    results = [None]*len(prompts)
-    threads = []
-
-    def worker(idx, prompt_text):
-        if no_target:
-            out = _run_standalone_draft(draft_model, tokenizer, prompt_text, max_new_tokens, profile)
-            results[idx] = out
-        else:
-            session_id = _gen_session_id()
-            stub.StartGeneration(
-                inference_pb2.StartRequest(
-                    session_id=session_id,
-                    prompt=prompt_text,
-                    max_new_tokens=max_new_tokens,
-                    gamma=gamma
-                )
-            )
-            logger.info(f"[Thread-{idx}] Starting speculative decoding with session_id={session_id}")
-            gen_text, perf_stats = speculative_decode(
-                draft_model, tokenizer, stub,
-                prompt_text, max_new_tokens, gamma,
-                profile=profile, top_p=top_p, temperature=temperature,
-                session_id=session_id
-            )
-            full_output = prompt_text + gen_text
-            results[idx] = full_output
-            if profile and perf_stats:
-                prefix = f"performance_speculative_prompt{idx}"
-                save_perf_stats(perf_stats, file_prefix=prefix)
-
-    for i, prompt_text in enumerate(prompts):
-        t = threading.Thread(target=worker, args=(i, prompt_text), daemon=True)
-        threads.append(t)
-        t.start()
-
-    for t in threads:
-        t.join()
-
-    print("\n=== Final Batched Outputs ===")
-    for i, text in enumerate(results):
-        print(f"\n[Prompt {i} Output]:\n{text}")
-
+    total_time = time.time() - start_time
+    logger.info(f"Distributed speculative decode completed in {total_time:.2f}s.")
 
 def _gen_session_id():
     return int(uuid.uuid4()) & 0xFFFFFFFF
