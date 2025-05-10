@@ -12,7 +12,6 @@ import queue
 import threading
 import uuid
 
-
 logger = logging.getLogger(__name__)
 if not logger.hasHandlers():
     h = logging.StreamHandler()
