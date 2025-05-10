@@ -79,17 +79,14 @@ def main():
         if model_name is None:
             logger.error("Please specify --model (target model path) for target role")
             return
-        # Launch the target model gRPC server
+        # Launch the target model gRPC server (vLLM interface)
         from inference import target_worker
         target_worker.run_server(
             model_name,
             port=args.port,
-            sequence_length=args.sequence_length,
-            spec_length=args.gamma,
-            profile=args.profile,
-            temperature=args.temperature,
-            top_p=args.top_p,
-            batch_size=args.batch,
+            max_num_seqs=args.batch,
+            max_model_len=args.sequence_length,
+            gamma=args.gamma,
         )
 
     elif args.role == "draft":
