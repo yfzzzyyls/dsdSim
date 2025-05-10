@@ -538,6 +538,3 @@ def run_client(
 
     total_time = time.time() - start_time
     logger.info(f"Distributed speculative decode completed in {total_time:.2f}s.")
-
-def _gen_session_id():
-    return int(uuid.uuid4()) & 0xFFFFFFFF

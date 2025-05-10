@@ -22,6 +22,9 @@ if not logger.hasHandlers():
     logger.addHandler(h)
     logger.setLevel(logging.INFO)
 
+def _gen_session_id():
+    return int(uuid.uuid4()) & 0xFFFFFFFF
+
 class TargetSession:
     def __init__(self, input_ids, row_idx: int):
         self.current_ids = input_ids  # Torch tensor [1, seq_len]
@@ -145,7 +148,7 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
             assert prompt_text is not None, \
                 f"Prompt text is required for session."
             # Generate a fresh, 32-bit random id
-            session_id = int(uuid.uuid4()) & 0xFFFFFFFF
+            session_id = _gen_session_id()
             enc = self.tokenizer(prompt_text, return_tensors='pt')
             current_ids = enc["input_ids"]
             # Allocate a free Neuron‑batch row for this session
