@@ -517,11 +517,18 @@ def run_client(
         )
         latency = time.time() - t0
         final_text = prompt_text + gen_text
+
+        # --------- NEW: compute real throughput ---------
+        tokens_out = perf_stats.get("tokens_generated", 0)
+        throughput  = tokens_out / latency if latency > 0 else 0.0
+        perf_stats["throughput"] = throughput
+        # -----------------------------------------------
+
         logger.info(
             "[Thread %d] completed in %.2fs, tokens=%d, throughput=%.2f t/s",
             prompt_idx, latency,
-            perf_stats.get("tokens_generated", 0),
-            perf_stats.get("throughput", 0.0),
+            tokens_out,
+            throughput,
         )
         return {
             "prompt_idx": prompt_idx,
