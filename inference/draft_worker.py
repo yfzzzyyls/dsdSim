@@ -518,9 +518,17 @@ def run_client(
         latency = time.time() - t0
         final_text = prompt_text + gen_text
 
-        # --------- NEW: compute real throughput ---------
-        tokens_out = perf_stats.get("tokens_generated", 0)
-        throughput  = tokens_out / latency if latency > 0 else 0.0
+        # ----- Compute per‑thread throughput -----
+        tokens_out = perf_stats.get("tokens_generated")
+        if tokens_out is None:
+            # Derive from accepted + target counts when profiling is off
+            tokens_out = (
+                perf_stats.get("accepted_tokens_total", 0) +
+                perf_stats.get("target_tokens_total", 0)
+            )
+            perf_stats["tokens_generated"] = tokens_out
+
+        throughput = tokens_out / latency if latency > 0 else 0.0
         perf_stats["throughput"] = throughput
         # -----------------------------------------------
 
