@@ -393,7 +393,7 @@ def compile_target_model(model_path: str,
         attention_layout      = "BSH",
         use_2d_cache_ids      = True,
         dynamic_batch_size    = False,      # build (len,1) and (len,2) heads
-        enable_chunked_prefill=False,
+        enable_chunked_prefill= True,
     )
     model.enable_speculative_decoder(SPEC_LENGTH_BUCKETS, BATCH_BUCKETS)
     model.to_neuron()
