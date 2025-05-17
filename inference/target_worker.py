@@ -26,7 +26,7 @@ def _gen_session_id():
     return int(uuid.uuid4()) & 0xFFFFFFFF
 
 class TargetSession:
-    def __init__(self, input_ids, row_idx: int):
+    def __init__(self, input_ids, row_idx: int, max_tokens: int):
         self.current_ids = input_ids  # Torch tensor [1, seq_len]
         self.finished = False
         self.tokens_generated = 0
@@ -37,6 +37,7 @@ class TargetSession:
         self.cache_id = torch.tensor([0], dtype=torch.int32)
         self.pending_logits = None
         self.row_idx = row_idx
+        self.max_tokens = max_tokens
 
     # ------------------------------------------------------------------
     # Accessors / mutators for session‑local KV pointer
@@ -153,7 +154,7 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
             current_ids = enc["input_ids"]
             # Allocate a free Neuron‑batch row for this session
             row_idx = self._allocate_row()
-            self.sessions[session_id] = TargetSession(current_ids, row_idx)
+            self.sessions[session_id] = TargetSession(current_ids, row_idx, max_tokens)
             # ------------------------------------------------------------------
             # Priming Neuron KV cache for *only* the newly‑allocated row
             # (avoid replaying prompts for other rows)
@@ -219,7 +220,7 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
         # Append committed ids to session's token history
         new_tok_tensor = torch.tensor([tok_ids], dtype=sess.current_ids.dtype)
         sess.current_ids = torch.cat([sess.current_ids, new_tok_tensor], dim=1)
-
+        sess.tokens_generated += len(tok_ids)
         # Optionally assert pointer is correct
         if self.eos_token_id is not None and any(t == self.eos_token_id for t in tok_ids):
             sess.finished = True
@@ -346,7 +347,10 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
 
         # Block until scheduler puts result
         committed_ids, accepted_cnt, verify_ms, finished = resp_q.get()
-
+        # If this session has now hit its max_tokens budget, force cleanup
+        sess = self.sessions.get(sid)
+        if sess is not None and sess.tokens_generated >= sess.max_tokens:
+            finished = True
         if finished:
             # Release Neuron batch row and clean up session
             sess = self.sessions.pop(sid, None)
