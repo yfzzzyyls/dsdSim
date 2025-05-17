@@ -347,6 +347,15 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
         # Block until scheduler puts result
         committed_ids, accepted_cnt, verify_ms, finished = resp_q.get()
 
+        if finished:
+            # Release Neuron batch row and clean up session
+            sess = self.sessions.pop(sid, None)
+            if sess is not None:
+                self._release_row(sess.row_idx)
+            # Remove rendezvous queue entry
+            self.result_queues.pop(sid, None)
+
+
         return inference_pb2.VerifyResponse(
             committed_ids=committed_ids,
             accepted_count=accepted_cnt,
