@@ -151,9 +151,6 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
         """
         # The adapter exposes the current per‑row KV pointer vector.
         model_vec = self.model.get_batched_cache_id_vec()
-        
-        assert self.model._next_pos is not None, \
-            "Model does not expose a batched KV pointer vector"
 
         row_idx = sess.row_idx
         if not (0 <= row_idx < model_vec.shape[0]):
