@@ -22,6 +22,19 @@ if not logger.hasHandlers():
     logger.addHandler(h)
     logger.setLevel(logging.INFO)
 
+# ───────────────────────────────────────────────────────────
+# Thread-local tokenizer pool – one instance per server thread
+# ───────────────────────────────────────────────────────────
+_TOKENIZER_LOCAL = threading.local()
+def get_thread_tokenizer(model_path: str):
+    """Return a tokenizer instance unique to the current thread."""
+    if not hasattr(_TOKENIZER_LOCAL, "tok"):
+        _TOKENIZER_LOCAL.tok = AutoTokenizer.from_pretrained(
+            model_path, use_fast=False
+        )
+    return _TOKENIZER_LOCAL.tok
+
+
 def _gen_session_id():
     return int(uuid.uuid4()) & 0xFFFFFFFF
 
@@ -71,8 +84,9 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
         )
         self.temperature = temperature
         self.top_p = top_p
-        self.tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=False)
-        self.eos_token_id = self.tokenizer.eos_token_id
+        self.model_path = model_path
+        tok = get_thread_tokenizer(model_path)
+        self.eos_token_id = tok.eos_token_id
         self._ctx_estimate = sequence_length
         self.sessions = {}  # session_id -> TargetSession
         # ------------------------------------------------------------------
@@ -150,7 +164,8 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
                 f"Prompt text is required for session."
             # Generate a fresh, 32-bit random id
             session_id = _gen_session_id()
-            enc = self.tokenizer(prompt_text, return_tensors='pt')
+            tok = get_thread_tokenizer(self.model_path)
+            enc = tok(prompt_text, return_tensors='pt')
             current_ids = enc["input_ids"]
             # Allocate a free Neuron‑batch row for this session
             row_idx = self._allocate_row()
@@ -311,6 +326,8 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
         """
         if not batch_reqs:
             return
+
+        tokenizer = get_thread_tokenizer(self.model_path)
 
         # Group tensors
         sess_list      = []
