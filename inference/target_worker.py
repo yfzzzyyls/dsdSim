@@ -500,16 +500,16 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
             #        and final committed chunk in **human‑readable words**
             # ----------------------------------------------------------
             draft_words = [
-                self.tokenizer.decode([tid], clean_up_tokenization_spaces=False)
+                tokenizer.decode([tid], clean_up_tokenization_spaces=False)
                 for tid in draft_tokens
             ]
             tgt_preds = torch.argmax(tgt_row_probs, dim=-1).tolist()
             tgt_words = [
-                self.tokenizer.decode([tid], clean_up_tokenization_spaces=False)
+                tokenizer.decode([tid], clean_up_tokenization_spaces=False)
                 for tid in tgt_preds
             ]
             committed_words = [
-                self.tokenizer.decode([tid], clean_up_tokenization_spaces=False)
+                tokenizer.decode([tid], clean_up_tokenization_spaces=False)
                 for tid in committed
             ]
             # status = (
