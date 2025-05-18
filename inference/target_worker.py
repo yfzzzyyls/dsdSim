@@ -142,11 +142,41 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
     #     return torch.cat([input_ids, pad_tokens], dim=1)
 
     def _sync_kv_pointer(self, sess: TargetSession):
-        pass
-        # TODO: implement pointer sync check
-        # if self.model.get_batched_cache_id_vec() is not None:
-        #     assert int(self.model.get_batched_cache_id_vec()[sess.row_idx].item()) == \
-        #            int(sess.get_session_cache_id().item()), "KV desync"
+        """
+        Verify that the Python‑side pointer stored in `sess.cache_id`
+        is identical to the Neuron model’s batched KV‑cache pointer for
+        this session’s row.  Any divergence means the session and model
+        are out of sync (likely a race or logic bug) and continuing
+        would corrupt text generation, so we raise immediately.
+        """
+        # The adapter exposes the current per‑row KV pointer vector.
+        model_vec = self.model.get_batched_cache_id_vec()
+        
+        assert self.model._next_pos is not None, \
+            "Model does not expose a batched KV pointer vector"
+
+        row_idx = sess.row_idx
+        if not (0 <= row_idx < model_vec.shape[0]):
+            raise AssertionError(
+                f"Row index {row_idx} is out of range for KV pointer "
+                f"vector of length {model_vec.shape[0]}"
+            )
+
+        model_ptr = int(model_vec[row_idx].item())
+        sess_ptr  = int(sess.get_session_cache_id().item())
+
+        if model_ptr != sess_ptr:
+            # Log first, then raise for immediate visibility.
+            logger.error(
+                "[KV‑DESYNC] session row=%d  model_ptr=%d  sess_ptr=%d",
+                row_idx, model_ptr, sess_ptr
+            )
+            raise AssertionError(
+                f"KV cache pointer mismatch on row {row_idx}: "
+                f"model={model_ptr} vs session={sess_ptr}"
+            )
+        # Optional noisy trace:
+        # logger.debug("[KV‑SYNC] row=%d ptr=%d", row_idx, model_ptr)
 
 
     def StartGeneration(self, request, context):
@@ -196,13 +226,8 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
             self.model.update_batched_cache(delta, row_idx)          # target‑side vector
             self.sessions[session_id].update_session_cache_id(delta) # session‑side scalar
 
-            # # ------------------------------------------------------------------
-            # logger.info(
-            #     "[StartGeneration] sid=%s L=%d row=%d session.cache_id=%s model.cache_vec=%s",
-            #     session_id, L_new, row_idx,
-            #     self.sessions[session_id].cache_id.tolist(),
-            #     self.model.get_batched_cache_id_vec().tolist(),
-            # )
+            # Sanity‑check KV pointer alignment after pre‑fill
+            self._sync_kv_pointer(self.sessions[session_id])
         return inference_pb2.StartResponse(acknowledged=True, session_id=session_id)
     
     def _commit_tokens_bulk(self, sess, tok_ids):
