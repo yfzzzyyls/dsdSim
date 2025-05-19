@@ -580,7 +580,7 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
             return
 
         tok = get_thread_tokenizer(self.model_path)
-        pad_id = tok.pad_token_id if tok.pad_token_id is not None else tok.eos_token_id
+        pad_id = 0
 
         # Build batched tensors with right‑padding
         max_len = max(j["input_ids"].shape[1] for j in jobs)
@@ -600,10 +600,26 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
                 pad = torch.full((1, max_len - L), pad_id, dtype=ids.dtype)
                 ids = torch.cat([ids, pad], dim=1)
 
-            vec = torch.arange(max_len, dtype=torch.int32).unsqueeze(0)
+            # ----------------------------------------------------------
+            # Build a cache-position vector that matches **real** tokens:
+            # real tokens → start_pos … start_pos+L-1
+            # pad tokens  → continue that arithmetic sequence.
+            # ----------------------------------------------------------
+            start_pos = int(sess.get_session_cache_id().item())  # 0 for brand-new row
+            vec_real  = torch.arange(start_pos, start_pos + L,
+                                     dtype=torch.int32).unsqueeze(0)   # (1, L)
+
+            if L < max_len:
+                pad_vec = torch.arange(start_pos + L,
+                                       start_pos + max_len,
+                                       dtype=torch.int32).unsqueeze(0)
+                vec = torch.cat([vec_real, pad_vec], dim=1)            # (1, max_len)
+            else:
+                vec = vec_real
+
             input_ids_lst.append(ids)
             cache_vecs_lst.append(vec)
-            start_ids_lst.append(sess.row_idx)
+            start_ids_lst.append(sess.row_idx)   # ← ensure start_ids tensor is built
 
         input_ids  = torch.cat(input_ids_lst, 0)
         cache_vecs = torch.cat(cache_vecs_lst, 0)
@@ -617,11 +633,18 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
                 start_ids=start_ids,
             )
 
-        # Update KV pointers per session
-        for (j, L_new) in zip(jobs, row_lengths):
+        # ------------------------------------------------------------------
+        # All rows were right‑padded to `max_len`, and we passed the fully
+        # padded tensor to `self.model.forward`.  That call advanced the
+        # Neuron‑side KV pointer by `max_len` for **every** row.  Therefore
+        # the Python‑side session pointer must advance by the *same* amount
+        # (max_len), not the original prompt length L_new; otherwise the
+        # two views drift and _sync_kv_pointer() will assert.
+        # ------------------------------------------------------------------
+        for j in jobs:
             sid  = j["session_id"]
             sess = self.sessions[sid]
-            delta = L_new
+            delta = max_len                       # ← use max_len for all rows
             self.model.update_batched_cache(delta, sess.row_idx)
             sess.update_session_cache_id(delta)
             self._sync_kv_pointer(sess)
