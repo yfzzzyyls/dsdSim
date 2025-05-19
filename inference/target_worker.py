@@ -12,6 +12,8 @@ import queue
 import threading
 import uuid
 from inference.model_loader import SPEC_LENGTH_BUCKETS   # available bucket lengths
+import collections
+import itertools
 
 logger = logging.getLogger(__name__)
 if not logger.hasHandlers():
@@ -92,9 +94,11 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
         # ------------------------------------------------------------------
         # Scheduler state (Stage‑2 incremental batching)
         # ------------------------------------------------------------------
-        self.verify_queue   = queue.Queue()               # (req_dict) items
+        self.job_queue      = queue.Queue()               # unified scheduler queue
         self.batch_timeout  = 0.03                             # seconds to wait for more peers
         self.max_batch      = batch_size                  # honour compile batch
+        # Window size for look‑ahead batching (8× batch is a common heuristic)
+        self.window_size   = 8 * self.max_batch
         # ----------------------------------------------------------
         # Row‑index pool for static‑batch Neuron graph
         # ----------------------------------------------------------
@@ -116,6 +120,7 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
             target=self._scheduler_loop, daemon=True
         )
         self._sched_thread.start()
+        self.model_mutex = torch.multiprocessing.Lock()
         self.lock = torch.multiprocessing.Lock()
 
     # ------------------------------------------------------------------
@@ -197,34 +202,12 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
             # Allocate a free Neuron‑batch row for this session
             row_idx = self._allocate_row()
             self.sessions[session_id] = TargetSession(current_ids, row_idx, max_tokens)
-            # ------------------------------------------------------------------
-            # Priming Neuron KV cache for *only* the newly‑allocated row
-            # (avoid replaying prompts for other rows)
-            # ------------------------------------------------------------------
-            ctx_len = self._ctx_estimate          # compile‑time context length (128)
-            row_idx = self.sessions[session_id].row_idx
-            L_new   = current_ids.shape[1]
-
-            # In continuous batching each sequence writes inside its own 0‑based slice,
-            # so cache_ids should start at 0 for a brand‑new row.
-            cache_vec = torch.arange(L_new, dtype=torch.int32,
-                                     device=current_ids.device).unsqueeze(0)  # (1, L_new)
-
-            # ---- Prefill only this row (batch size 1) ----
-            seq_ids = torch.tensor([row_idx], dtype=torch.int32, device=current_ids.device)
-            _ = self.model.forward(
-                input_ids=current_ids,
-                cache_ids=cache_vec,
-                start_ids=seq_ids           # pass logical sequence‑id
-            )
-
-            # ---- Advance KV pointer for *this* row only ----
-            delta = L_new
-            self.model.update_batched_cache(delta, row_idx)          # target‑side vector
-            self.sessions[session_id].update_session_cache_id(delta) # session‑side scalar
-
-            # Sanity‑check KV pointer alignment after pre‑fill
-            self._sync_kv_pointer(self.sessions[session_id])
+            # Enqueue a prefill job for the scheduler
+            self.job_queue.put({
+                "kind":        "prefill",
+                "session_id":  session_id,
+                "input_ids":   current_ids,
+            })
         return inference_pb2.StartResponse(acknowledged=True, session_id=session_id)
     
     def _commit_tokens_bulk(self, sess, tok_ids):
@@ -283,11 +266,12 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
         self.result_queues[sid] = resp_q
 
         # Enqueue work for the scheduler thread
-        self.verify_queue.put({
-            "session_id":    sid,
-            "draft_tokens":  draft_tokens,
-            "draft_probs":   draft_probs,
-            "enqueue_time":  start_verify_t,
+        self.job_queue.put({
+            "kind":         "decode",
+            "session_id":   sid,
+            "draft_tokens": draft_tokens,
+            "draft_probs":  draft_probs,
+            "enqueue_time": start_verify_t,
         })
 
         # Block until scheduler puts result
@@ -317,30 +301,58 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
     # ------------------------------------------------------------------
     def _scheduler_loop(self):
         """
-        Drain self.verify_queue; batch together all requests that (a) arrive
-        within self.batch_timeouts *or* (b) fill up to self.max_batch items.
-        For the first implementation we assume *all* requests use the same
-        γ (chunk length) so they share one compiled Neuron graph.
+        Unified scheduler: look at a sliding window of jobs and build
+        homogeneous micro‑batches (decode‑only OR prefill‑only).
+        Decode jobs always take priority because they are latency‑critical.
         """
-        pending = []
-        last_pop = time.monotonic()
+        pending: collections.deque = collections.deque()
+        last_prefill_run = time.monotonic()
         while True:
+            # 1) Pull at most one new job (non‑blocking after timeout)
             try:
-                # Non‑blocking get with small timeout so we can flush
-                req = self.verify_queue.get(timeout=self.batch_timeout)
-                pending.append(req)
-                # Flush if we filled the batch
-                flush = len(pending) >= self.max_batch
+                job = self.job_queue.get(timeout=self.batch_timeout)
+                pending.append(job)
             except queue.Empty:
-                flush = len(pending) > 0
+                pass   # nothing new; just evaluate current pending list
 
-            now = time.monotonic()
-            if flush or (pending and (now - last_pop) >= self.batch_timeout):
-                self._process_batch(pending)
-                pending.clear()
-                last_pop = now
+            if not pending:
+                continue   # nothing to do yet
 
-    def _process_batch(self, batch_reqs):
+            # 2) Examine the first WINDOW jobs (look‑ahead)
+            window = list(itertools.islice(pending, 0, self.window_size))
+            decodes  = [j for j in window if j["kind"] == "decode"]
+            prefills = [j for j in window if j["kind"] == "prefill"]
+
+            batch = []
+            # 3) Choose which job type to run
+            if decodes:
+                # latency‑critical path
+                while decodes and len(batch) < self.max_batch:
+                    j = decodes.pop(0)
+                    pending.remove(j)
+                    batch.append(j)
+                self._process_decode_batch(batch)
+            else:
+                # No decodes in window ⇒ run a prefill batch
+                while prefills and len(batch) < self.max_batch:
+                    j = prefills.pop(0)
+                    pending.remove(j)
+                    batch.append(j)
+                self._process_prefill_batch(batch)
+                last_prefill_run = time.monotonic()
+
+            # 4) Starvation guard: if we haven't run a prefill in 5 ms,
+            # force one next iteration (prevents long prompts starving)
+            time_since_prefill = time.monotonic() - last_prefill_run
+            if time_since_prefill > 0.005 and any(j["kind"] == "prefill" for j in pending):
+                # Move one prefill job to the front so it wins next round
+                for j in list(pending):
+                    if j["kind"] == "prefill":
+                        pending.remove(j)
+                        pending.appendleft(j)
+                        break
+
+    def _process_decode_batch(self, batch_reqs):
         """
         batch_reqs: List[dict] with keys session_id, draft_tokens, draft_probs.
         Performs one batched speculative_forward and writes result to each
@@ -555,6 +567,64 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
             self.result_queues[sid].put(
                 (committed, accepted_cnt, verify_ms, finished)
             )
+
+    def _process_prefill_batch(self, jobs):
+        """
+        Batched prompt prefill for brand‑new sessions.
+        Each job dict must contain:
+            kind:       "prefill"
+            session_id: int
+            input_ids:  (1, L) tensor
+        """
+        if not jobs:
+            return
+
+        tok = get_thread_tokenizer(self.model_path)
+        pad_id = tok.pad_token_id if tok.pad_token_id is not None else tok.eos_token_id
+
+        # Build batched tensors with right‑padding
+        max_len = max(j["input_ids"].shape[1] for j in jobs)
+        input_ids_lst = []
+        cache_vecs_lst = []
+        start_ids_lst  = []
+        row_lengths    = []
+
+        for j in jobs:
+            sid   = j["session_id"]
+            sess  = self.sessions[sid]
+            ids   = j["input_ids"]
+            L     = ids.shape[1]
+            row_lengths.append(L)
+
+            if L < max_len:
+                pad = torch.full((1, max_len - L), pad_id, dtype=ids.dtype)
+                ids = torch.cat([ids, pad], dim=1)
+
+            vec = torch.arange(max_len, dtype=torch.int32).unsqueeze(0)
+            input_ids_lst.append(ids)
+            cache_vecs_lst.append(vec)
+            start_ids_lst.append(sess.row_idx)
+
+        input_ids  = torch.cat(input_ids_lst, 0)
+        cache_vecs = torch.cat(cache_vecs_lst, 0)
+        start_ids  = torch.tensor(start_ids_lst, dtype=torch.int32, device=input_ids.device)
+
+        # One Neuron forward under mutex
+        with self.model_mutex:
+            _ = self.model.forward(
+                input_ids=input_ids,
+                cache_ids=cache_vecs,
+                start_ids=start_ids,
+            )
+
+        # Update KV pointers per session
+        for (j, L_new) in zip(jobs, row_lengths):
+            sid  = j["session_id"]
+            sess = self.sessions[sid]
+            delta = L_new
+            self.model.update_batched_cache(delta, sess.row_idx)
+            sess.update_session_cache_id(delta)
+            self._sync_kv_pointer(sess)
 
 def run_server(model_path, port=50051, sequence_length=128,
                spec_length=None, profile=False,
