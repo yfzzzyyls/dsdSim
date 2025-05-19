@@ -107,10 +107,17 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
 
         def _allocate_row():
             assert self._row_pool, "No free Neuron batch rows left"
-            return self._row_pool.pop(0)
+            row_idx = self._row_pool.pop(0)
+            # Ensure Neuron-side KV pointer for this row starts at 0.
+            # The previous session may have left it non‑zero.
+            self.model.batched_cache_ids[row_idx] = 0
+            return row_idx
 
         def _release_row(idx: int):
             self._row_pool.append(idx)
+            # Also reset the Neuron-side KV pointer so the next session
+            # starts from a clean slate.
+            self.model.batched_cache_ids[idx] = 0
 
         self._allocate_row = _allocate_row
         self._release_row  = _release_row
