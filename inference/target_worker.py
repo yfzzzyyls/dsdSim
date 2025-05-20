@@ -402,7 +402,8 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
             # choose the smallest bucket ≥ current γ+1, else fall back to largest
             desired_len = next((b for b in spec_buckets if b >= len(toks)),
                                spec_buckets[-1])
-            pad_id = 0
+            # Use the tokenizer's UNK token as padding so every model shares a valid embedding
+            pad_id = tokenizer.unk_token_id
             assert len(toks) <= desired_len, \
                 f"Batch size {real_B} compiled now should be the less than max_batch {self.max_batch}"
             if len(toks) < desired_len:                      # right-pad
@@ -583,7 +584,7 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
             return
 
         tok = get_thread_tokenizer(self.model_path)
-        pad_id = 0
+        pad_id = tok.unk_token_id   # use UNK token as padding
 
         # Build batched tensors with right‑padding
         max_len = max(j["input_ids"].shape[1] for j in jobs)
