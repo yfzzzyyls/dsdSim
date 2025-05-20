@@ -13,7 +13,7 @@ import threading
 import uuid
 from inference.model_loader import SPEC_LENGTH_BUCKETS   # available bucket lengths
 import collections
-import itertools
+
 
 logger = logging.getLogger(__name__)
 if not logger.hasHandlers():
@@ -23,6 +23,49 @@ if not logger.hasHandlers():
     h.setFormatter(fmt)
     logger.addHandler(h)
     logger.setLevel(logging.INFO)
+
+
+
+
+# ───────────────────────────────────────────────
+# Simple thread‑safe scheduler with peek + batch
+# ───────────────────────────────────────────────
+class Scheduler:
+    """
+    Internal queue for the target server.
+
+    • enqueue(job_dict) – append a job (dict with at least "kind").
+    • pop_batch(max_batch) – block up to batch_timeout and return
+      (kind, [jobs]) where all jobs share the same "kind" and the list
+      length ≤ max_batch.  FIFO order across kinds is preserved.
+    """
+    def __init__(self, batch_timeout: float = 0.03):
+        self._q   = collections.deque()
+        self._cv  = threading.Condition()
+        self._tmo = batch_timeout
+        self._seq = 0  # global FIFO sequence number
+
+    # ---------- producer ----------
+    def enqueue(self, job: dict):
+        with self._cv:
+            job["_seq"] = self._seq; self._seq += 1
+            self._q.append(job)
+            self._cv.notify()
+
+    # ---------- consumer ----------
+    def pop_batch(self, max_batch: int):
+        """Return (kind, batch_list) or (None, []) on timeout."""
+        with self._cv:
+            if not self._cv.wait_for(lambda: self._q, timeout=self._tmo):
+                return None, []
+
+            # Oldest job decides the batch kind
+            batch_kind = self._q[0]["kind"]
+            batch = []
+            while self._q and len(batch) < max_batch and self._q[0]["kind"] == batch_kind:
+                batch.append(self._q.popleft())
+            return batch_kind, batch
+
 
 # ───────────────────────────────────────────────────────────
 # Thread-local tokenizer pool – one instance per server thread
@@ -94,11 +137,9 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
         # ------------------------------------------------------------------
         # Scheduler state (Stage‑2 incremental batching)
         # ------------------------------------------------------------------
-        self.job_queue      = queue.Queue()               # unified scheduler queue
-        self.batch_timeout  = 0.03                             # seconds to wait for more peers
-        self.max_batch      = batch_size                  # honour compile batch
-        # Window size for look‑ahead batching (8× batch is a common heuristic)
-        self.window_size   = 8 * self.max_batch
+        self.batch_timeout  = 0.03
+        self.max_batch      = batch_size
+        self.scheduler      = Scheduler(batch_timeout=self.batch_timeout)        
         # ----------------------------------------------------------
         # Row‑index pool for static‑batch Neuron graph
         # ----------------------------------------------------------
@@ -108,16 +149,18 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
         def _allocate_row():
             assert self._row_pool, "No free Neuron batch rows left"
             row_idx = self._row_pool.pop(0)
-            # Ensure Neuron-side KV pointer for this row starts at 0.
-            # The previous session may have left it non‑zero.
-            self.model.batched_cache_ids[row_idx] = 0
+            # Fully rewind Neuron runtime pointer for this row.
+            old_ptr = int(self.model.get_batched_cache_id_vec()[row_idx].item())
+            if old_ptr:
+                self.model.update_batched_cache(-old_ptr, row_idx)
             return row_idx
 
         def _release_row(idx: int):
             self._row_pool.append(idx)
-            # Also reset the Neuron-side KV pointer so the next session
-            # starts from a clean slate.
-            self.model.batched_cache_ids[idx] = 0
+            # Rewind Neuron runtime pointer before recycling this row.
+            current_ptr = int(self.model.get_batched_cache_id_vec()[idx].item())
+            if current_ptr:
+                self.model.update_batched_cache(-current_ptr, idx)
 
         self._allocate_row = _allocate_row
         self._release_row  = _release_row
@@ -154,7 +197,7 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
         if model_ptr != sess_ptr:
             # Log first, then raise for immediate visibility.
             logger.error(
-                "[KV‑DESYNC] session row=%d  model_ptr=%d  sess_ptr=%d",
+                "[KV-DESYNC] session row=%d  model_ptr=%d  sess_ptr=%d",
                 row_idx, model_ptr, sess_ptr
             )
             raise AssertionError(
@@ -187,7 +230,7 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
             row_idx = self._allocate_row()
             self.sessions[session_id] = TargetSession(current_ids, row_idx, max_tokens)
             # Enqueue a prefill job for the scheduler
-            self.job_queue.put({
+            self.scheduler.enqueue({
                 "kind":        "prefill",
                 "session_id":  session_id,
                 "input_ids":   current_ids,
@@ -250,7 +293,7 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
         self.result_queues[sid] = resp_q
 
         # Enqueue work for the scheduler thread
-        self.job_queue.put({
+        self.scheduler.enqueue({
             "kind":         "decode",
             "session_id":   sid,
             "draft_tokens": draft_tokens,
@@ -285,56 +328,22 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
     # ------------------------------------------------------------------
     def _scheduler_loop(self):
         """
-        Unified scheduler: look at a sliding window of jobs and build
-        homogeneous micro‑batches (decode‑only OR prefill‑only).
-        Decode jobs always take priority because they are latency‑critical.
+        Consumer loop: pop homogeneous batches from Scheduler and
+        dispatch them to the appropriate processing routine.
         """
-        pending: collections.deque = collections.deque()
-        last_prefill_run = time.monotonic()
+
         while True:
-            # 1) Pull at most one new job (non‑blocking after timeout)
-            try:
-                job = self.job_queue.get(timeout=self.batch_timeout)
-                pending.append(job)
-            except queue.Empty:
-                pass   # nothing new; just evaluate current pending list
+            kind, batch = self.scheduler.pop_batch(self.max_batch)
+            if not batch:
+                continue  # timeout – retry
 
-            if not pending:
-                continue   # nothing to do yet
-
-            # 2) Examine the first WINDOW jobs (look‑ahead)
-            window = list(itertools.islice(pending, 0, self.window_size))
-            decodes  = [j for j in window if j["kind"] == "decode"]
-            prefills = [j for j in window if j["kind"] == "prefill"]
-
-            batch = []
-            # 3) Choose which job type to run
-            if decodes:
-                # latency‑critical path
-                while decodes and len(batch) < self.max_batch:
-                    j = decodes.pop(0)
-                    pending.remove(j)
-                    batch.append(j)
+            if kind == "decode":
                 self._process_decode_batch(batch)
-            else:
-                # No decodes in window ⇒ run a prefill batch
-                while prefills and len(batch) < self.max_batch:
-                    j = prefills.pop(0)
-                    pending.remove(j)
-                    batch.append(j)
+            elif kind == "prefill":
                 self._process_prefill_batch(batch)
-                last_prefill_run = time.monotonic()
+            else:
+                raise RuntimeError("Scheduler returned unknown kind '%s'", kind)
 
-            # 4) Starvation guard: if we haven't run a prefill in 5 ms,
-            # force one next iteration (prevents long prompts starving)
-            time_since_prefill = time.monotonic() - last_prefill_run
-            if time_since_prefill > 0.005 and any(j["kind"] == "prefill" for j in pending):
-                # Move one prefill job to the front so it wins next round
-                for j in list(pending):
-                    if j["kind"] == "prefill":
-                        pending.remove(j)
-                        pending.appendleft(j)
-                        break
 
     def _process_decode_batch(self, batch_reqs):
         """
