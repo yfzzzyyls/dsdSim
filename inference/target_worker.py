@@ -62,8 +62,18 @@ class Scheduler:
             # Oldest job decides the batch kind
             batch_kind = self._q[0]["kind"]
             batch = []
-            while self._q and len(batch) < max_batch and self._q[0]["kind"] == batch_kind:
-                batch.append(self._q.popleft())
+
+            # Scan the deque and collect up-to max_batch jobs of that kind,
+            # even if other kinds are interleaved.  Non-matching jobs stay
+            # in place so their FIFO order is preserved.
+            i = 0
+            while i < len(self._q) and len(batch) < max_batch:
+                if self._q[i]["kind"] == batch_kind:
+                    batch.append(self._q[i])
+                    del self._q[i]            # remove selected job; next element shifts into i
+                    # Do NOT increment i so we examine the new element now at index i
+                else:
+                    i += 1                    # skip different-kind job
             return batch_kind, batch
 
 
