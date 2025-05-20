@@ -27,6 +27,7 @@ if not logger.hasHandlers():
 
 
 
+
 # ───────────────────────────────────────────────
 # Simple thread‑safe scheduler with peek + batch
 # ───────────────────────────────────────────────
@@ -89,6 +90,16 @@ def get_thread_tokenizer(model_path: str):
         )
     return _TOKENIZER_LOCAL.tok
 
+# ----------------------------------------------------------------------
+# Utility: count how many *real* (non-pad) tokens are in each row.
+# ----------------------------------------------------------------------
+def count_real_tokens(input_ids: torch.Tensor, pad_id: int = 0) -> torch.Tensor:
+    """
+    Return a 1-D tensor where each element is the number of tokens in the
+    corresponding row of `input_ids` that are NOT equal to `pad_id`.
+    Shape (batch_size,)
+    """
+    return (input_ids != pad_id).sum(dim=1)
 
 def _gen_session_id():
     return int(uuid.uuid4()) & 0xFFFFFFFF
@@ -596,11 +607,12 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
             sid   = j["session_id"]
             sess  = self.sessions[sid]
             ids   = j["input_ids"]
-            L     = ids.shape[1]
-            row_lengths.append(L)
+            # Count *non-pad* tokens for this row
+            L_real = int(count_real_tokens(ids, pad_id=pad_id).item())
+            row_lengths.append(L_real)
 
-            if L < max_len:
-                pad = torch.full((1, max_len - L), pad_id, dtype=ids.dtype)
+            if L_real < max_len:
+                pad = torch.full((1, max_len - L_real), pad_id, dtype=ids.dtype)
                 ids = torch.cat([ids, pad], dim=1)
 
             # ----------------------------------------------------------
@@ -609,11 +621,11 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
             # pad tokens  → continue that arithmetic sequence.
             # ----------------------------------------------------------
             start_pos = int(sess.get_session_cache_id().item())  # 0 for brand-new row
-            vec_real  = torch.arange(start_pos, start_pos + L,
+            vec_real  = torch.arange(start_pos, start_pos + L_real,
                                      dtype=torch.int32).unsqueeze(0)   # (1, L)
 
-            if L < max_len:
-                pad_vec = torch.arange(start_pos + L,
+            if L_real < max_len:
+                pad_vec = torch.arange(start_pos + L_real,
                                        start_pos + max_len,
                                        dtype=torch.int32).unsqueeze(0)
                 vec = torch.cat([vec_real, pad_vec], dim=1)            # (1, max_len)
@@ -636,18 +648,15 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
                 start_ids=start_ids,
             )
 
+        # Neuron only counts non-pad tokens, so advance each KV pointer
+        # by the true prompt length stored in row_lengths[idx].
         # ------------------------------------------------------------------
-        # All rows were right‑padded to `max_len`, and we passed the fully
-        # padded tensor to `self.model.forward`.  That call advanced the
-        # Neuron‑side KV pointer by `max_len` for **every** row.  Therefore
-        # the Python‑side session pointer must advance by the *same* amount
-        # (max_len), not the original prompt length L_new; otherwise the
-        # two views drift and _sync_kv_pointer() will assert.
-        # ------------------------------------------------------------------
-        for j in jobs:
+        # Advance each session’s KV pointer by its real prompt length, not by
+        # the padded bucket length.
+        for idx, j in enumerate(jobs):
             sid  = j["session_id"]
             sess = self.sessions[sid]
-            delta = max_len                       # ← use max_len for all rows
+            delta = row_lengths[idx]              # real (unpadded) length
             self.model.update_batched_cache(delta, sess.row_idx)
             sess.update_session_cache_id(delta)
             self._sync_kv_pointer(sess)
