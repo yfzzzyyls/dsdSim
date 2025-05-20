@@ -281,17 +281,18 @@ def compile_model(model_path: str,
         # Ensure tokenizer & configs have an explicit PAD token.
         # This silences HF warnings and lets Neuron skip attention‑mask logic.
         # ------------------------------------------------------------------
-        tokenizer = AutoTokenizer.from_pretrained(model_path,
-                                                  trust_remote_code=True,
-                                                  use_fast=False)
-        if tokenizer.pad_token is None:
-            tokenizer.pad_token = tokenizer.eos_token           # reuse </s>
-        # Make the id available everywhere
-        tokenizer.pad_token_id = tokenizer.eos_token_id
+        tokenizer = AutoTokenizer.from_pretrained(
+            model_path, trust_remote_code=True, use_fast=False
+        )
+        # ----------------------------------------------------------
+        # Standardise: always use ID 0 as the PAD token so every
+        # component agrees (draft, target, scheduler).
+        # ----------------------------------------------------------
+        tokenizer.pad_token_id = 0
+        tokenizer.pad_token    = tokenizer.convert_ids_to_tokens(0)
         hf_config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
-        if hf_config.pad_token_id is None:
-            hf_config.pad_token_id = tokenizer.pad_token_id
-        model.config.pad_token_id = hf_config.pad_token_id
+        hf_config.pad_token_id = 0
+        model.config.pad_token_id = 0
         adapter = HuggingFaceGenerationModelAdapter(hf_config, model)
         # --------------------------------------------------------------
         # DEBUG: Inspect raw Neuron model output shape *before* wrapping
@@ -331,9 +332,11 @@ def compile_model(model_path: str,
     else:
         model = AutoModelForCausalLM.from_pretrained(model_path)
         tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=False)
-        if tokenizer.pad_token is None:
-            tokenizer.pad_token = tokenizer.eos_token
-        tokenizer.pad_token_id = tokenizer.eos_token_id
+        tokenizer.pad_token_id = 0
+        tokenizer.pad_token    = tokenizer.convert_ids_to_tokens(0)
+        # Optionally set config pad_token_id if available
+        if hasattr(model, "config"):
+            model.config.pad_token_id = 0
         logger.info("Non‑Neuron path: loaded model & tokenizer; skipping on‑disk save because we re‑compile on every run.")
         return NeuronHFAdapterWrap(HuggingFaceGenerationModelAdapter(model.config, model), batch_size=batch_size)
     
@@ -406,8 +409,9 @@ def compile_target_model(model_path: str,
                                               trust_remote_code=True,
                                               use_fast=False)
     if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-    tokenizer.pad_token_id = tokenizer.eos_token_id
+        pad_tok_string = tokenizer.convert_ids_to_tokens(0)
+        tokenizer.pad_token = pad_tok_string
+    tokenizer.pad_token_id = 0
 
     hf_config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
     if hf_config.pad_token_id is None:

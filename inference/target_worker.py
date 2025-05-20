@@ -130,29 +130,6 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
         self.model_mutex = torch.multiprocessing.Lock()
         self.lock = torch.multiprocessing.Lock()
 
-    # ------------------------------------------------------------------
-    # Utility: right‑pad an (1, L) tensor with zeros to ctx_estimate
-    # ------------------------------------------------------------------
-    # def _pad_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
-    #     seq_len = input_ids.shape[1]
-    #     if seq_len >= self._ctx_estimate:
-    #         return input_ids                   # long enough
-    #     pad_len = self._ctx_estimate - seq_len
-
-    #     # ① choose a *legal* pad-id
-    #     pad_id = self.tokenizer.pad_token_id
-    #     if pad_id is None:                    # just in case
-    #         pad_id = self.tokenizer.eos_token_id
-
-    #     # ② fill token pad with pad_id  (keep -1 only for cache_id)
-    #     pad_tokens = torch.full(
-    #         (1, pad_len),
-    #         pad_id,
-    #         dtype=input_ids.dtype,
-    #         device=input_ids.device,
-    #     )
-    #     return torch.cat([input_ids, pad_tokens], dim=1)
-
     def _sync_kv_pointer(self, sess: TargetSession):
         """
         Verify that the Python‑side pointer stored in `sess.cache_id`
