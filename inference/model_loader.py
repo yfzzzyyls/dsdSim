@@ -289,9 +289,16 @@ def compile_model(model_path: str,
         # component agrees (draft, target, scheduler).
         # ----------------------------------------------------------
         # Use UNK as the padding token so every component shares an existing embedding
+        # after loading the tokenizer …
         unk_id = tokenizer.unk_token_id
+        if unk_id is None:
+            # some LLaMA checkpoints have no reserved UNK; add one
+            tokenizer.add_special_tokens({"unk_token": "<unk>"})
+            unk_id = tokenizer.unk_token_id          # grab the new id
+
+        # set PAD → UNK
         tokenizer.pad_token_id = unk_id
-        tokenizer.pad_token    = tokenizer.convert_ids_to_tokens(unk_id)
+        tokenizer.pad_token    = tokenizer.convert_ids_to_tokens([unk_id])[0]
         hf_config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
         hf_config.pad_token_id = unk_id
         model.config.pad_token_id = unk_id
