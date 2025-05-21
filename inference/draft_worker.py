@@ -261,12 +261,19 @@ def speculative_decode(
         target_tokens_total += max(0, len(commit_ids) - accepted_count)
 
 
-        # 2) Forward **one** bonus token; accepted tokens already occupy 0…A‑1.
-        bonus_id = commit_ids[-1]           # always present
+        # 2) Forward **one** bonus token only if we actually committed tokens
+        #    this round.  An empty commit_ids means the target rejected the
+        #    entire draft chunk (rare but possible).
+        if not commit_ids:
+            # Shrink γ to encourage smaller speculative chunks next loop
+            current_gamma = max(1, current_gamma // 2)
+            logger.debug("[session=%s] empty commit, gamma→%d", session_id, current_gamma)
+            continue
+
+        bonus_id = commit_ids[-1]
         scratch_token[0, 0] = bonus_id
 
-        # ============================================================
-        # set bonus id to the next beginning of generating new draft tokens
+        # Set the last committed token as the new context token for draft model
         prev_token_id = bonus_id
         # ==============================================================
         # # 3) Advance pointer past the newly‑written bonus token.

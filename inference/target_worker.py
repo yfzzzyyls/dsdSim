@@ -11,7 +11,7 @@ from transformers.generation import LogitsProcessorList, SuppressTokensLogitsPro
 import queue
 import threading
 import uuid
-from inference.model_loader import SPEC_LENGTH_BUCKETS   # available bucket lengths
+from inference.model_loader import SPEC_LENGTH_BUCKETS, BATCH_BUCKETS   # available bucket lengths
 import collections
 
 
@@ -105,7 +105,8 @@ def _gen_session_id():
     return int(uuid.uuid4()) & 0xFFFFFFFF
 
 class TargetSession:
-    def __init__(self, input_ids, row_idx: int, max_tokens: int):
+    def __init__(self, session_id: int, input_ids, row_idx: int, max_tokens: int):
+        self.session_id = session_id
         self.current_ids = input_ids  # Torch tensor [1, seq_len]
         self.finished = False
         self.tokens_generated = 0
@@ -167,24 +168,6 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
         # TODO: make this dynamic, now hardcoded to 2 rows
         self._row_pool = list(range(2))          # free rows 0…B‑1
 
-        def _allocate_row():
-            assert self._row_pool, "No free Neuron batch rows left"
-            row_idx = self._row_pool.pop(0)
-            # Fully rewind Neuron runtime pointer for this row.
-            old_ptr = int(self.model.get_batched_cache_id_vec()[row_idx].item())
-            if old_ptr:
-                self.model.update_batched_cache(-old_ptr, row_idx)
-            return row_idx
-
-        def _release_row(idx: int):
-            self._row_pool.append(idx)
-            # Rewind Neuron runtime pointer before recycling this row.
-            current_ptr = int(self.model.get_batched_cache_id_vec()[idx].item())
-            if current_ptr:
-                self.model.update_batched_cache(-current_ptr, idx)
-
-        self._allocate_row = _allocate_row
-        self._release_row  = _release_row
         # map session_id -> Queue for the blocking VerifyDraftTokens call
         self.result_queues  = {}
         self._sched_thread  = threading.Thread(
@@ -193,6 +176,36 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
         self._sched_thread.start()
         self.model_mutex = torch.multiprocessing.Lock()
         self.lock = torch.multiprocessing.Lock()
+
+    def _allocate_row(self):
+        assert self._row_pool, "No free Neuron batch rows left"
+        row_idx = self._row_pool.pop(0)
+        # Fully rewind Neuron runtime pointer for this row.
+        old_ptr = int(self.model.get_batched_cache_id_vec()[row_idx].item())
+        if old_ptr:
+            self.model.update_batched_cache(-old_ptr, row_idx)
+        return row_idx
+
+    def _release_row(self, idx: int):
+        self._row_pool.append(idx)
+        # Rewind Neuron runtime pointer before recycling this row.
+        current_ptr = int(self.model.get_batched_cache_id_vec()[idx].item())
+        if current_ptr:
+            self.model.update_batched_cache(-current_ptr, idx)
+
+    # -----------------------------  FINALIZE  -----------------------------
+    def _finalize_session(self, sid: int):
+        """
+        Idempotent cleanup: free the Neuron batch row and remove all
+        session-specific state. Safe to call multiple times.
+        """
+        sess = self.sessions.pop(sid, None)
+        if sess is not None:
+            try:
+                self._release_row(sess.row_idx)
+            except Exception as e:
+                logger.warning("Ignoring error while releasing row %s: %s",
+                               sess.row_idx, e)
 
     def _sync_kv_pointer(self, sess: TargetSession):
         """
@@ -249,7 +262,7 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
             current_ids = enc["input_ids"]
             # Allocate a free Neuron‑batch row for this session
             row_idx = self._allocate_row()
-            self.sessions[session_id] = TargetSession(current_ids, row_idx, max_tokens)
+            self.sessions[session_id] = TargetSession(session_id, current_ids, row_idx, max_tokens)
             # Enqueue a prefill job for the scheduler
             self.scheduler.enqueue({
                 "kind":        "prefill",
@@ -292,7 +305,7 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
         # Optionally assert pointer is correct
         if self.eos_token_id is not None and any(t == self.eos_token_id for t in tok_ids):
             sess.finished = True
-            self._release_row(sess.row_idx)
+            self._finalize_session(sess.session_id)
 
     def VerifyDraftTokens(self, request, context):
         """
@@ -329,13 +342,7 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
         if sess is not None and sess.tokens_generated >= sess.max_tokens:
             finished = True
         if finished:
-            # Release Neuron batch row and clean up session
-            sess = self.sessions.pop(sid, None)
-            if sess is not None:
-                self._release_row(sess.row_idx)
-            # Remove rendezvous queue entry
-            self.result_queues.pop(sid, None)
-
+            self._finalize_session(sid)
 
         return inference_pb2.VerifyResponse(
             committed_ids=committed_ids,
@@ -358,13 +365,25 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
             if not batch:
                 continue  # timeout – retry
 
-            if kind == "decode":
-                self._process_decode_batch(batch)
-            elif kind == "prefill":
-                self._process_prefill_batch(batch)
-            else:
-                raise RuntimeError("Scheduler returned unknown kind '%s'", kind)
-
+            try:
+                if kind == "decode":
+                    self._process_decode_batch(batch)
+                elif kind == "prefill":
+                    self._process_prefill_batch(batch)
+                else:
+                    raise RuntimeError(f"Scheduler returned unknown kind '{kind}'")
+            except Exception as e:
+                logger.error("Scheduler batch error: %s", e, exc_info=True)
+                for j in batch:
+                    sid = j.get("session_id")
+                    q = self.result_queues.get(sid)
+                    if q is not None:
+                        try:
+                            q.put_nowait(([], 0, 0.0, True))  # sentinel
+                        except queue.Full:
+                            pass
+                    self._finalize_session(sid)
+                continue
 
     def _process_decode_batch(self, batch_reqs):
         """
@@ -577,14 +596,16 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
             self._commit_tokens_bulk(sess, committed)
             finished = sess.finished
 
-            # Respond to the waiting gRPC handler
-            self.result_queues[sid].put(
-                (committed, accepted_cnt, verify_ms, finished)
-            )
+            resp_q = self.result_queues.get(sid)
+            if resp_q is not None:
+                resp_q.put((committed, accepted_cnt, verify_ms, finished))
+                if finished:
+                    # After delivering the final response, remove the queue
+                    self.result_queues.pop(sid, None)
 
     def _process_prefill_batch(self, jobs):
         """
-        Batched prompt prefill for brand‑new sessions.
+        Batched prompt prefill for brand-new sessions.
         Each job dict must contain:
             kind:       "prefill"
             session_id: int
@@ -628,7 +649,7 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
                 pad_vec = torch.arange(start_pos + L_real,
                                        start_pos + max_len,
                                        dtype=torch.int32).unsqueeze(0)
-                vec = torch.cat([vec_real, pad_vec], dim=1)            # (1, max_len)
+                vec = torch.cat([vec_real, pad_vec], dim=1)           
             else:
                 vec = vec_real
 
