@@ -462,7 +462,7 @@ def run_client(
         )
         model_path_str = draft_model_name
     else:
-        TypeError("draft_model_name must be a string (path).")
+        raise TypeError("draft_model_name must be a string (path).")
         # never happens in Neuron
         # already a model instance
         draft_model = draft_model_name
