@@ -165,8 +165,8 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
         # ----------------------------------------------------------
         # Row‑index pool for static‑batch Neuron graph
         # ----------------------------------------------------------
-        # TODO: make this dynamic, now hardcoded to 2 rows
-        self._row_pool = list(range(2))          # free rows 0…B‑1
+        # Use the maximum bucket size for the row pool.
+        self._row_pool = list(range(max(BATCH_BUCKETS)))  # free rows 0…max bucket‑1
 
         # map session_id -> Queue for the blocking VerifyDraftTokens call
         self.result_queues  = {}
