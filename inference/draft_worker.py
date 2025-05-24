@@ -17,9 +17,9 @@ from transformers_neuronx import sampling
 
 logger = logging.getLogger(__name__)
 
-# Repetition‑penalty strength (0 < α ≤ 1).  Smaller → stronger penalty
+# Repetition penalty strength (0 < α ≤ 1). Smaller → stronger penalty
 REP_PENALTY = 0.4
-NGRAM_WINDOW = 3    # penalise 1‑ to 3‑gram repeats
+NGRAM_WINDOW = 3    # penalise 1 to 3 gram repeats
 TOP_K = 128
 
 if not logger.hasHandlers():
@@ -51,7 +51,7 @@ def speculative_decode(
     # Derive valid gammas and gamma_max from the bucket list
     valid_gammas = tuple(b - 1 for b in SPEC_LENGTH_BUCKETS if b > 1)
 
-    # Fail fast if the global bucket list is mis‑configured
+    # Fail fast if the global bucket list is misconfigured
     if not valid_gammas:
         raise ValueError(
             "SPEC_LENGTH_BUCKETS must contain integers > 1; "
@@ -90,19 +90,17 @@ def speculative_decode(
     assert prompt_ids is not None, "Prompt tokenization failed due to empty input."
     prev_token_id = int(prompt_ids[0, -1].item())
 
-    # --------------------------------------------------------------
-    # Per‑stage timing buckets (all values in seconds)
-    # --------------------------------------------------------------
+    # Per stage timing buckets (all values in seconds)
     timing = {
         "draft_prefill_time":       0.0,
         "draft_generation_time":    0.0,
         "grpc_roundtrip_time":      0.0,   # pure network + (de)serialisation latency
-        "target_verification_time": 0.0,   # server‑side compute only
-        "target_prefill_time":      0.0,   # server‑side prefill time
-        "sampling_filter_time":     0.0,   # time spent on n‑gram mask + top‑k/p filter
+        "target_verification_time": 0.0,   # server side compute only
+        "target_prefill_time":      0.0,   # server side prefill time
+        "sampling_filter_time":     0.0,   # time spent on n gram mask + top k/p filter
     }
     
-    # Feed the prompt so Neuron caches 0…L‑1, then set pointer to NEXT index (=L)
+    # Feed the prompt so Neuron caches 0…L-1, then set pointer to NEXT index (=L)
     # build the KV cache for the prompt
     time_draftprefill = time.perf_counter()
     L = prompt_ids.shape[1]
@@ -110,9 +108,9 @@ def speculative_decode(
     _ = draft_model.forward(
         input_ids=prompt_ids,
         cache_ids=cache_vec,          # avoid AttributeError in Neuron _prepare_for_par_ctx_rhs_padding
-    )                                 # fills 0…L‑1
+    )                                 # fills 0…L-1
     timing["draft_prefill_time"] += time.perf_counter() - time_draftprefill
-    # Overwrite cache pointer with a single‑index tensor [L]
+    # Overwrite cache pointer with a single index tensor [L]
     draft_model.update_cache(L)
 
     tokens_generated = 0
@@ -145,7 +143,7 @@ def speculative_decode(
             logits, _ = draft_model.forward(input_ids=scratch_token, cache_ids=cache_vec)
             timing["draft_generation_time"] += time.perf_counter() - time_draftgen
 
-            # Temperature‑scale logits then apply classic nucleus (top‑p) filter
+            # Temperature scale logits then apply classic nucleus (top p) filter
             time_sample = time.perf_counter()
             # apply ngram filter
             masked = sampling.filter_ngrams(
@@ -158,7 +156,7 @@ def speculative_decode(
             # apply temperature scaling
             logits = logits / current_temp
 
-            # apply top‑k and top‑p filtering
+            # apply top k and top p filtering
             masked, candidate_idx = sampling.top_k_top_p_filtering(
                 logits.unsqueeze(0),             # (1, V) expected
                 top_k=TOP_K,
@@ -196,7 +194,7 @@ def speculative_decode(
         # Ensure we pad the probabilities to match
         padded_probs = speculative_probs + [0.0] * (len(padded_tokens) - len(speculative_probs))
 
-        # ----- measure RPC round‑trip and split into network vs. verify compute -----
+        # measure RPC round trip and split into network vs. verify compute
         time_roundtrip = time.perf_counter()
         commit_ids, accepted_count, verify_time_ms, target_finished = grpc_client.verify_draft_tokens(
             stub, padded_tokens, padded_probs, session_id=session_id
@@ -213,36 +211,17 @@ def speculative_decode(
         # Only consider acceptances up to the original draft length (ignore padded tokens)
         actual_accepted = min(accepted_count, original_length)
         
-        # PID controller for gamma adjustment (only after stability period)
-        if original_length > 0 and iterations_completed >= stability_period:  # Avoid division by zero
-            acceptance_rate = actual_accepted / original_length
-            
-            # PID controller update
-            error = target_accept - acceptance_rate
-            pid_integral += error
-            pid_derivative = error - pid_prev_error
-            
-            gamma_adjustment = pid_kp * error + pid_ki * pid_integral + pid_kd * pid_derivative
-            
-            # Limit the maximum change per step for stability
-            gamma_adjustment = max(-max_gamma_change, min(max_gamma_change, gamma_adjustment))
-            
-            # Update gamma (clamp to valid range)
-            new_gamma = current_gamma + gamma_adjustment
-            current_gamma = max(1, min(gamma_max, round(new_gamma)))
-            
-            pid_prev_error = error
-            
-            logger.debug(f"[session={session_id}] Acceptance rate: {acceptance_rate:.3f}, "
-                       f"adjusted gamma: {current_gamma}")
+        # PID controller for gamma adjustment (DISABLED for debugging)
+        # Keep gamma stable at the initial value to isolate target worker issues
+        # if original_length > 0 and iterations_completed >= stability_period:
+        #     acceptance_rate = actual_accepted / original_length
+        #     # ... PID logic disabled ...
         
         iterations_completed += 1
 
-        # ------------------------------------------------------------------
         # Respect the remaining token budget so we never exceed max_new_tokens.
         # If the target returned more tokens than we can still emit, truncate
-        # the commit list *before* we touch any state‑tracking counters.
-        # ------------------------------------------------------------------
+        # the commit list *before* we touch any state tracking counters.
         tokens_generated += len(commit_ids)
         remaining_budget = max_new_tokens - tokens_generated
         if remaining_budget <= 0:
@@ -260,9 +239,9 @@ def speculative_decode(
         # Track how many tokens were generated by the target model this loop
         target_tokens_total += max(0, len(commit_ids) - actual_accepted)
 
-        # 2) Forward **one** bonus token only if we actually committed tokens
-        #    this round.  An empty commit_ids means the target rejected the
-        #    entire draft chunk (rare but possible).
+        # Forward **one** bonus token only if we actually committed tokens
+        # this round. An empty commit_ids means the target rejected the
+        # entire draft chunk (rare but possible).
         if not commit_ids:
             # Shrink γ to encourage smaller speculative chunks next loop
             current_gamma = max(1, current_gamma // 2)
@@ -291,7 +270,7 @@ def speculative_decode(
         logger.debug("ACCEPT cnt=%d  committed=%s",
              actual_accepted,
              speculative_tokens[:actual_accepted])
-        # Propagate server‑side finished flag
+        # Propagate server side finished flag
         finished = finished or target_finished
 
         if target_finished or tokens_generated >= max_new_tokens:
@@ -300,7 +279,7 @@ def speculative_decode(
     # Build final text
     generated_text = tokenizer.decode(
             output_tokens[-tokens_generated:],
-            skip_special_tokens=True,               # ← strip EOS / PAD / BOS
+            skip_special_tokens=True,               # strip EOS / PAD / BOS
             clean_up_tokenization_spaces=False,
         ) if output_tokens else ""
 
@@ -426,9 +405,7 @@ def run_client(
         f"Gamma {gamma} is less than the minimum supported length "
         f"(1). Please choose a larger value."
     )
-    # ------------------------------------------------------------------
-    # Stage‑1: load the target model and start the gRPC server
-    # ------------------------------------------------------------------
+    
     logger.info(f"Loading draft model '{draft_model_name}' (sequence_length={sequence_length}) for speculative decoding...")
     if isinstance(draft_model_name, str):
         # draft_model_name is a path → load the model
@@ -441,11 +418,6 @@ def run_client(
         model_path_str = draft_model_name
     else:
         raise TypeError("draft_model_name must be a string (path).")
-        # never happens in Neuron
-        # already a model instance
-        draft_model = draft_model_name
-        # try to recover a path for tokenizer fallback
-        model_path_str = getattr(getattr(draft_model, "config", None), "_name_or_path", None)
 
     # Decide which tokenizer to load
     if target_tokenizer:
@@ -467,18 +439,12 @@ def run_client(
             )
         return _tokenizer_local.tok
 
-    # ------------------------------------------------------------------
-    # Stage‑3: run one *thread* per prompt so draft‑side generation
-    # overlaps network verification latency.  Each thread owns its own
-    # session_id, cache, and speculative_decode() loop.
-    # ------------------------------------------------------------------
     def _worker(prompt_idx, prompt_text):
         tokenizer = _get_tokenizer()        # thread-specific copy
-        # Prime target
         # Ask the target to assign a canonical session-id
         start_resp = stub.StartGeneration(
-            inference_pb2.StartRequest(
-                session_id=0,                 # 0 → “please assign one for me”
+            inference_pb2.StartGenerationRequest(
+                session_id=0,                 # 0 → "please assign one for me"
                 prompt=prompt_text,
                 max_new_tokens=max_new_tokens,
                 gamma=gamma,
@@ -495,7 +461,7 @@ def run_client(
         latency = time.time() - t0
         final_text = prompt_text + gen_text
 
-        # ----- Compute per‑thread throughput -----
+        # Compute per thread throughput
         tokens_out = perf_stats.get("tokens_generated")
         if tokens_out is None:
             # Derive from accepted + target counts when profiling is off
@@ -509,7 +475,6 @@ def run_client(
         perf_stats["total_time"] = latency
         throughput = tokens_out / latency if latency > 0 else 0.0
         perf_stats["tokens_per_second"] = throughput
-        # -----------------------------------------------
 
         logger.info(
             "[Thread %d] completed in %.2fs, tokens=%d, throughput=%.2f t/s",
@@ -539,7 +504,7 @@ def run_client(
     # Sort results by original prompt order
     results.sort(key=lambda r: r["prompt_idx"])
 
-    # Pretty‑print outputs
+    # Pretty print outputs
     print("\n=== Final Outputs (CONCURRENT) ===")
     for r in results:
         print(f"[Prompt {r['prompt_idx']} Output]:\n{r['text']}\n")
