@@ -17,8 +17,8 @@ import types
 # fsd.to_neuron()  # Compile the fused speculative model
  # Speculation buckets are specified by *length*; the compiler will build
  # both batch‑1 and batch‑2 heads automatically when `dynamic_batch_size=True`.
-SPEC_LENGTH_BUCKETS = [3, 5]
-BATCH_BUCKETS = [4]
+SPEC_LENGTH_BUCKETS = [5]
+BATCH_BUCKETS = [1, 2, 3, 4]
 logger = logging.getLogger(__name__)
 
 class NeuronHFAdapterWrap(torch.nn.Module):

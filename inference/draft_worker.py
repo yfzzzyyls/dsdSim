@@ -14,7 +14,7 @@ import random
 import collections
 import concurrent.futures
 from transformers_neuronx import sampling
-from inference.model_loader import SPEC_LENGTH_BUCKETS, BATCH_BUCKETS
+from inference.model_loader import SPEC_LENGTH_BUCKETS
 
 logger = logging.getLogger(__name__)
 
@@ -189,19 +189,54 @@ def speculative_decode(
         if not speculative_tokens:
             break
 
+        # 8) Verify tokens with target model
+        # --------------------------------------------------------------
+        # Fast‑fail if the speculative chunk length is NOT one of the
+        # compiled γ buckets.  We no longer truncate; instead we raise to
+        # surface a configuration / logic error immediately.
+        # --------------------------------------------------------------
+
+        # ==============================================================
+        # if len(speculative_tokens) not in valid_gammas:
+        #     assert len(speculative_tokens) in valid_gammas, (
+        #         f"Speculative chunk length {len(speculative_tokens)} is not "
+        #         f"supported by the compiled target model; valid γ buckets = "
+        #         f"{valid_gammas}"
+        #     )
+        # ============================================================
+
+        # ============================================================
+        # Ensure speculative_probs is the same length as speculative_tokens.
+        # This can become mismatched when we break early from the inner loop
+        # (e.g. EOS or token‑budget exhaustion).  Truncate to the shorter
+        # length so we never advance _next_pos past the compiled context.
+        # ============================================================
+        
+        # # ====================================================================
+        # # --- Verify + commit in one RPC ---
+        # # logger.debug("[session=%s] Proposed tokens: %s", session_id, speculative_tokens)
+        # # --- show draft chunk as words instead of IDs -----------------
+        # token_texts_dbg = [
+        #     tokenizer.decode([tid], clean_up_tokenization_spaces=False)
+        #     for tid in speculative_tokens
+        # ]
+        # logger.debug("[session=%s] draft model proposed: chunk len=%d, proposed tokens (text)=%s, ids=%s, probs=%s", session_id, len(speculative_tokens), token_texts_dbg, speculative_tokens, speculative_probs)
+        # # ====================================================================
+
 
         # ----- measure RPC round‑trip and split into network vs. verify compute -----
-        if profile: time_roundtrip = time.perf_counter()
+        time_roundtrip = time.perf_counter()
         commit_ids, accepted_count, verify_time_ms, target_finished = grpc_client.verify_draft_tokens(
             stub, speculative_tokens, speculative_probs, session_id=session_id
         )
-        if profile: 
-            rpc_roundtrip = time.perf_counter() - time_roundtrip
-            verify_sec   = verify_time_ms / 1000.0
-            # Network + (de)serialisation + client/server scheduling
-            network_sec  = max(0.0, rpc_roundtrip - verify_sec)
-            timing["grpc_roundtrip_time"]      += network_sec
-            timing["target_verification_time"] += verify_sec
+        rpc_roundtrip = time.perf_counter() - time_roundtrip
+
+        verify_sec   = verify_time_ms / 1000.0
+        # Network + (de)serialisation + client/server scheduling
+        network_sec  = max(0.0, rpc_roundtrip - verify_sec)
+
+        timing["grpc_roundtrip_time"]      += network_sec
+        timing["target_verification_time"] += verify_sec
 
         # ------------------------------------------------------------------
         # Respect the remaining token budget so we never exceed max_new_tokens.
@@ -299,23 +334,10 @@ def speculative_decode(
 
     # Performance stats
     perf_stats = {}
-
-    #####################################################################
-    # # Compute total tokens produced by both draft (accepted) and target
-    # # total_output_tokens = accepted_tokens_total + target_tokens_total
-    # if total_output_tokens > 0:
-    #     match_rate = accepted_tokens_total / total_output_tokens
-    #     perf_stats["token_match_rate"] = match_rate
-
-    # if total_output_tokens > 0:
-    #     logger.debug(
-    #         f"Speculative decoding match rate: {match_rate:.2%} "
-    #         f"(Draft accepted: {accepted_tokens_total}, Target generated: {target_tokens_total})"
-    #     )
-    ##################################################################
-
+    # Compute total tokens produced by both draft (accepted) and target
+    total_output_tokens = accepted_tokens_total + target_tokens_total
     if profile:
-        tokens_generated_total = accepted_tokens_total + target_tokens_total
+        tokens_generated_total = total_output_tokens
         perf_stats["tokens_generated"] = tokens_generated_total
         perf_stats.update({
             "draft_prefill_time":       timing["draft_prefill_time"],
@@ -325,6 +347,15 @@ def speculative_decode(
             "sampling_filter_time":     timing["sampling_filter_time"],
         })
 
+    if total_output_tokens > 0:
+        match_rate = accepted_tokens_total / total_output_tokens
+        perf_stats["token_match_rate"] = match_rate
+
+    if total_output_tokens > 0:
+        logger.debug(
+            f"Speculative decoding match rate: {match_rate:.2%} "
+            f"(Draft accepted: {accepted_tokens_total}, Target generated: {target_tokens_total})"
+        )
 
     logger.debug(
         f"[session={session_id}] Finished: generated_text='{generated_text[:120]}...'"

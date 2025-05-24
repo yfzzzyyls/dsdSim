@@ -91,7 +91,7 @@ rm -r /var/tmp/neuron-compile-cache
 ### **Compile & Run the Target Model Server**
 
 ```
-python main.py --role target --model /home/ubuntu/models/llama-3.1-8b/ --port 50051 --sequence_length 160 --batch 4 --profile --top_p 1.0
+python main.py --role target --model /home/ubuntu/models/llama-3.1-8b/ --port 50051 --sequence_length 160 --batch 2 --profile --top_p 1.0
 ```
 
 ### **Compile & Run the Draft Model server**
