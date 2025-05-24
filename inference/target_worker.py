@@ -394,8 +394,6 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
         if not batch_reqs:
             return
 
-        tokenizer = get_thread_tokenizer(self.model_path)
-
         # Group tensors
         sess_list      = []
         draft_tok_lens = {len(r["draft_tokens"]) for r in batch_reqs}
@@ -573,19 +571,19 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
             # DEBUG: Show draft proposals, target predictions, accept/reject,
             #        and final committed chunk in **human‑readable words**
             # ----------------------------------------------------------
-            draft_words = [
-                tokenizer.decode([tid], clean_up_tokenization_spaces=False)
-                for tid in draft_tokens
-            ]
-            tgt_preds = torch.argmax(tgt_row_probs, dim=-1).tolist()
-            tgt_words = [
-                tokenizer.decode([tid], clean_up_tokenization_spaces=False)
-                for tid in tgt_preds
-            ]
-            committed_words = [
-                tokenizer.decode([tid], clean_up_tokenization_spaces=False)
-                for tid in committed
-            ]
+            # draft_words = [
+            #     tokenizer.decode([tid], clean_up_tokenization_spaces=False)
+            #     for tid in draft_tokens
+            # ]
+            # tgt_preds = torch.argmax(tgt_row_probs, dim=-1).tolist()
+            # tgt_words = [
+            #     tokenizer.decode([tid], clean_up_tokenization_spaces=False)
+            #     for tid in tgt_preds
+            # ]
+            # committed_words = [
+            #     tokenizer.decode([tid], clean_up_tokenization_spaces=False)
+            #     for tid in committed
+            # ]
             # status = (
             #     "all_accepted"
             #     if accepted_cnt == len(draft_tokens)
@@ -621,8 +619,8 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
         """
         if not jobs:
             return
-
-        tok = get_thread_tokenizer(self.model_path)
+        assert len(jobs) <= self.max_batch, "prefill batch too large"
+        
         pad_id = 0
 
         # Build batched tensors with right‑padding
