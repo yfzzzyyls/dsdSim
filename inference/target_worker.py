@@ -421,7 +421,14 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
         cache_vecs = []
         for r in batch_reqs:
             sid  = r["session_id"]
-            sess = self.sessions[sid]
+            # sess = self.sessions[sid]
+            sess = self.sessions.get(sid)
+            if sess is None:
+                # Session was already finalized – drop the request and notify caller
+                resp_q = self.result_queues.pop(sid, None)
+                if resp_q is not None:
+                    resp_q.put(([], 0, 0.0, True))
+                continue
             self._sync_kv_pointer(sess)
 
             prev_token = int(sess.current_ids[0, -1].item())
@@ -600,6 +607,7 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
             if resp_q is not None:
                 resp_q.put((committed, accepted_cnt, verify_ms, finished))
                 if finished:
+                    self._finalize_session(sess.session_id)
                     # After delivering the final response, remove the queue
                     self.result_queues.pop(sid, None)
 
