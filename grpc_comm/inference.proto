@@ -78,8 +78,6 @@ message VerifyResponse {
   bool finished = 3;
   // Time spent on the target side verifying this draft chunk (milliseconds)
   float verify_time_ms = 4;
-  // Time spent on the target side prefilling (milliseconds)
-  float prefill_time_ms = 5;
 }
 
 message FinalizeRequest {

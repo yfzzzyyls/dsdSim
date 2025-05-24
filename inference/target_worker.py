@@ -106,12 +106,11 @@ def _gen_session_id():
 
 class TargetSession:
     def __init__(self, session_id: int, input_ids, row_idx: int, max_tokens: int):
-        self.session_id = session_id 
+        self.session_id = session_id
         self.current_ids = input_ids  # Torch tensor [1, seq_len]
         self.finished = False
         self.tokens_generated = 0
         self.verification_time = 0.0   # cumulative time spent verifying draft tokens (seconds)
-        self.prefill_time = 0.0        # time spent on target prefill (seconds)
         self.finalize_calls    = 0     # count of FinalizeTokens invocations
         self.last_draft_chunk = None
         # pointer to the *next* KV slot (scalar tensor, starts at 0)
@@ -320,8 +319,7 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
         if not draft_tokens:
             return inference_pb2.VerifyResponse(
                 committed_ids=[], accepted_count=0,
-                verify_time_ms=0.0, finished=True,
-                prefill_time_ms=0.0
+                verify_time_ms=0.0, finished=True
             )
 
         # Prepare per‑call rendez‑vous Queue
@@ -338,7 +336,7 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
         })
 
         # Block until scheduler puts result
-        committed_ids, accepted_cnt, verify_ms, finished, prefill_ms = resp_q.get()
+        committed_ids, accepted_cnt, verify_ms, finished = resp_q.get()
         # If this session has now hit its max_tokens budget, force cleanup
         sess = self.sessions.get(sid)
         if sess is not None and sess.tokens_generated >= sess.max_tokens:
@@ -351,7 +349,6 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
             accepted_count=accepted_cnt,
             verify_time_ms=verify_ms,
             finished=finished,
-            prefill_time_ms=prefill_ms,
         )
 
     # ------------------------------------------------------------------
@@ -382,7 +379,7 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
                     q = self.result_queues.get(sid)
                     if q is not None:
                         try:
-                            q.put_nowait(([], 0, 0.0, True, 0.0))  # sentinel with prefill_ms
+                            q.put_nowait(([], 0, 0.0, True))  # sentinel
                         except queue.Full:
                             pass
                     self._finalize_session(sid)
@@ -428,7 +425,7 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
                 # Session was already finalized – drop the request and notify caller
                 resp_q = self.result_queues.pop(sid, None)
                 if resp_q is not None:
-                    resp_q.put(([], 0, 0.0, True, 0.0))  # Add prefill_ms=0.0 for consistency
+                    resp_q.put(([], 0, 0.0, True))
                 continue
             self._sync_kv_pointer(sess)
 
@@ -472,7 +469,7 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
         # collapsing the vocab axis down to 2 columns.
         # --------------------------------------------------------------
         assert real_B <= self.max_batch, \
-            f"Batch size {real_B} compiled now should be the less than max_batch"
+            f"Batch size {real_B} compiled now should be the less than max_batch {self.max_batch}"
         
         if not input_ids:          # all requests were skipped
             return
@@ -609,9 +606,7 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
 
             resp_q = self.result_queues.get(sid)
             if resp_q is not None:
-                # Include prefill time from session
-                prefill_ms = sess.prefill_time * 1000.0 if sess else 0.0
-                resp_q.put((committed, accepted_cnt, verify_ms, finished, prefill_ms))
+                resp_q.put((committed, accepted_cnt, verify_ms, finished))
                 if finished:
                     self._finalize_session(sess.session_id)
                     # After delivering the final response, remove the queue
@@ -650,46 +645,50 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
                 pad = torch.full((1, max_len - L_real), pad_id, dtype=ids.dtype)
                 ids = torch.cat([ids, pad], dim=1)
 
-            # Build a cache-position vector that matches **real** tokens
+            # ----------------------------------------------------------
+            # Build a cache-position vector that matches **real** tokens:
+            # real tokens → start_pos … start_pos+L-1
+            # pad tokens  → continue that arithmetic sequence.
+            # ----------------------------------------------------------
             start_pos = int(sess.get_session_cache_id().item())  # 0 for brand-new row
             vec_real  = torch.arange(start_pos, start_pos + L_real,
-                                 dtype=torch.int32).unsqueeze(0)   # (1, L)
+                                     dtype=torch.int32).unsqueeze(0)   # (1, L)
 
             if L_real < max_len:
                 pad_vec = torch.arange(start_pos + L_real,
-                                   start_pos + max_len,
-                                   dtype=torch.int32).unsqueeze(0)
+                                       start_pos + max_len,
+                                       dtype=torch.int32).unsqueeze(0)
                 vec = torch.cat([vec_real, pad_vec], dim=1)           
             else:
                 vec = vec_real
 
             input_ids_lst.append(ids)
             cache_vecs_lst.append(vec)
-            start_ids_lst.append(sess.row_idx)
+            start_ids_lst.append(sess.row_idx)   # ← ensure start_ids tensor is built
 
         input_ids  = torch.cat(input_ids_lst, 0)
         cache_vecs = torch.cat(cache_vecs_lst, 0)
         start_ids  = torch.tensor(start_ids_lst, dtype=torch.int32, device=input_ids.device)
 
-        # Time the actual prefill operation
-        t0 = time.perf_counter()
+        # One Neuron forward under mutex
         with self.model_mutex:
             _ = self.model.forward(
                 input_ids=input_ids,
                 cache_ids=cache_vecs,
                 start_ids=start_ids,
             )
-        prefill_time = time.perf_counter() - t0
 
-        # Advance each session's KV pointer and store prefill time
+        # Neuron only counts non-pad tokens, so advance each KV pointer
+        # by the true prompt length stored in row_lengths[idx].
+        # ------------------------------------------------------------------
+        # Advance each session’s KV pointer by its real prompt length, not by
+        # the padded bucket length.
         for idx, j in enumerate(jobs):
             sid  = j["session_id"]
             sess = self.sessions[sid]
             delta = row_lengths[idx]              # real (unpadded) length
             self.model.update_batched_cache(delta, sess.row_idx)
             sess.update_session_cache_id(delta)
-            # Store prefill time in the session
-            sess.prefill_time = prefill_time
             self._sync_kv_pointer(sess)
 
 def run_server(model_path, port=50051, sequence_length=128,
