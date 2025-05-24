@@ -452,7 +452,7 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
                 toks = toks[:spec_bucket]  # Truncate if too long
 
             start_pos = int(sess.get_session_cache_id().item())
-            vec = torch.arange(len(toks), dtype=torch.int32) + start_pos
+            vec = torch.arange(spec_bucket, dtype=torch.int32) + start_pos
 
             input_ids.append(torch.tensor(toks, dtype=torch.int32))
             cache_vecs.append(vec)

@@ -414,14 +414,15 @@ def run_client(
     def _worker(prompt_idx, prompt_text):
         tokenizer = _get_tokenizer()        # thread-specific copy
         # Ask the target to assign a canonical session-id
-        start_resp = stub.StartGeneration(
-            inference_pb2.StartGenerationRequest(
-                session_id=0,                 # 0 → "please assign one for me"
-                prompt=prompt_text,
-                max_new_tokens=max_new_tokens,
-                gamma=gamma,
-            )
-        )
+        # Create a simple request object that mimics the protobuf message
+        request = type('StartGenerationRequest', (), {
+            'session_id': 0,
+            'prompt': prompt_text,
+            'max_new_tokens': max_new_tokens,
+            'gamma': gamma,
+        })()
+        
+        start_resp = stub.StartGeneration(request)
         sid = start_resp.session_id
         t0 = time.time()
         gen_text, perf_stats = speculative_decode(
