@@ -7,29 +7,13 @@ import threading
 import uuid
 from datetime import datetime
 from grpc_comm import inference_pb2_grpc, inference_pb2, grpc_client
-from inference.model_loader import load_model, get_spec_bucket_for_gamma, pad_tokens_to_bucket
+from inference.model_loader import load_model, get_spec_bucket_for_gamma, pad_tokens_to_bucket, SPEC_LENGTH_BUCKETS
 from transformers import AutoTokenizer
 import torch
 import random
 import collections
 import concurrent.futures
 from transformers_neuronx import sampling
-from inference.model_loader impor        # Ask the        start_resp = stub.StartGeneration(
-            inference_pb2.GenerateRequest(
-                session_id=0,                 # 0 → "please assign one for me"
-                prompt=prompt_text,
-                max_new_tokens=max_new_tokens,
-                gamma=gamma,
-            )
-        )to assign a canonical session-id
-        start_resp = stub.StartGeneration(
-            inference_pb2.GenerateRequest(
-                session_id=0,                 # 0 → "please assign one for me"
-                prompt=prompt_text,
-                max_new_tokens=max_new_tokens,
-                gamma=gamma,
-            )
-        )NGTH_BUCKETS
 
 logger = logging.getLogger(__name__)
 
@@ -416,7 +400,7 @@ def run_client(
     target_host: str = "localhost",
     port: int = 50051,
     prompt_text_file: str = "",
-    target_tokenizer: str = None,
+    target_tokenizer: str = "",
     max_new_tokens: int = 50,
     sequence_length: int = 128,
     gamma: int = 4,
