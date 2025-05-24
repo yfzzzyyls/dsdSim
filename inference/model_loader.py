@@ -395,7 +395,7 @@ def compile_target_model(model_path: str,
         fuse_qkv              = True,
         attention_layout      = "BSH",
         use_2d_cache_ids      = True,
-        dynamic_batch_size    = False,      # build (len,1) and (len,2) heads
+        dynamic_batch_size    = True,      # build (len,1) and (len,2) heads
         enable_chunked_prefill= False,
     )
     model.enable_speculative_decoder(SPEC_LENGTH_BUCKETS, BATCH_BUCKETS)
