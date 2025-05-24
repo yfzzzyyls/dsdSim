@@ -556,49 +556,41 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
         
         pad_id = 0
 
-        # Build batched tensors with right‑padding
+        # Build batched tensors with proper dimensions
         max_len = max(j["input_ids"].shape[1] for j in jobs)
-        input_ids_lst = []
-        cache_vecs_lst = []
-        start_ids_lst  = []
-        row_lengths    = []
+        batch_size = len(jobs)
+        
+        # Pre-allocate tensors with correct batch dimension
+        input_ids = torch.full((batch_size, max_len), pad_id, dtype=torch.long)
+        cache_vecs = torch.zeros((batch_size, max_len), dtype=torch.int32)
+        start_ids_lst = []
+        row_lengths = []
 
-        for j in jobs:
-            sid   = j["session_id"]
-            sess  = self.sessions[sid]
-            ids   = j["input_ids"]
-            # Count *non-pad* tokens for this row
-            L_real = int(count_real_tokens(ids, pad_id=pad_id).item())
+        for idx, j in enumerate(jobs):
+            sid = j["session_id"]
+            sess = self.sessions[sid]
+            ids = j["input_ids"].squeeze(0)  # Remove batch dimension: (1, L) -> (L,)
+            
+            # Count real tokens
+            L_real = ids.shape[0] if ids.numel() > 0 else 0
             row_lengths.append(L_real)
 
-            if L_real < max_len:
-                pad = torch.full((1, max_len - L_real), pad_id, dtype=ids.dtype)
-                ids = torch.cat([ids, pad], dim=1)
+            # Fill in the actual tokens (no padding needed as we pre-allocated)
+            if L_real > 0:
+                input_ids[idx, :L_real] = ids[:L_real]
 
-            # ----------------------------------------------------------
-            # Build a cache-position vector that matches **real** tokens:
-            # real tokens → start_pos … start_pos+L-1
-            # pad tokens  → continue that arithmetic sequence.
-            # ----------------------------------------------------------
-            start_pos = int(sess.get_session_cache_id().item())  # 0 for brand-new row
-            vec_real  = torch.arange(start_pos, start_pos + L_real,
-                                     dtype=torch.int32).unsqueeze(0)   # (1, L)
+            # Build cache position vector for this sequence
+            start_pos = int(sess.get_session_cache_id().item())  # Should be 0 for new sessions
+            if max_len > 0:
+                cache_vec = torch.arange(start_pos, start_pos + max_len, dtype=torch.int32)
+                cache_vecs[idx] = cache_vec
 
-            if L_real < max_len:
-                pad_vec = torch.arange(start_pos + L_real,
-                                       start_pos + max_len,
-                                       dtype=torch.int32).unsqueeze(0)
-                vec = torch.cat([vec_real, pad_vec], dim=1)           
-            else:
-                vec = vec_real
+            start_ids_lst.append(sess.row_idx)
 
-            input_ids_lst.append(ids)
-            cache_vecs_lst.append(vec)
-            start_ids_lst.append(sess.row_idx)   # ← ensure start_ids tensor is built
+        start_ids = torch.tensor(start_ids_lst, dtype=torch.int32, device=input_ids.device)
 
-        input_ids  = torch.cat(input_ids_lst, 0)
-        cache_vecs = torch.cat(cache_vecs_lst, 0)
-        start_ids  = torch.tensor(start_ids_lst, dtype=torch.int32, device=input_ids.device)
+        logger.debug(f"Prefill batch shapes: input_ids={input_ids.shape}, "
+                     f"cache_vecs={cache_vecs.shape}, start_ids={start_ids.shape}")
 
         # One Neuron forward under mutex
         with self.model_mutex:
@@ -608,15 +600,11 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
                 start_ids=start_ids,
             )
 
-        # Neuron only counts non-pad tokens, so advance each KV pointer
-        # by the true prompt length stored in row_lengths[idx].
-        # ------------------------------------------------------------------
-        # Advance each session’s KV pointer by its real prompt length, not by
-        # the padded bucket length.
+        # Advance each session's KV pointer by its real prompt length
         for idx, j in enumerate(jobs):
-            sid  = j["session_id"]
+            sid = j["session_id"]
             sess = self.sessions[sid]
-            delta = row_lengths[idx]              # real (unpadded) length
+            delta = row_lengths[idx]  # real (unpadded) length
             self.model.update_batched_cache(delta, sess.row_idx)
             sess.update_session_cache_id(delta)
             self._sync_kv_pointer(sess)
