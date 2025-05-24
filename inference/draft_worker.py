@@ -14,7 +14,22 @@ import random
 import collections
 import concurrent.futures
 from transformers_neuronx import sampling
-from inference.model_loader import SPEC_LENGTH_BUCKETS
+from inference.model_loader impor        # Ask the        start_resp = stub.StartGeneration(
+            inference_pb2.GenerateRequest(
+                session_id=0,                 # 0 → "please assign one for me"
+                prompt=prompt_text,
+                max_new_tokens=max_new_tokens,
+                gamma=gamma,
+            )
+        )to assign a canonical session-id
+        start_resp = stub.StartGeneration(
+            inference_pb2.GenerateRequest(
+                session_id=0,                 # 0 → "please assign one for me"
+                prompt=prompt_text,
+                max_new_tokens=max_new_tokens,
+                gamma=gamma,
+            )
+        )NGTH_BUCKETS
 
 logger = logging.getLogger(__name__)
 
@@ -61,16 +76,22 @@ def speculative_decode(
     gamma_max = max(valid_gammas)
     
     # PID controller for dynamic gamma adjustment
+    # For stability, start with the requested gamma and don't adjust for the first few iterations
     current_gamma = min(gamma, gamma_max)  # Start with requested gamma, clamped to max
     current_temp = temperature
     target_accept = 0.5  # desired acceptance rate
     
-    # PID controller parameters (tunable)
-    pid_kp = 0.3  # proportional gain
-    pid_ki = 0.05  # integral gain
-    pid_kd = 0.1   # derivative gain
+    # PID controller parameters (tunable) - more conservative for stability
+    pid_kp = 0.05  # very conservative proportional gain
+    pid_ki = 0.001  # very conservative integral gain
+    pid_kd = 0.01   # very conservative derivative gain
     pid_integral = 0.0
     pid_prev_error = 0.0
+    
+    # Stability constraints
+    iterations_completed = 0
+    stability_period = 3  # Don't adjust gamma for first 3 iterations
+    max_gamma_change = 1  # Maximum change of 1 per adjustment
 
     logger.debug(
         f"[session={session_id}] Starting speculative_decode with dynamic gamma: "
@@ -183,9 +204,12 @@ def speculative_decode(
             break
 
         # Pad draft tokens to the spec bucket size if needed (for target model compatibility)
+        # The bucket size includes the bonus token, so for draft tokens we need bucket_size - 1
+        max_draft_slots = spec_bucket - 1  # Reserve 1 slot for bonus token
         padded_tokens, original_length = pad_tokens_to_bucket(
-            speculative_tokens, spec_bucket - 1, pad_token_id=0  # -1 because bucket includes bonus token
+            speculative_tokens, max_draft_slots, pad_token_id=0
         )
+        # Ensure we pad the probabilities to match
         padded_probs = speculative_probs + [0.0] * (len(padded_tokens) - len(speculative_probs))
 
         # ----- measure RPC round‑trip and split into network vs. verify compute -----
@@ -205,8 +229,8 @@ def speculative_decode(
         # Only consider acceptances up to the original draft length (ignore padded tokens)
         actual_accepted = min(accepted_count, original_length)
         
-        # PID controller for gamma adjustment
-        if original_length > 0:  # Avoid division by zero
+        # PID controller for gamma adjustment (only after stability period)
+        if original_length > 0 and iterations_completed >= stability_period:  # Avoid division by zero
             acceptance_rate = actual_accepted / original_length
             
             # PID controller update
@@ -216,6 +240,9 @@ def speculative_decode(
             
             gamma_adjustment = pid_kp * error + pid_ki * pid_integral + pid_kd * pid_derivative
             
+            # Limit the maximum change per step for stability
+            gamma_adjustment = max(-max_gamma_change, min(max_gamma_change, gamma_adjustment))
+            
             # Update gamma (clamp to valid range)
             new_gamma = current_gamma + gamma_adjustment
             current_gamma = max(1, min(gamma_max, round(new_gamma)))
@@ -224,6 +251,8 @@ def speculative_decode(
             
             logger.debug(f"[session={session_id}] Acceptance rate: {acceptance_rate:.3f}, "
                        f"adjusted gamma: {current_gamma}")
+        
+        iterations_completed += 1
 
         # ------------------------------------------------------------------
         # Respect the remaining token budget so we never exceed max_new_tokens.

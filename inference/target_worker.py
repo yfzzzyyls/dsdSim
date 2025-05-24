@@ -423,7 +423,9 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
 
         # Find the appropriate spec bucket for the maximum draft length
         from inference.model_loader import get_spec_bucket_for_gamma
-        spec_bucket = get_spec_bucket_for_gamma(max_draft_len, SPEC_LENGTH_BUCKETS)
+        # Use the actual draft length, not the padded length
+        actual_max_draft_len = max(len([t for t in r["draft_tokens"] if t != 0]) for r in batch_reqs)
+        spec_bucket = get_spec_bucket_for_gamma(actual_max_draft_len, SPEC_LENGTH_BUCKETS)
         
         # ------------------------------------------------------------------
         # Build input tensors (B, spec_bucket) and cache_vec (B, spec_bucket)
@@ -497,7 +499,9 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
             )  # (spec_bucket, V)
             
             # Only process up to the original draft length (ignore padded tokens)
-            tgt_row_probs = all_row_probs[:-1]  # Remove bonus token position
+            # The target model returns logits for: [prev_token, draft_token_0, draft_token_1, ..., draft_token_n-1, bonus_position]
+            # So we need to skip the first position (prev_token) and only use positions 1 to original_draft_length
+            tgt_row_probs = all_row_probs[1:original_draft_length+1]  # Skip prev_token position, take only actual draft positions
             
             device = tgt_row_probs.device
             # Only use the original (non-padded) draft tokens for verification
@@ -507,7 +511,7 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
             dr_tokens = torch.tensor(actual_draft_tokens, device=device)
             row_idx = torch.arange(len(actual_draft_tokens), device=device)
             
-            if len(actual_draft_tokens) > 0:
+            if len(actual_draft_tokens) > 0 and len(actual_draft_tokens) <= tgt_row_probs.shape[0]:
                 p_tgt = tgt_row_probs[row_idx, dr_tokens]
                 q_draft = torch.tensor(actual_draft_probs, device=device)
 
@@ -522,13 +526,23 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
             accepted_cnt = first_rej
             committed = actual_draft_tokens[:accepted_cnt]
 
-            # Add bonus token
+            # Add bonus token - sample from the position after the last accepted token
             if accepted_cnt < len(actual_draft_tokens):
-                # Rejection occurred, sample from the position where rejection happened
-                bonus_id = int(torch.multinomial(all_row_probs[first_rej], 1).item())
+                # Rejection occurred, sample from the position where rejection happened (after prev_token)
+                bonus_position = 1 + first_rej  # Skip prev_token position
+                if bonus_position < all_row_probs.shape[0]:
+                    bonus_id = int(torch.multinomial(all_row_probs[bonus_position], 1).item())
+                else:
+                    # Fallback to last position if out of bounds
+                    bonus_id = int(torch.multinomial(all_row_probs[-1], 1).item())
             else:
-                # All tokens accepted, sample from the bonus position
-                bonus_id = int(torch.multinomial(all_row_probs[-1], 1).item())
+                # All tokens accepted, sample from the bonus position (after all draft tokens)
+                bonus_position = 1 + len(actual_draft_tokens)  # Skip prev_token position
+                if bonus_position < all_row_probs.shape[0]:
+                    bonus_id = int(torch.multinomial(all_row_probs[bonus_position], 1).item())
+                else:
+                    # Fallback to last position if out of bounds
+                    bonus_id = int(torch.multinomial(all_row_probs[-1], 1).item())
             committed.append(bonus_id)
 
             self._commit_tokens_bulk(sess, committed)
