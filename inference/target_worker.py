@@ -470,7 +470,10 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
         # --------------------------------------------------------------
         assert real_B <= self.max_batch, \
             f"Batch size {real_B} compiled now should be the less than max_batch {self.max_batch}"
-        # REMOVE dummy-row padding: do not pad input_ids, cache_vecs, or sess_list
+        
+        if not input_ids:          # all requests were skipped
+            return
+        
         input_ids  = torch.stack(input_ids, 0)        # (B, γ+1)
         cache_vecs = torch.stack(cache_vecs, 0)       # (B, γ+1)
 

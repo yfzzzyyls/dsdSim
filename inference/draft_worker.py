@@ -383,12 +383,18 @@ def save_perf_stats(perf_stats: dict, file_prefix: str):
                 return f"0.0%({t:.3f})"
         
         # Append CSV row; write header if file does not exist
-        header = ["total_time","tokens_generated","tokens_per_second",
-                "avg_token_time","token_match_rate",
-                "target_prefill_time","draft_prefill_time",
-                "draft_generation_time",
-                "grpc_roundtrip_time","target_verification_time",
-                "sampling_filter_time"]
+        header = [
+            'total_time',
+            'tokens_generated',
+            'tokens_per_second',
+            'token_match_rate',
+            'target_prefill_time',
+            'draft_prefill_time',
+            'draft_generation_time',
+            'grpc_roundtrip_time',
+            'target_verification_time',
+            'sampling_filter_time',
+        ]
 
         write_header = not os.path.exists(csv_path)
         with open(csv_path, "a", newline='') as cf:
@@ -397,8 +403,7 @@ def save_perf_stats(perf_stats: dict, file_prefix: str):
             row = [
                 f"{total_time_val:.3f}",
                 perf_stats.get("tokens_generated", ""),
-                perf_stats.get("throughput", ""),
-                perf_stats.get("avg_token_time", ""),
+                perf_stats.get("tokens_per_second", ""),
                 perf_stats.get("token_match_rate", ""),
                 fmt(perf_stats.get("target_prefill_time", 0.0)),
                 fmt(perf_stats.get("draft_prefill_time", 0.0)),
@@ -527,8 +532,10 @@ def run_client(
             )
             perf_stats["tokens_generated"] = tokens_out
 
+        # Record total wall-clock time and throughput
+        perf_stats["total_time"] = latency
         throughput = tokens_out / latency if latency > 0 else 0.0
-        perf_stats["throughput"] = throughput
+        perf_stats["tokens_per_second"] = throughput
         # -----------------------------------------------
 
         logger.info(
