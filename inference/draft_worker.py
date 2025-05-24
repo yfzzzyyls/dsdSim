@@ -87,6 +87,7 @@ def speculative_decode(
         "draft_generation_time":    0.0,
         "grpc_roundtrip_time":      0.0,   # pure network + (de)serialisation latency
         "target_verification_time": 0.0,   # server‑side compute only
+        "target_prefill_time":      0.0,   # server‑side prefill time
         "sampling_filter_time":     0.0,   # time spent on n‑gram mask + top‑k/p filter
     }
     
@@ -226,18 +227,20 @@ def speculative_decode(
 
         # ----- measure RPC round‑trip and split into network vs. verify compute -----
         time_roundtrip = time.perf_counter()
-        commit_ids, accepted_count, verify_time_ms, target_finished = grpc_client.verify_draft_tokens(
+        commit_ids, accepted_count, verify_time_ms, target_finished, prefill_time_ms = grpc_client.verify_draft_tokens(
             stub, speculative_tokens, speculative_probs, session_id=session_id
         )
         rpc_roundtrip = time.perf_counter() - time_roundtrip
 
         verify_sec   = verify_time_ms / 1000.0
+        prefill_sec  = prefill_time_ms / 1000.0
         # Network + (de)serialisation + client/server scheduling
         network_sec  = max(0.0, rpc_roundtrip - verify_sec)
 
         timing["grpc_roundtrip_time"]      += network_sec
         timing["target_verification_time"] += verify_sec
-
+        timing["target_prefill_time"]      += prefill_sec
+        
         # ------------------------------------------------------------------
         # Respect the remaining token budget so we never exceed max_new_tokens.
         # If the target returned more tokens than we can still emit, truncate
@@ -344,6 +347,7 @@ def speculative_decode(
             "draft_generation_time":    timing["draft_generation_time"],
             "grpc_roundtrip_time":      timing["grpc_roundtrip_time"],
             "target_verification_time": timing["target_verification_time"],
+            "target_prefill_time":      timing["target_prefill_time"],
             "sampling_filter_time":     timing["sampling_filter_time"],
         })
 

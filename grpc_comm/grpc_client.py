@@ -78,4 +78,5 @@ def verify_draft_tokens(stub, draft_tokens, draft_probs, session_id=0):
         resp.accepted_count,
         resp.verify_time_ms,
         resp.finished,
+        resp.prefill_time_ms,
     )
