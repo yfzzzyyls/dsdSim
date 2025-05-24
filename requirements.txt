@@ -1,1 +1,1 @@
-# Example set of dependencies for running on AWS Trainium with torch-neuronx
+# Dependencies for running on AWS Trainium with torch-neuronx
