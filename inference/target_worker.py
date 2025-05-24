@@ -11,7 +11,7 @@ from transformers.generation import LogitsProcessorList, SuppressTokensLogitsPro
 import queue
 import threading
 import uuid
-from inference.model_loader import SPEC_LENGTH_BUCKETS, BATCH_BUCKETS   # available bucket lengths
+from inference.model_loader import SPEC_LENGTH_BUCKETS, BATCH_BUCKETS, get_spec_bucket_for_gamma   # available bucket lengths
 import collections
 
 
@@ -390,36 +390,18 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
         batch_reqs: List[dict] with keys session_id, draft_tokens, draft_probs.
         Performs one batched speculative_forward and writes result to each
         caller's result_queue.
+        Handles variable-length draft sequences by padding to the appropriate bucket size.
         """
         if not batch_reqs:
             return
 
-        # Group tensors
-        sess_list      = []
-        draft_tok_lens = {len(r["draft_tokens"]) for r in batch_reqs}
-        # Simple: require identical γ; otherwise process sequentially.
-        # TODO: Changed to "padding-to-max" and adjust accept/reject rule to ignore padded slots. 
-        assert len(draft_tok_lens) == 1, \
-            f"Only support same γ for multiple draft models: {draft_tok_lens} (expected 1)"
-
-        gamma = draft_tok_lens.pop()
-        B     = len(batch_reqs)
-        real_B = B            # remember how many *real* rows we have
-
-        # # Log real_B, gamma, session ids
-        # logger.info(
-        #     "[Batch] real_B=%d  gamma=%d  session_ids=%s",
-        #     real_B, gamma, [r['session_id'] for r in batch_reqs]
-        # )
-
-        # ------------------------------------------------------------------
-        # Build input tensors (B, γ+1) and cache_vec (B, γ+1)
-        # ------------------------------------------------------------------
-        input_ids  = []
-        cache_vecs = []
+        # Group tensors and find the maximum draft length
+        sess_list = []
+        draft_lengths = []
+        max_draft_len = 0
+        
         for r in batch_reqs:
-            sid  = r["session_id"]
-            # sess = self.sessions[sid]
+            sid = r["session_id"]
             sess = self.sessions.get(sid)
             if sess is None:
                 # Session was already finalized – drop the request and notify caller
@@ -427,55 +409,57 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
                 if resp_q is not None:
                     resp_q.put(([], 0, 0.0, True))
                 continue
+            
+            # Count non-padded tokens in the draft
+            draft_tokens = r["draft_tokens"]
+            original_length = len([t for t in draft_tokens if t != 0])  # Assuming 0 is pad token
+            draft_lengths.append(original_length)
+            max_draft_len = max(max_draft_len, len(draft_tokens))
+            sess_list.append(sess)
+        
+        B = len(sess_list)
+        if B == 0:
+            return
+
+        # Find the appropriate spec bucket for the maximum draft length
+        from inference.model_loader import get_spec_bucket_for_gamma
+        spec_bucket = get_spec_bucket_for_gamma(max_draft_len, SPEC_LENGTH_BUCKETS)
+        
+        # ------------------------------------------------------------------
+        # Build input tensors (B, spec_bucket) and cache_vec (B, spec_bucket)
+        # ------------------------------------------------------------------
+        input_ids = []
+        cache_vecs = []
+        
+        for idx, r in enumerate(batch_reqs):
+            if idx >= len(sess_list):  # Skip if session was dropped
+                continue
+                
+            sess = sess_list[idx]
             self._sync_kv_pointer(sess)
 
             prev_token = int(sess.current_ids[0, -1].item())
-            toks = [prev_token] + r["draft_tokens"]          # γ+1 tokens
+            draft_tokens = r["draft_tokens"]
+            toks = [prev_token] + draft_tokens          # γ+1 tokens
 
-            # ---------- Dynamic padding to the closest spec bucket ----------
-            spec_buckets = sorted(SPEC_LENGTH_BUCKETS)       # e.g. [5, 8, 128]
-            # choose the smallest bucket ≥ current γ+1, else fall back to largest
-            desired_len = next((b for b in spec_buckets if b >= len(toks)),
-                               spec_buckets[-1])
+            # Pad to spec_bucket size
             pad_id = 0
-            assert len(toks) <= desired_len, \
-                f"Batch size {real_B} compiled now should be the less than max_batch {self.max_batch}"
-            if len(toks) < desired_len:                      # right-pad
-                toks += [pad_id] * (desired_len - len(toks))
-            # ------------------------------------------------------------------
+            if len(toks) < spec_bucket:
+                toks += [pad_id] * (spec_bucket - len(toks))
+            elif len(toks) > spec_bucket:
+                toks = toks[:spec_bucket]  # Truncate if too long
 
             start_pos = int(sess.get_session_cache_id().item())
-            # start_pos is already the local pointer for this row (0‑based within its slice)
             vec = torch.arange(len(toks), dtype=torch.int32) + start_pos
-            # (no row‑offset added because continuous batching routes by seq_id)
-
-            # Decode the first five token-ids to human‑readable strings
-            # token_words = [
-            #     self.tokenizer.decode([tid], clean_up_tokenization_spaces=False)
-            #     for tid in toks[:5]
-            # ]
-            # logger.info(
-            #     "[BatchRow %d] sid=%s  ids=%s  words=%s  cache_vec=%s",
-            #     len(sess_list), sid, toks[:5], token_words, vec[:5].tolist()
-            # )
 
             input_ids.append(torch.tensor(toks, dtype=torch.int32))
             cache_vecs.append(vec)
-            sess_list.append(sess)
 
-        # --------------------------------------------------------------
-        # Pad *lists* before stacking so the final stacked tensor keeps
-        # the original (B, N, V) layout coming out of Neuron.  This avoids
-        # collapsing the vocab axis down to 2 columns.
-        # --------------------------------------------------------------
-        assert real_B <= self.max_batch, \
-            f"Batch size {real_B} compiled now should be the less than max_batch {self.max_batch}"
-        
-        if not input_ids:          # all requests were skipped
+        if not input_ids:  # all requests were skipped
             return
         
-        input_ids  = torch.stack(input_ids, 0)        # (B, γ+1)
-        cache_vecs = torch.stack(cache_vecs, 0)       # (B, γ+1)
+        input_ids = torch.stack(input_ids, 0)        # (B, spec_bucket)
+        cache_vecs = torch.stack(cache_vecs, 0)       # (B, spec_bucket)
 
         # Add start_ids tensor for batch
         start_ids = torch.tensor(
@@ -487,119 +471,65 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
         # ------------------------------------------------------------------
         # Batched speculative_forward
         # ------------------------------------------------------------------
-        # --------------------------------------------------------------
-        # DEBUG: show the raw tensors that will be fed to speculative_forward
-        # --------------------------------------------------------------
-        # logger.info(
-        #     "[SpecForward] γ=%d  input_ids=%s  cache_vecs(row0…)=%s",
-        #     gamma,
-        #     input_ids.tolist(),
-        #     cache_vecs.tolist()[:2]   # print first 2 rows to avoid log spam
-        # )
         t0 = time.perf_counter()
         logits = self.model.speculative_forward(
-            input_ids = input_ids,
-            cache_ids = cache_vecs,
-            start_ids = start_ids,          # continuous batching
-            spec_length = input_ids.size(1),   # use the padded/truncated length
+            input_ids=input_ids,
+            cache_ids=cache_vecs,
+            start_ids=start_ids,
+            spec_length=input_ids.size(1),
         )
-        # logger.info("[scheduler - process_batch] speculative_forward raw shape = %s", tuple(logits.shape))
-        # Raw Neuron layout is (N, V, B)  where:
-        #   N = γ + 1, V = vocab shards (≈ vocab_size × TP), B = batch
-        # We keep this layout to avoid the transpose overhead.
         verify_ms = (time.perf_counter() - t0) * 1000.0
 
-        # logits: (N, V, B)  → split per session
-        for b, req in enumerate(batch_reqs):
-            # Skip the padded dummy rows – they have no corresponding request
-            sess = sess_list[b]
-            if sess is None:
+        # logits: (N, V, B) → split per session
+        for b, r in enumerate(batch_reqs):
+            if b >= len(sess_list):  # Skip if session was dropped
                 continue
-            sid          = req["session_id"]
-            draft_tokens = req["draft_tokens"]
-            draft_probs  = req["draft_probs"]
+                
+            sess = sess_list[b]
+            sid = r["session_id"]
+            draft_tokens = r["draft_tokens"]
+            draft_probs = r["draft_probs"]
+            original_draft_length = draft_lengths[b]
 
             # logits[:, :, b] → (N, V) for this session
             all_row_probs = torch.softmax(
                 logits[:, :, b].float(), dim=-1
-            )                               # (γ+1, V)
-            # ----------------------------------------------------------
-            # DEBUG: sample *one* token from the target distribution for
-            #        each position i (0…γ) so we can see what the large
-            #        model "wants" to emit.  Decode to words.
-            # ----------------------------------------------------------
-            # sampled_ids = []
-            # sampled_words = []
-            # for i in range(all_row_probs.size(0)):
-            #     samp_id = int(torch.multinomial(all_row_probs[i], 1).item())
-            #     sampled_ids.append(samp_id)
-            #     sampled_words.append(
-            #         self.tokenizer.decode([samp_id], clean_up_tokenization_spaces=False)
-            #     )
-            # logger.info(
-            #     "[TargetSample] sid=%s  sampled_ids=%s  words=%s",
-            #     sid, sampled_ids, sampled_words
-            # )
-            tgt_row_probs = all_row_probs[:-1]
-
+            )  # (spec_bucket, V)
+            
+            # Only process up to the original draft length (ignore padded tokens)
+            tgt_row_probs = all_row_probs[:-1]  # Remove bonus token position
+            
             device = tgt_row_probs.device
-            dr_tokens = torch.tensor(draft_tokens, device=device)
-            row_idx   = torch.arange(len(draft_tokens), device=device)
-            p_tgt   = tgt_row_probs[row_idx, dr_tokens]
-            q_draft = torch.tensor(draft_probs, device=device)
+            # Only use the original (non-padded) draft tokens for verification
+            actual_draft_tokens = draft_tokens[:original_draft_length]
+            actual_draft_probs = draft_probs[:original_draft_length]
+            
+            dr_tokens = torch.tensor(actual_draft_tokens, device=device)
+            row_idx = torch.arange(len(actual_draft_tokens), device=device)
+            
+            if len(actual_draft_tokens) > 0:
+                p_tgt = tgt_row_probs[row_idx, dr_tokens]
+                q_draft = torch.tensor(actual_draft_probs, device=device)
 
-            ratio  = p_tgt / q_draft
-            rand_v = torch.rand_like(ratio)
-            accept = (p_tgt >= q_draft) | (rand_v < ratio)
-            rej    = (~accept).nonzero(as_tuple=False)
-            first_rej = int(rej[0].item()) if rej.numel() > 0 else len(draft_tokens)
-            # logger.info(
-            #     f"[ACCEPTANCE DEBUG] "
-            #     f"accept={accept.cpu().tolist()} "
-            #     f"reject_indices={(rej.squeeze(-1).cpu().tolist() if rej.numel() else [])} "
-            #     f"first_rej={first_rej}"
-            # )
-
+                ratio = p_tgt / (q_draft + 1e-10)  # Add small epsilon to avoid division by zero
+                rand_v = torch.rand_like(ratio)
+                accept = (p_tgt >= q_draft) | (rand_v < ratio)
+                rej = (~accept).nonzero(as_tuple=False)
+                first_rej = int(rej[0].item()) if rej.numel() > 0 else len(actual_draft_tokens)
+            else:
+                first_rej = 0
 
             accepted_cnt = first_rej
-            committed    = draft_tokens[:accepted_cnt]
+            committed = actual_draft_tokens[:accepted_cnt]
 
-            if accepted_cnt < len(draft_tokens):
+            # Add bonus token
+            if accepted_cnt < len(actual_draft_tokens):
+                # Rejection occurred, sample from the position where rejection happened
                 bonus_id = int(torch.multinomial(all_row_probs[first_rej], 1).item())
             else:
+                # All tokens accepted, sample from the bonus position
                 bonus_id = int(torch.multinomial(all_row_probs[-1], 1).item())
             committed.append(bonus_id)
-
-            # ----------------------------------------------------------
-            # DEBUG: Show draft proposals, target predictions, accept/reject,
-            #        and final committed chunk in **human‑readable words**
-            # ----------------------------------------------------------
-            # draft_words = [
-            #     tokenizer.decode([tid], clean_up_tokenization_spaces=False)
-            #     for tid in draft_tokens
-            # ]
-            # tgt_preds = torch.argmax(tgt_row_probs, dim=-1).tolist()
-            # tgt_words = [
-            #     tokenizer.decode([tid], clean_up_tokenization_spaces=False)
-            #     for tid in tgt_preds
-            # ]
-            # committed_words = [
-            #     tokenizer.decode([tid], clean_up_tokenization_spaces=False)
-            #     for tid in committed
-            # ]
-            # status = (
-            #     "all_accepted"
-            #     if accepted_cnt == len(draft_tokens)
-            #     else f"rejected_from_pos_{accepted_cnt}"
-            # )
-            # logger.info(
-            #     "[Verify] sid=%s  status=%s\n"
-            #     "  draft  = %s\n"
-            #     "  target = %s\n"
-            #     "  commit = %s",
-            #     sid, status,
-            #     draft_words, tgt_words, committed_words,
-            # )
 
             self._commit_tokens_bulk(sess, committed)
             finished = sess.finished

@@ -7,7 +7,7 @@ import threading
 import uuid
 from datetime import datetime
 from grpc_comm import inference_pb2_grpc, inference_pb2, grpc_client
-from inference.model_loader import load_model
+from inference.model_loader import load_model, get_spec_bucket_for_gamma, pad_tokens_to_bucket
 from transformers import AutoTokenizer
 import torch
 import random
@@ -47,8 +47,8 @@ def speculative_decode(
     Perform probability-based speculative decoding using a draft model and a target model via gRPC,
     with full rollback of the draft model's past states.
     Extended to handle a session_id so multiple prompts can run concurrently on the server.
+    Uses dynamic gamma adjustment with PID controller.
     """
-    # snap initial γ to the largest compiled bucket ≤ user request
     # Derive valid gammas and gamma_max from the bucket list
     valid_gammas = tuple(b - 1 for b in SPEC_LENGTH_BUCKETS if b > 1)
 
@@ -59,21 +59,27 @@ def speculative_decode(
             f"current value = {SPEC_LENGTH_BUCKETS}"
         )
     gamma_max = max(valid_gammas)
-    # Clamp the user‑requested γ to the supported range [1, gamma_max]
-    current_gamma = gamma
-    current_temp  = temperature            # draft temperature we can tweak
-    target_accept = 0.5                    # desired per‑loop acceptance rate
+    
+    # PID controller for dynamic gamma adjustment
+    current_gamma = min(gamma, gamma_max)  # Start with requested gamma, clamped to max
+    current_temp = temperature
+    target_accept = 0.5  # desired acceptance rate
+    
+    # PID controller parameters (tunable)
+    pid_kp = 0.3  # proportional gain
+    pid_ki = 0.05  # integral gain
+    pid_kd = 0.1   # derivative gain
+    pid_integral = 0.0
+    pid_prev_error = 0.0
 
     logger.debug(
-        f"[session={session_id}] Starting speculative_decode: "
-        f"prompt='{prompt[:60]}...' max_new_tokens={max_new_tokens} gamma={gamma}"
+        f"[session={session_id}] Starting speculative_decode with dynamic gamma: "
+        f"initial_gamma={current_gamma}, max_gamma={gamma_max}, buckets={SPEC_LENGTH_BUCKETS}"
     )
 
     # Initial setup: process prompt through draft model to initialize cache
     output_tokens = []
-    # draft_model.cache_ids = None
-    # draft_model._next_pos = 0  # next position index in the KV cache
-
+    
     # pre-filling: Feed the entire prompt once so the draft model builds its KV cache
     prompt_ids = tokenizer(prompt, return_tensors='pt').input_ids
     assert prompt_ids is not None, "Prompt tokenization failed due to empty input."
@@ -87,6 +93,7 @@ def speculative_decode(
         "draft_generation_time":    0.0,
         "grpc_roundtrip_time":      0.0,   # pure network + (de)serialisation latency
         "target_verification_time": 0.0,   # server‑side compute only
+        "target_prefill_time":      0.0,   # server‑side prefill time
         "sampling_filter_time":     0.0,   # time spent on n‑gram mask + top‑k/p filter
     }
     
@@ -102,8 +109,6 @@ def speculative_decode(
     timing["draft_prefill_time"] += time.perf_counter() - time_draftprefill
     # Overwrite cache pointer with a single‑index tensor [L]
     draft_model.update_cache(L)
-    # draft_model.cache_ids = torch.tensor([L], dtype=torch.int32)
-    # draft_model._next_pos = L
 
     tokens_generated = 0
     # reusable scratch tensor (1,1) for single-token forwards
@@ -115,14 +120,13 @@ def speculative_decode(
     target_tokens_total = 0
 
     while not finished and tokens_generated < max_new_tokens:
-        # The draft model proposes up to 'gamma' tokens
+        # Determine the bucket size needed for current gamma
+        spec_bucket = get_spec_bucket_for_gamma(current_gamma, SPEC_LENGTH_BUCKETS)
+        
+        # The draft model proposes up to 'current_gamma' tokens
         speculative_tokens = []
         speculative_probs = []
-        # # ---------- just before the debug call, print he actual word generated ----------
-        # token_texts = [tokenizer.decode([tid], clean_up_tokenization_spaces=False)
-        #             for tid in speculative_tokens]
 
-        # past_states = [draft_model.cache_ids]
         for i in range(current_gamma):
             scratch_token[0, 0] = prev_token_id
             # Compute the absolute KV-cache position for this token
@@ -135,9 +139,7 @@ def speculative_decode(
             time_draftgen = time.perf_counter()            
             logits, _ = draft_model.forward(input_ids=scratch_token, cache_ids=cache_vec)
             timing["draft_generation_time"] += time.perf_counter() - time_draftgen
-            # logits = logits.float()
 
-            # ---- Our improved numeric stability start ----
             # Temperature‑scale logits then apply classic nucleus (top‑p) filter
             time_sample = time.perf_counter()
             # apply ngram filter
@@ -169,65 +171,27 @@ def speculative_decode(
             speculative_probs.append(token_prob)
             
             prev_token_id = token_id
-            # past_states.append(draft_model.cache_ids + i)   # save pointer to next slot
+            
             # Stop if end-of-sequence or max_new_tokens reached
             if tokenizer.eos_token_id is not None and token_id == tokenizer.eos_token_id:
                 finished = True
                 break
             if tokens_generated + len(speculative_tokens) >= max_new_tokens:
                 break
- 
-        # # If overshoot
-        # if len(speculative_tokens) > 0 and tokens_generated > max_new_tokens:
-        #     overshoot = tokens_generated - max_new_tokens
-        #     speculative_tokens = speculative_tokens[:-overshoot]
-        #     speculative_probs = speculative_probs[:-overshoot]
-        #     output_tokens = output_tokens[:-overshoot]
-        #     tokens_generated = max_new_tokens
-        #     finished = True
 
         if not speculative_tokens:
             break
 
-        # 8) Verify tokens with target model
-        # --------------------------------------------------------------
-        # Fast‑fail if the speculative chunk length is NOT one of the
-        # compiled γ buckets.  We no longer truncate; instead we raise to
-        # surface a configuration / logic error immediately.
-        # --------------------------------------------------------------
-
-        # ==============================================================
-        # if len(speculative_tokens) not in valid_gammas:
-        #     assert len(speculative_tokens) in valid_gammas, (
-        #         f"Speculative chunk length {len(speculative_tokens)} is not "
-        #         f"supported by the compiled target model; valid γ buckets = "
-        #         f"{valid_gammas}"
-        #     )
-        # ============================================================
-
-        # ============================================================
-        # Ensure speculative_probs is the same length as speculative_tokens.
-        # This can become mismatched when we break early from the inner loop
-        # (e.g. EOS or token‑budget exhaustion).  Truncate to the shorter
-        # length so we never advance _next_pos past the compiled context.
-        # ============================================================
-        
-        # # ====================================================================
-        # # --- Verify + commit in one RPC ---
-        # # logger.debug("[session=%s] Proposed tokens: %s", session_id, speculative_tokens)
-        # # --- show draft chunk as words instead of IDs -----------------
-        # token_texts_dbg = [
-        #     tokenizer.decode([tid], clean_up_tokenization_spaces=False)
-        #     for tid in speculative_tokens
-        # ]
-        # logger.debug("[session=%s] draft model proposed: chunk len=%d, proposed tokens (text)=%s, ids=%s, probs=%s", session_id, len(speculative_tokens), token_texts_dbg, speculative_tokens, speculative_probs)
-        # # ====================================================================
-
+        # Pad draft tokens to the spec bucket size if needed (for target model compatibility)
+        padded_tokens, original_length = pad_tokens_to_bucket(
+            speculative_tokens, spec_bucket - 1, pad_token_id=0  # -1 because bucket includes bonus token
+        )
+        padded_probs = speculative_probs + [0.0] * (len(padded_tokens) - len(speculative_probs))
 
         # ----- measure RPC round‑trip and split into network vs. verify compute -----
         time_roundtrip = time.perf_counter()
         commit_ids, accepted_count, verify_time_ms, target_finished = grpc_client.verify_draft_tokens(
-            stub, speculative_tokens, speculative_probs, session_id=session_id
+            stub, padded_tokens, padded_probs, session_id=session_id
         )
         rpc_roundtrip = time.perf_counter() - time_roundtrip
 
@@ -237,6 +201,29 @@ def speculative_decode(
 
         timing["grpc_roundtrip_time"]      += network_sec
         timing["target_verification_time"] += verify_sec
+        
+        # Only consider acceptances up to the original draft length (ignore padded tokens)
+        actual_accepted = min(accepted_count, original_length)
+        
+        # PID controller for gamma adjustment
+        if original_length > 0:  # Avoid division by zero
+            acceptance_rate = actual_accepted / original_length
+            
+            # PID controller update
+            error = target_accept - acceptance_rate
+            pid_integral += error
+            pid_derivative = error - pid_prev_error
+            
+            gamma_adjustment = pid_kp * error + pid_ki * pid_integral + pid_kd * pid_derivative
+            
+            # Update gamma (clamp to valid range)
+            new_gamma = current_gamma + gamma_adjustment
+            current_gamma = max(1, min(gamma_max, round(new_gamma)))
+            
+            pid_prev_error = error
+            
+            logger.debug(f"[session={session_id}] Acceptance rate: {acceptance_rate:.3f}, "
+                       f"adjusted gamma: {current_gamma}")
 
         # ------------------------------------------------------------------
         # Respect the remaining token budget so we never exceed max_new_tokens.
@@ -252,14 +239,13 @@ def speculative_decode(
         elif len(commit_ids) > remaining_budget:
             commit_ids = commit_ids[:remaining_budget]
             # clamp accepted_count as well
-            if accepted_count > len(commit_ids):
-                accepted_count = len(commit_ids)
+            if actual_accepted > len(commit_ids):
+                actual_accepted = len(commit_ids)
 
         # Now that commit_ids is final, update global counters
-        accepted_tokens_total += accepted_count
+        accepted_tokens_total += actual_accepted
         # Track how many tokens were generated by the target model this loop
-        target_tokens_total += max(0, len(commit_ids) - accepted_count)
-
+        target_tokens_total += max(0, len(commit_ids) - actual_accepted)
 
         # 2) Forward **one** bonus token only if we actually committed tokens
         #    this round.  An empty commit_ids means the target rejected the
@@ -275,15 +261,10 @@ def speculative_decode(
 
         # Set the last committed token as the new context token for draft model
         prev_token_id = bonus_id
-        # ==============================================================
-        # # 3) Advance pointer past the newly‑written bonus token.
-        # this is used to update the KV cache ptr
-        # --------------------------------------------------------------
-        # Advance the draft model’s KV pointer by (accepted_count + bonus)
-        # --------------------------------------------------------------
-        delta = accepted_count + 1          # bonus token counts as +1
+        
+        # Advance the draft model's KV pointer by (accepted_count + bonus)
+        delta = actual_accepted + 1          # bonus token counts as +1
         draft_model.update_cache(delta)     # unified, increment-by-delta API
-        # ==============================================================
 
         # Record every token that will appear in the final text
         output_tokens.extend(commit_ids)
@@ -295,33 +276,11 @@ def speculative_decode(
             finished = True
 
         logger.debug("ACCEPT cnt=%d  committed=%s",
-             accepted_count,
-             speculative_tokens[:accepted_count])
+             actual_accepted,
+             speculative_tokens[:actual_accepted])
         # Propagate server‑side finished flag
         finished = finished or target_finished
 
-        # ---------- adaptive γ and temperature (P‑controller) ----------
-        # if current_gamma > 0:
-        #     loop_accept_rate = accepted_count / current_gamma
-        #     error = target_accept - loop_accept_rate
-
-        #     # PID suggestion
-        #     desired_gamma = int(max(1, min(gamma_max,
-        #                                    current_gamma + 0.5 * error * current_gamma)))
-        #     # snap to nearest compiled bucket _not exceeding_ desired_gamma
-        #     new_gamma = max(g for g in valid_gammas if g <= desired_gamma)
-        #     if new_gamma != current_gamma:
-        #         logger.debug("[session=%s] Adjust γ %d → %d (acc_rate=%.2f, desired=%d)",
-        #                      session_id, current_gamma, new_gamma, loop_accept_rate, desired_gamma)
-        #     current_gamma = new_gamma
-
-        #     new_temp = max(0.3, min(2.0, current_temp * (1 + 0.2 * error)))
-        #     if abs(new_temp - current_temp) > 1e-3:
-        #         logger.debug("[session=%s] Adjust draft temperature %.3f → %.3f",
-        #                      session_id, current_temp, new_temp)
-        #     current_temp = new_temp
-
-        # =======================================================================
         if target_finished or tokens_generated >= max_new_tokens:
             finished = True
 
@@ -344,6 +303,7 @@ def speculative_decode(
             "draft_generation_time":    timing["draft_generation_time"],
             "grpc_roundtrip_time":      timing["grpc_roundtrip_time"],
             "target_verification_time": timing["target_verification_time"],
+            "target_prefill_time":      timing["target_prefill_time"],
             "sampling_filter_time":     timing["sampling_filter_time"],
         })
 

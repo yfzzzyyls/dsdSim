@@ -17,9 +17,54 @@ import types
 # fsd.to_neuron()  # Compile the fused speculative model
  # Speculation buckets are specified by *length*; the compiler will build
  # both batch‑1 and batch‑2 heads automatically when `dynamic_batch_size=True`.
-SPEC_LENGTH_BUCKETS = [5]
-BATCH_BUCKETS = [1, 2, 3, 4]
+SPEC_LENGTH_BUCKETS = [3, 5]  # supports gamma=2 and gamma=4
+BATCH_BUCKETS = [1, 2]
 logger = logging.getLogger(__name__)
+
+def get_spec_bucket_for_gamma(gamma: int, available_buckets=None) -> int:
+    """
+    Map a requested gamma to the smallest available spec bucket that can accommodate it.
+    
+    Args:
+        gamma: Requested speculation length
+        available_buckets: List of compiled bucket sizes (e.g., [3, 5])
+    
+    Returns:
+        The bucket size to use (e.g., if gamma=3 and buckets=[3,5], return 5 for the +1 bonus token)
+    """
+    if available_buckets is None:
+        available_buckets = SPEC_LENGTH_BUCKETS
+    
+    # We need gamma + 1 tokens (gamma draft + 1 bonus), so find the smallest bucket >= gamma + 1
+    required_size = gamma + 1
+    
+    valid_buckets = [b for b in available_buckets if b >= required_size]
+    if not valid_buckets:
+        raise ValueError(f"No compiled bucket can handle gamma={gamma}. "
+                        f"Available buckets: {available_buckets}, required size: {required_size}")
+    
+    return min(valid_buckets)
+
+def pad_tokens_to_bucket(tokens: list, target_bucket_size: int, pad_token_id: int = 0) -> tuple[list, int]:
+    """
+    Pad token list to match the target bucket size.
+    
+    Args:
+        tokens: List of token IDs
+        target_bucket_size: The bucket size to pad to
+        pad_token_id: Token ID to use for padding
+    
+    Returns:
+        (padded_tokens, original_length) where original_length is the number of real tokens
+    """
+    original_length = len(tokens)
+    if original_length >= target_bucket_size:
+        # Truncate if too long (shouldn't happen with proper bucket selection)
+        return tokens[:target_bucket_size], min(original_length, target_bucket_size)
+    
+    # Pad to target size
+    padded_tokens = tokens + [pad_token_id] * (target_bucket_size - original_length)
+    return padded_tokens, original_length
 
 class NeuronHFAdapterWrap(torch.nn.Module):
     """
