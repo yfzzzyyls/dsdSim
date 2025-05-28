@@ -441,7 +441,6 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
             prev_token = int(sess.current_ids[0, -1].item())
             draft_tokens = r["draft_tokens"]
             toks = [prev_token] + draft_tokens          # γ+1 tokens
-            original_length = len(toks)  # Save original length before padding
 
             # Pad to spec_bucket size
             pad_id = 0
@@ -451,13 +450,7 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
                 toks = toks[:spec_bucket]  # Truncate if too long
 
             start_pos = int(sess.get_session_cache_id().item())
-            # Use original_length for cache vector, not spec_bucket to avoid processing padding
-            vec = torch.arange(original_length, dtype=torch.int32) + start_pos
-            # Pad cache vector to match token tensor size
-            if len(vec) < spec_bucket:
-                # Pad with dummy values that won't affect computation
-                padding = torch.full((spec_bucket - len(vec),), start_pos + original_length, dtype=torch.int32)
-                vec = torch.cat([vec, padding])
+            vec = torch.arange(spec_bucket, dtype=torch.int32) + start_pos
 
             input_ids.append(torch.tensor(toks, dtype=torch.int32))
             cache_vecs.append(vec)
