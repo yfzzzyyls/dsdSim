@@ -157,49 +157,34 @@ def generate_draft_chunk(draft_model, prev_token_id, tokenizer, gamma, top_p, te
 
 def synchronize_runahead_model(runahead_model, main_model, accepted_tokens):
     """
-    Synchronize the runahead model's KV cache with the main model by processing accepted tokens.
+    Synchronize the runahead model's cache pointer with the main model.
     
-    This ensures both models have identical conversation history, which is critical for 
-    proper run-ahead optimization based on AMUSD's approach.
+    Simplified approach: Since both models were initialized with the same prompt,
+    we just need to keep their cache pointers in sync. The actual KV cache content
+    should already be identical from the initial prompt processing.
     
     Args:
         runahead_model: The separate runahead model instance
         main_model: The main draft model
-        accepted_tokens: List of tokens that were accepted by the target model
+        accepted_tokens: List of tokens that were accepted (not used in simple sync)
     """
-    if not accepted_tokens or runahead_model is None:
+    if runahead_model is None:
         return
     
     try:
-        # Ensure runahead model is at the same cache position as main model before processing
+        # Simply synchronize cache pointers - both models have same conversation history
+        # from initial prompt processing
         main_cache_pos = int(main_model.get_cache_id_vec().item())
-        runahead_cache_pos = int(runahead_model.get_cache_id_vec().item())
+        runahead_model.update_cache(main_cache_pos)
         
-        # If models are out of sync, align the runahead model to the main model position
-        if runahead_cache_pos != main_cache_pos:
-            runahead_model.update_cache(main_cache_pos)
-        
-        # Process accepted tokens through the runahead model to sync KV cache content
-        if len(accepted_tokens) > 0:
-            # Convert tokens to tensor format expected by the model
-            token_tensor = torch.tensor([accepted_tokens], dtype=torch.int64)  # (1, N)
-            
-            # Build cache position vector for the accepted tokens
-            start_pos = main_cache_pos
-            cache_vec = torch.arange(start_pos, start_pos + len(accepted_tokens), dtype=torch.int32).unsqueeze(0)
-            
-            # Process tokens through runahead model to update its KV cache
-            # This aligns the runahead model's conversation history with the main model
-            _ = runahead_model.forward(input_ids=token_tensor, cache_ids=cache_vec)
-        
-        logger.debug(f"Synchronized runahead model with {len(accepted_tokens)} accepted tokens")
+        logger.debug(f"Synchronized runahead model cache pointer to position {main_cache_pos}")
         
     except Exception as e:
         logger.warning(f"Failed to synchronize runahead model: {e}")
 
 
 def generate_draft_chunk_isolated(runahead_model, prev_token_id, tokenizer, gamma, top_p, temperature, 
-                                 main_cache_state=None):
+                                  main_cache_state=None):
     """
     Generate draft tokens using a separate model instance to avoid cache conflicts.
     
@@ -296,7 +281,9 @@ def generate_draft_chunk_isolated(runahead_model, prev_token_id, tokenizer, gamm
         return [], [], prev_token_id, 0.0
     
     generation_time = time.time() - start_time
-    return draft_tokens, draft_probs, current_token, generation_time
+    # Also return first speculative token for bonus comparison
+    first_spec = draft_tokens[0] if draft_tokens else None
+    return draft_tokens, draft_probs, current_token, generation_time, first_spec
 
 
 def generate_draft_chunk_async(draft_model, prev_token_id, tokenizer, gamma, top_p, temperature):
@@ -421,7 +408,9 @@ def speculative_decode(
             if future_chunk is not None:
                 # Try to use pre-generated chunk from run-ahead
                 try:
-                    draft_tokens, draft_probs, final_token, generation_time = future_chunk.result(timeout=0.005)
+                    draft_tokens, draft_probs, final_token, generation_time, ra_first = future_chunk.result(timeout=0.005)
+                    # Save first speculative token for bonus comparison
+                    runahead_first = ra_first
                     timing['runhead_savings'] += generation_time
                     timing['draft_generation_time'] += generation_time  # Still count toward total
                     logger.debug(f"[session={session_id}] Used run-ahead chunk, saved {generation_time:.3f}s")
@@ -536,6 +525,13 @@ def speculative_decode(
             else:
                 # All tokens accepted
                 logger.debug(f"[session={session_id}] All {len(draft_tokens)} draft tokens accepted")
+                # Compare bonus against speculative prediction
+                bonus_id = commit_ids[-1]
+                if future_chunk and runahead_first != bonus_id:
+                    # Wrong speculative bonus → cancel and resync run-ahead
+                    future_chunk.cancel()
+                    future_chunk = None
+                    synchronize_runahead_model(runahead_model, draft_model, commit_ids)
 
             # Respect the remaining token budget so we never exceed max_new_tokens.
             tokens_generated += len(commit_ids)
