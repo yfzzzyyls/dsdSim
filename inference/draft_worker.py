@@ -155,155 +155,9 @@ def generate_draft_chunk(draft_model, prev_token_id, tokenizer, gamma, top_p, te
     return draft_tokens, draft_probs, current_token
 
 
-def synchronize_runahead_model(runahead_model, main_model, accepted_tokens):
-    """
-    Synchronize the runahead model's KV cache with the main model by processing accepted tokens.
-    
-    This ensures both models have identical conversation history, which is critical for 
-    proper run-ahead optimization based on AMUSD's approach.
-    
-    Args:
-        runahead_model: The separate runahead model instance
-        main_model: The main draft model
-        accepted_tokens: List of tokens that were accepted by the target model
-    """
-    if not accepted_tokens or runahead_model is None:
-        return
-    
-    try:
-        # Ensure runahead model is at the same cache position as main model before processing
-        main_cache_pos = int(main_model.get_cache_id_vec().item())
-        runahead_cache_pos = int(runahead_model.get_cache_id_vec().item())
-        
-        # If models are out of sync, align the runahead model to the main model position
-        if runahead_cache_pos != main_cache_pos:
-            runahead_model.update_cache(main_cache_pos)
-        
-        # Process accepted tokens through the runahead model to sync KV cache content
-        if len(accepted_tokens) > 0:
-            # Convert tokens to tensor format expected by the model
-            token_tensor = torch.tensor([accepted_tokens], dtype=torch.int64)  # (1, N)
-            
-            # Build cache position vector for the accepted tokens
-            start_pos = main_cache_pos
-            cache_vec = torch.arange(start_pos, start_pos + len(accepted_tokens), dtype=torch.int32).unsqueeze(0)
-            
-            # Process tokens through runahead model to update its KV cache
-            # This aligns the runahead model's conversation history with the main model
-            _ = runahead_model.forward(input_ids=token_tensor, cache_ids=cache_vec)
-        
-        logger.debug(f"Synchronized runahead model with {len(accepted_tokens)} accepted tokens")
-        
-    except Exception as e:
-        logger.warning(f"Failed to synchronize runahead model: {e}")
-
-
-def generate_draft_chunk_isolated(runahead_model, prev_token_id, tokenizer, gamma, top_p, temperature, 
-                                 main_cache_state=None):
-    """
-    Generate draft tokens using a separate model instance to avoid cache conflicts.
-    
-    This is the correct approach based on AMUSD's design: use separate model instances
-    for main generation vs run-ahead generation, with cache synchronization when needed.
-    
-    The key insight: Both models should have the same conversation history (KV cache content).
-    This is achieved by keeping them synchronized through accepted token processing.
-    
-    Args:
-        runahead_model: Separate draft model instance for run-ahead generation
-        prev_token_id: Token to start generation from
-        tokenizer: Tokenizer for EOS detection
-        gamma: Number of tokens to generate
-        top_p: Nucleus sampling parameter
-        temperature: Temperature for sampling
-        main_cache_state: Cache pointer position from main model (for position sync)
-    
-    Returns:
-        (draft_tokens, draft_probs, final_token, generation_time)
-    """
-    start_time = time.time()
-    
-    try:
-        # Sync cache pointer to match main model if provided
-        # Note: The actual KV cache content should already be synchronized 
-        # through processing the same accepted tokens in both models
-        if main_cache_state is not None:
-            runahead_model.update_cache(main_cache_state)
-        
-        # Save the starting cache position for restoration if needed
-        starting_cache_pos = int(runahead_model.get_cache_id_vec().item())
-        
-        draft_tokens = []
-        draft_probs = []
-        
-        # reusable scratch tensor (1,1) for single-token forwards
-        scratch_token = torch.empty((1, 1), dtype=torch.int64)
-        current_token = prev_token_id
-        
-        # Generate tokens sequentially using the isolated model
-        for i in range(gamma):
-            scratch_token[0, 0] = current_token
-            
-            # Compute the absolute KV-cache position for this token
-            current_ptr = int(runahead_model.get_cache_id_vec().item())
-            next_pos = current_ptr + i
-            # Neuron decoder expects (B, 1) – wrap pos in an extra bracket
-            cache_vec = torch.tensor([[next_pos]], dtype=torch.int32, device=scratch_token.device)
-            
-            # Generate using the isolated runahead model with explicit cache position
-            logits, _ = runahead_model.forward(input_ids=scratch_token, cache_ids=cache_vec)
-
-            # Apply ngram filter
-            masked = sampling.filter_ngrams(
-                NGRAM_WINDOW,
-                torch.tensor([current_token]).unsqueeze(0),
-                logits.unsqueeze(0),    # (1, V) expected
-                next_pos
-            )
-
-            # Apply temperature scaling
-            logits = logits / temperature
-
-            # Apply top k and top p filtering
-            masked, candidate_idx = sampling.top_k_top_p_filtering(
-                logits.unsqueeze(0),             # (1, V) expected
-                top_k=TOP_K,
-                top_p=top_p
-            )
-
-            probs = torch.softmax(masked, dim=-1).squeeze(0)
-            sample_in_topk = torch.multinomial(probs, 1).item()
-            token_id = int(candidate_idx[0, sample_in_topk])
-            token_prob = float(probs[sample_in_topk])
-
-            # Store the token and its probability
-            draft_tokens.append(token_id)
-            draft_probs.append(token_prob)
-            
-            current_token = token_id
-            
-            # Stop if end-of-sequence
-            if tokenizer.eos_token_id is not None and token_id == tokenizer.eos_token_id:
-                break
-        
-        # CRITICAL: Restore the original cache position in the runahead model
-        # This prevents the runahead model from advancing permanently until tokens are verified
-        runahead_model.update_cache(starting_cache_pos)
-        
-    except Exception as e:
-        logger.debug(f"Isolated run-ahead failed: {e}")
-        # On any error, return empty result to fall back to sync generation
-        return [], [], prev_token_id, 0.0
-    
-    generation_time = time.time() - start_time
-    return draft_tokens, draft_probs, current_token, generation_time
-
-
 def generate_draft_chunk_async(draft_model, prev_token_id, tokenizer, gamma, top_p, temperature):
     """
     Async wrapper for draft chunk generation that also tracks generation time.
-    NOTE: This function should NOT be used for run-ahead as it causes cache corruption.
-    Use generate_draft_chunk_isolated instead for run-ahead optimization.
     """
     start_time = time.time()
     tokens, probs, final_token = generate_draft_chunk(
@@ -322,8 +176,7 @@ def speculative_decode(
     profile=False,
     top_p=0.9,
     temperature=1.0,
-    session_id=0,
-    runahead_model=None
+    session_id=0
 ):
     """
     Perform speculative decoding with 1-chunk run-ahead optimization.
@@ -381,24 +234,6 @@ def speculative_decode(
     # Overwrite cache pointer with a single index tensor [L]
     draft_model.update_cache(L)
 
-    # CRITICAL: Initialize runahead model with the same prompt to ensure identical conversation history
-    # This is essential for proper cache synchronization in the run-ahead optimization
-    if runahead_model is not None:
-        logger.debug(f"[session={session_id}] Initializing runahead model with prompt (length={L})")
-        try:
-            # Process the same prompt through the runahead model
-            _ = runahead_model.forward(
-                input_ids=prompt_ids,
-                cache_ids=cache_vec,
-            )
-            # Set the same cache position as the main model
-            runahead_model.update_cache(L)
-            logger.debug(f"[session={session_id}] Runahead model initialized successfully")
-        except Exception as e:
-            logger.warning(f"[session={session_id}] Failed to initialize runahead model: {e}")
-            # Disable runahead if initialization fails
-            runahead_model = None
-
     tokens_generated = 0
     # fixed-size deque for fast repetition penalty history
     recent_deque  = collections.deque(maxlen=50)
@@ -406,45 +241,31 @@ def speculative_decode(
     accepted_tokens_total = 0
     target_tokens_total = 0
 
-    # Enhanced run-ahead optimization with proper coordination
-    # Instead of disabling run-ahead, implement it properly using careful timing
-    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="RunAhead")
+    # Run-ahead optimization setup
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
     future_chunk = None
+    state_manager = DraftModelStateManager(draft_model)
     
     try:
         while not finished and tokens_generated < max_new_tokens:
             loop_start = time.time()
             
             # === GENERATE CURRENT CHUNK ===
-            current_chunk_start = time.perf_counter()
-            
-            if future_chunk is not None:
+            if future_chunk is not None and not future_chunk.cancelled():
                 # Try to use pre-generated chunk from run-ahead
                 try:
-                    draft_tokens, draft_probs, final_token, generation_time = future_chunk.result(timeout=0.005)
+                    draft_tokens, draft_probs, final_token, generation_time = future_chunk.result(timeout=0.001)
                     timing['runhead_savings'] += generation_time
-                    timing['draft_generation_time'] += generation_time  # Still count toward total
-                    logger.debug(f"[session={session_id}] Used run-ahead chunk, saved {generation_time:.3f}s")
+                    logger.debug(f"[session={session_id}] Using pre-generated chunk, saved {generation_time:.3f}s")
                 except concurrent.futures.TimeoutError:
-                    # Run-ahead not ready, generate synchronously and cancel async
-                    future_chunk.cancel()
-                    future_chunk = None
-                    time_draftgen = time.perf_counter()
-                    draft_tokens, draft_probs, final_token = generate_draft_chunk(
-                        draft_model, prev_token_id, tokenizer, current_gamma, top_p, current_temp
-                    )
-                    timing['draft_generation_time'] += time.perf_counter() - time_draftgen
-                    logger.debug(f"[session={session_id}] Run-ahead timeout, generated synchronously")
-                except Exception as e:
-                    # Run-ahead failed, generate synchronously
-                    logger.warning(f"[session={session_id}] Run-ahead failed: {e}, falling back to sync")
+                    # Run-ahead not ready yet, generate synchronously
                     time_draftgen = time.perf_counter()
                     draft_tokens, draft_probs, final_token = generate_draft_chunk(
                         draft_model, prev_token_id, tokenizer, current_gamma, top_p, current_temp
                     )
                     timing['draft_generation_time'] += time.perf_counter() - time_draftgen
             else:
-                # No run-ahead available, generate synchronously
+                # Generate synchronously
                 time_draftgen = time.perf_counter()
                 draft_tokens, draft_probs, final_token = generate_draft_chunk(
                     draft_model, prev_token_id, tokenizer, current_gamma, top_p, current_temp
@@ -454,19 +275,12 @@ def speculative_decode(
             if not draft_tokens:
                 break
 
-            # === CAPTURE CACHE STATE BEFORE RUN-AHEAD ===
-            # Save the original cache position before any run-ahead generation
-            # This is critical for proper rollback on token rejection
-            original_cache_pos = int(draft_model.get_cache_id_vec().item())
-
             # === START RUN-AHEAD GENERATION ===
-            # Start isolated run-ahead generation for the next chunk using separate model
-            if tokens_generated + len(draft_tokens) < max_new_tokens and runahead_model is not None:
-                # Sync the runahead model cache with main model state
-                main_cache_state = int(draft_model.get_cache_id_vec().item())
+            # Begin generating the next chunk speculatively
+            if tokens_generated + len(draft_tokens) < max_new_tokens:
                 future_chunk = executor.submit(
-                    generate_draft_chunk_isolated,
-                    runahead_model, final_token, tokenizer, current_gamma, top_p, current_temp, main_cache_state
+                    generate_draft_chunk_async,
+                    draft_model, final_token, tokenizer, current_gamma, top_p, current_temp
                 )
 
             # Determine the bucket size needed for current gamma
@@ -513,28 +327,15 @@ def speculative_decode(
 
             # === PROCESS VERIFICATION RESULT ===
             if actual_accepted < len(draft_tokens):
-                # Rejection occurred - cancel run-ahead since prediction was wrong
+                # Rejection occurred - cancel run-ahead and prepare for rollback
                 if future_chunk:
                     future_chunk.cancel()
                     future_chunk = None
-                    logger.debug(f"[session={session_id}] Cancelled run-ahead due to rejection")
-                
-                # CRITICAL ROLLBACK: If we had run-ahead tokens cached beyond what was accepted,
-                # we need to rollback the cache to the correct position
-                current_cache_pos = int(draft_model.get_cache_id_vec().item())
-                expected_cache_pos_after_accepted = original_cache_pos + actual_accepted
-                
-                if current_cache_pos > expected_cache_pos_after_accepted:
-                    # Rollback required - set cache to position after accepted tokens
-                    rollback_amount = current_cache_pos - expected_cache_pos_after_accepted
-                    draft_model.update_cache(expected_cache_pos_after_accepted)
-                    logger.debug(f"[session={session_id}] Rolled back cache by {rollback_amount} positions "
-                               f"from {current_cache_pos} to {expected_cache_pos_after_accepted}")
                 
                 logger.debug(f"[session={session_id}] Rejection at position {actual_accepted}, "
                            f"accepted {actual_accepted}/{len(draft_tokens)} draft tokens")
             else:
-                # All tokens accepted
+                # All tokens accepted - run-ahead is valid!
                 logger.debug(f"[session={session_id}] All {len(draft_tokens)} draft tokens accepted")
 
             # Respect the remaining token budget so we never exceed max_new_tokens.
@@ -566,18 +367,9 @@ def speculative_decode(
             # Set the last committed token as the new context token for draft model
             prev_token_id = bonus_id
             
-            # FIXED: Set cache to the correct absolute position after processing commit_ids
-            # The cache should be at original_cache_pos + len(commit_ids) after processing all committed tokens
-            final_cache_pos = original_cache_pos + len(commit_ids)
-            draft_model.update_cache(final_cache_pos)     # Set absolute position
-            
-            # CRITICAL: Synchronize runahead model with accepted tokens to maintain identical KV cache content
-            # This ensures both models have the same conversation history for proper run-ahead optimization
-            if runahead_model is not None and len(commit_ids) > 0:
-                synchronize_runahead_model(runahead_model, draft_model, commit_ids)
-            
-            logger.debug(f"[session={session_id}] Updated cache from {original_cache_pos} to {final_cache_pos} "
-                        f"(+{len(commit_ids)} tokens: {actual_accepted} accepted + {len(commit_ids) - actual_accepted} bonus)")
+            # Advance the draft model's KV pointer by (accepted_count + bonus)
+            delta = actual_accepted + 1          # bonus token counts as +1
+            draft_model.update_cache(delta)     # unified, increment-by-delta API
 
             # Record every token that will appear in the final text
             output_tokens.extend(commit_ids)
@@ -599,12 +391,10 @@ def speculative_decode(
 
     except Exception as e:
         logger.error(f"[session={session_id}] Speculative decoding failed: {e}")
-    finally:
-        # Clean up async resources
         if future_chunk:
             future_chunk.cancel()
-        if executor:
-            executor.shutdown(wait=False)
+    finally:
+        executor.shutdown(wait=False)
 
     # Build final text
     generated_text = tokenizer.decode(
@@ -749,24 +539,13 @@ def run_client(
     
     logger.info(f"Loading draft model '{draft_model_name}' (sequence_length={sequence_length}) for speculative decoding...")
     if isinstance(draft_model_name, str):
-        # Load the main draft model
+        # draft_model_name is a path → load the model
         draft_model = load_model(
             draft_model_name,
             sequence_length=sequence_length,
             spec_length=gamma,
             batch_size=batch_size
         )
-        
-        # Load a separate runahead model instance for run-ahead optimization
-        # This prevents cache corruption by isolating main generation from run-ahead
-        logger.info(f"Loading separate runahead model instance for run-ahead optimization...")
-        runahead_model = load_model(
-            draft_model_name,
-            sequence_length=sequence_length,
-            spec_length=gamma,
-            batch_size=1  # Run-ahead uses single token generation
-        )
-        
         model_path_str = draft_model_name
     else:
         raise TypeError("draft_model_name must be a string (path).")
@@ -807,7 +586,7 @@ def run_client(
             draft_model, tokenizer, stub,
             prompt_text, max_new_tokens, gamma,
             profile=profile, top_p=top_p, temperature=temperature,
-            session_id=sid, runahead_model=runahead_model
+            session_id=sid
         )
         latency = time.time() - t0
         final_text = prompt_text + gen_text

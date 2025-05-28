@@ -18,10 +18,7 @@ import types
  # Speculation buckets are specified by *length*; the compiler will build
  # both batch‑1 and batch‑2 heads automatically when `dynamic_batch_size=True`.
 SPEC_LENGTH_BUCKETS = [3, 5]  # supports gamma=2 and gamma=4
-
-# Default batch size configuration - can be overridden via function parameters
-DEFAULT_BATCH_SIZE = 2  # Support batch=2 as requested
-BATCH_BUCKETS = [1, 2, 4]  # Support multiple batch sizes without hardcoding
+BATCH_BUCKETS = [1, 2]
 logger = logging.getLogger(__name__)
 
 def get_spec_bucket_for_gamma(gamma: int, available_buckets=None) -> int:
@@ -267,7 +264,7 @@ DEFAULT_SEQUENCE_LENGTH = 128
 def load_model(model_path: str,
                sequence_length: int = DEFAULT_SEQUENCE_LENGTH,
                spec_length: int | None = None,
-               batch_size: int = DEFAULT_BATCH_SIZE):
+               batch_size: int = 1):
     """
     Load or compile a model for inference.
     """
@@ -278,7 +275,7 @@ def load_model(model_path: str,
 def compile_model(model_path: str,
                   sequence_length: int = DEFAULT_SEQUENCE_LENGTH,
                   spec_length: int | None = None,
-                  batch_size: int = DEFAULT_BATCH_SIZE):
+                  batch_size: int = 1):
     """
     Compile a model for AWS Neuron. Loads the model (from HF Hub or local checkpoint),
     compiles it to a TorchScript that can run on NeuronCores, and saves the compiled model
