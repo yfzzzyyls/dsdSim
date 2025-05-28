@@ -241,47 +241,26 @@ def speculative_decode(
     accepted_tokens_total = 0
     target_tokens_total = 0
 
-    # Run-ahead optimization setup
-    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-    future_chunk = None
-    state_manager = DraftModelStateManager(draft_model)
+    # Disabled run-ahead optimization due to critical issues:
+    # 1. Race conditions in draft model state management
+    # 2. Cache pointer corruption between main/async threads  
+    # 3. Missing proper rollback on token rejection
+    # 4. Performance degradation from thread overhead
     
     try:
         while not finished and tokens_generated < max_new_tokens:
             loop_start = time.time()
             
             # === GENERATE CURRENT CHUNK ===
-            if future_chunk is not None and not future_chunk.cancelled():
-                # Try to use pre-generated chunk from run-ahead
-                try:
-                    draft_tokens, draft_probs, final_token, generation_time = future_chunk.result(timeout=0.001)
-                    timing['runhead_savings'] += generation_time
-                    logger.debug(f"[session={session_id}] Using pre-generated chunk, saved {generation_time:.3f}s")
-                except concurrent.futures.TimeoutError:
-                    # Run-ahead not ready yet, generate synchronously
-                    time_draftgen = time.perf_counter()
-                    draft_tokens, draft_probs, final_token = generate_draft_chunk(
-                        draft_model, prev_token_id, tokenizer, current_gamma, top_p, current_temp
-                    )
-                    timing['draft_generation_time'] += time.perf_counter() - time_draftgen
-            else:
-                # Generate synchronously
-                time_draftgen = time.perf_counter()
-                draft_tokens, draft_probs, final_token = generate_draft_chunk(
-                    draft_model, prev_token_id, tokenizer, current_gamma, top_p, current_temp
-                )
-                timing['draft_generation_time'] += time.perf_counter() - time_draftgen
+            # Generate synchronously to avoid state corruption
+            time_draftgen = time.perf_counter()
+            draft_tokens, draft_probs, final_token = generate_draft_chunk(
+                draft_model, prev_token_id, tokenizer, current_gamma, top_p, current_temp
+            )
+            timing['draft_generation_time'] += time.perf_counter() - time_draftgen
             
             if not draft_tokens:
                 break
-
-            # === START RUN-AHEAD GENERATION ===
-            # Begin generating the next chunk speculatively
-            if tokens_generated + len(draft_tokens) < max_new_tokens:
-                future_chunk = executor.submit(
-                    generate_draft_chunk_async,
-                    draft_model, final_token, tokenizer, current_gamma, top_p, current_temp
-                )
 
             # Determine the bucket size needed for current gamma
             spec_bucket = get_spec_bucket_for_gamma(current_gamma, SPEC_LENGTH_BUCKETS)
@@ -327,15 +306,11 @@ def speculative_decode(
 
             # === PROCESS VERIFICATION RESULT ===
             if actual_accepted < len(draft_tokens):
-                # Rejection occurred - cancel run-ahead and prepare for rollback
-                if future_chunk:
-                    future_chunk.cancel()
-                    future_chunk = None
-                
+                # Rejection occurred
                 logger.debug(f"[session={session_id}] Rejection at position {actual_accepted}, "
                            f"accepted {actual_accepted}/{len(draft_tokens)} draft tokens")
             else:
-                # All tokens accepted - run-ahead is valid!
+                # All tokens accepted
                 logger.debug(f"[session={session_id}] All {len(draft_tokens)} draft tokens accepted")
 
             # Respect the remaining token budget so we never exceed max_new_tokens.
@@ -391,10 +366,8 @@ def speculative_decode(
 
     except Exception as e:
         logger.error(f"[session={session_id}] Speculative decoding failed: {e}")
-        if future_chunk:
-            future_chunk.cancel()
     finally:
-        executor.shutdown(wait=False)
+        pass  # No cleanup needed without ThreadPoolExecutor
 
     # Build final text
     generated_text = tokenizer.decode(
