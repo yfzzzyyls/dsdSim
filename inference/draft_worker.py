@@ -88,16 +88,35 @@ def speculative_decode(
     prev_token_id = int(prompt_ids[0, -1].item())
 
     # --------------------------------------------------------------
-    # Per‑stage timing buckets (all values in seconds)
+    # Hierarchical timing metrics (all values in seconds)
     # --------------------------------------------------------------
     timing = {
-        "draft_prefill_time":       0.0,
-        "draft_generation_time":    0.0,
-        "grpc_roundtrip_time":      0.0,   # pure network + (de)serialisation latency
-        "target_verification_time": 0.0,   # server‑side compute only
-        "target_prefill_time":      0.0,   # server‑side prefill time
-        "sampling_filter_time":     0.0,   # time spent on n‑gram mask + top‑k/p filter
-        "runhead_savings":          0.0,   # time saved by run-ahead optimization
+        "system": {
+            "total_time": 0.0,              # set at the end
+            "latency": 0.0,                 # total wall-clock time
+            "tokens_generated": 0,          # total output tokens
+            "throughput": 0.0,              # tokens per second
+            "token_match_rate": 0.0,        # acceptance rate
+        },
+        "draft": {
+            "prefill_time": 0.0,            # initial prompt processing
+            "generation_time": 0.0,         # synchronous draft generation
+            "runahead_time": 0.0,           # time spent on run-ahead generation
+            "runahead_savings": 0.0,        # time saved by run-ahead
+            "runahead_hits": 0,             # successful run-ahead predictions
+            "runahead_attempts": 0,         # total run-ahead attempts
+            "runahead_timeouts": 0,         # run-ahead timeouts
+            "runahead_mismatches": 0,       # bonus token mismatches
+            "cache_update_time": 0.0,       # time spent updating cache positions
+            "sampling_filter_time": 0.0,    # n-gram mask + top-k/p filtering
+            "tensor_alloc_time": 0.0,       # tensor allocation overhead
+            "grpc_serialization_time": 0.0, # request/response serialization
+        },
+        "target": {
+            "prefill_time": 0.0,            # server-side prompt processing
+            "verification_time": 0.0,       # server-side token verification
+            "grpc_roundtrip_time": 0.0,     # network + scheduling latency
+        }
     }
     
     # Feed the prompt so Neuron caches 0…L‑1, then set pointer to NEXT index (=L)
@@ -109,7 +128,7 @@ def speculative_decode(
         input_ids=prompt_ids,
         cache_ids=cache_vec,          # avoid AttributeError in Neuron _prepare_for_par_ctx_rhs_padding
     )                                 # fills 0…L‑1
-    timing["draft_prefill_time"] += time.perf_counter() - time_draftprefill
+    timing["draft"]["prefill_time"] += time.perf_counter() - time_draftprefill
     # Overwrite cache pointer with a single‑index tensor [L]
     draft_model.update_cache(L)
 
@@ -124,7 +143,7 @@ def speculative_decode(
 
     # Run-ahead optimization setup
     executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-    future_chunk: Optional[concurrent.futures.Future[tuple[list[int], list[float], int, float, int | None]]] = None
+    future_chunk: Optional[concurrent.futures.Future[tuple[list[int], list[float], int, float, int | None, float, float]]] = None
     runahead_first = None  # Track first token of run-ahead speculation
     
     logger.debug(f"[session={session_id}] Run-ahead optimization ENABLED")
@@ -134,17 +153,24 @@ def speculative_decode(
         if future_chunk is not None and not future_chunk.cancelled():
             # Try to use pre-generated chunk from run-ahead
             try:
-                speculative_tokens, speculative_probs, final_token, generation_time, runahead_first = future_chunk.result(timeout=0.001)
-                timing['runhead_savings'] += generation_time
+                # Increase timeout to allow run-ahead generation to complete
+                # Most draft chunks should generate in 50-200ms, so 500ms is reasonable
+                speculative_tokens, speculative_probs, final_token, generation_time, runahead_first, tensor_alloc_time, sampling_filter_time = future_chunk.result(timeout=0.5)
+                timing['draft']['tensor_alloc_time'] += tensor_alloc_time
+                timing['draft']['sampling_filter_time'] += sampling_filter_time
+                timing['draft']['runahead_savings'] += generation_time
+                timing['draft']['runahead_hits'] += 1
                 logger.debug(f"[session={session_id}] Using pre-generated chunk, saved {generation_time:.3f}s")
                 prev_token_id = final_token
             except concurrent.futures.TimeoutError:
                 # Run-ahead not ready yet, generate synchronously
+                timing['draft']['runahead_timeouts'] += 1
+                logger.debug(f"[session={session_id}] Run-ahead timeout, falling back to sync generation")
                 time_draftgen = time.perf_counter()
                 speculative_tokens, speculative_probs, final_token = generate_draft_chunk_sync(
                     draft_model, prev_token_id, tokenizer, current_gamma, top_p, current_temp
                 )
-                timing['draft_generation_time'] += time.perf_counter() - time_draftgen
+                timing['draft']['generation_time'] += time.perf_counter() - time_draftgen
                 prev_token_id = final_token
                 runahead_first = None
         else:
@@ -153,7 +179,7 @@ def speculative_decode(
             speculative_tokens, speculative_probs, final_token = generate_draft_chunk_sync(
                 draft_model, prev_token_id, tokenizer, current_gamma, top_p, current_temp
             )
-            timing['draft_generation_time'] += time.perf_counter() - time_draftgen
+            timing['draft']['generation_time'] += time.perf_counter() - time_draftgen
             prev_token_id = final_token
             runahead_first = None
         
@@ -163,6 +189,7 @@ def speculative_decode(
         # === START RUN-AHEAD GENERATION ===
         # Begin generating the next chunk speculatively if we haven't reached the token limit
         if tokens_generated + len(speculative_tokens) < max_new_tokens:
+            timing['draft']['runahead_attempts'] += 1
             future_chunk = executor.submit(
                 generate_draft_chunk_isolated,
                 draft_model, final_token, tokenizer, current_gamma, top_p, current_temp
@@ -178,18 +205,22 @@ def speculative_decode(
         padded_probs = speculative_probs + [0.0] * (len(padded_tokens) - len(speculative_probs))
 
         # ----- measure RPC round‑trip and split into network vs. verify compute -----
-        time_roundtrip = time.perf_counter()
+        time_grpc_start = time.perf_counter()
+        time_serialization = time.perf_counter()
+        # Serialization happens during the gRPC call
         commit_ids, accepted_count, verify_time_ms, target_finished = grpc_client.verify_draft_tokens(
             stub, padded_tokens, padded_probs, session_id=session_id
         )
-        rpc_roundtrip = time.perf_counter() - time_roundtrip
+        grpc_serialization_time = time.perf_counter() - time_serialization
+        timing["draft"]["grpc_serialization_time"] += grpc_serialization_time
+        rpc_roundtrip = time.perf_counter() - time_grpc_start
 
-        verify_sec   = verify_time_ms / 1000.0
+        verify_sec = verify_time_ms / 1000.0
         # Network + (de)serialisation + client/server scheduling
-        network_sec  = max(0.0, rpc_roundtrip - verify_sec)
+        network_sec = max(0.0, rpc_roundtrip - verify_sec)
 
-        timing["grpc_roundtrip_time"]      += network_sec
-        timing["target_verification_time"] += verify_sec
+        timing["target"]["grpc_roundtrip_time"] += network_sec
+        timing["target"]["verification_time"] += verify_sec
         
         # Only consider acceptances up to the original draft length (ignore padded tokens)
         actual_accepted = min(accepted_count, original_length)
@@ -210,6 +241,7 @@ def speculative_decode(
                 bonus_token = commit_ids[-1]
                 if bonus_token != runahead_first:
                     # Run-ahead mismatch - cancel and invalidate
+                    timing['draft']['runahead_mismatches'] += 1
                     if future_chunk:
                         future_chunk.cancel()
                         future_chunk = None
@@ -278,8 +310,10 @@ def speculative_decode(
         prev_token_id = bonus_id
         
         # Advance the draft model's KV pointer by (accepted_count + bonus)
+        time_cache_update = time.perf_counter()
         delta = actual_accepted + 1          # bonus token counts as +1
         draft_model.update_cache(delta)     # unified, increment-by-delta API
+        timing["draft"]["cache_update_time"] += time.perf_counter() - time_cache_update
 
         # Record every token that will appear in the final text
         output_tokens.extend(commit_ids)
@@ -306,27 +340,33 @@ def speculative_decode(
             clean_up_tokenization_spaces=False,
         ) if output_tokens else ""
 
-    # Performance stats
-    perf_stats = {}
-    # Compute total tokens produced by both draft (accepted) and target
+    # Performance stats - hierarchical structure
     total_output_tokens = accepted_tokens_total + target_tokens_total
+    
+    # Update system-level metrics
+    timing["system"]["tokens_generated"] = total_output_tokens
+    if total_output_tokens > 0:
+        timing["system"]["token_match_rate"] = accepted_tokens_total / total_output_tokens
+
+    # Prepare performance stats output
+    perf_stats = {}
     if profile:
-        tokens_generated_total = total_output_tokens
-        perf_stats["tokens_generated"] = tokens_generated_total
-        perf_stats.update({
-            "draft_prefill_time":       timing["draft_prefill_time"],
-            "draft_generation_time":    timing["draft_generation_time"],
-            "grpc_roundtrip_time":      timing["grpc_roundtrip_time"],
-            "target_verification_time": timing["target_verification_time"],
-            "target_prefill_time":      timing["target_prefill_time"],
-            "sampling_filter_time":     timing["sampling_filter_time"],
-        })
+        # Include full hierarchical timing data
+        perf_stats = timing.copy()
+        # Add compatibility fields for existing code
+        perf_stats["tokens_generated"] = total_output_tokens
+        perf_stats["token_match_rate"] = timing["system"]["token_match_rate"]
+    else:
+        # Minimal stats when profiling is disabled
+        perf_stats = {
+            "tokens_generated": total_output_tokens,
+            "token_match_rate": timing["system"]["token_match_rate"] if total_output_tokens > 0 else 0.0,
+            "accepted_tokens_total": accepted_tokens_total,
+            "target_tokens_total": target_tokens_total
+        }
 
     if total_output_tokens > 0:
         match_rate = accepted_tokens_total / total_output_tokens
-        perf_stats["token_match_rate"] = match_rate
-
-    if total_output_tokens > 0:
         logger.debug(
             f"Speculative decoding match rate: {match_rate:.2%} "
             f"(Draft accepted: {accepted_tokens_total}, Target generated: {target_tokens_total})"
@@ -335,20 +375,27 @@ def speculative_decode(
     logger.debug(
         f"[session={session_id}] Finished: generated_text='{generated_text[:120]}...'"
     )
-    # Make these counters available to callers even when profiling is off
+    
+    # Always include these for backward compatibility
     perf_stats["accepted_tokens_total"] = accepted_tokens_total
     perf_stats["target_tokens_total"] = target_tokens_total
     return generated_text, perf_stats
 
 def save_perf_stats(perf_stats: dict, file_prefix: str):
     """
-    Save perf_stats to <file_prefix>.csv (append a row) and
+    Save hierarchical perf_stats to <file_prefix>.csv (append a row) and
     <file_prefix>.json (overwrite latest snapshot).
     """
-    csv_path  = f"{file_prefix}.csv"
+    csv_path = f"{file_prefix}.csv"
     json_path = f"{file_prefix}.json"
+    
     try:
-        total_time_val = perf_stats.get("total_time", 0.0)
+        # Extract timing data from hierarchical structure
+        system_data = perf_stats.get("system", {})
+        draft_data = perf_stats.get("draft", {})
+        target_data = perf_stats.get("target", {})
+        
+        total_time_val = perf_stats.get("total_time", system_data.get("total_time", 0.0))
         
         def fmt(t):
             if total_time_val > 0:
@@ -357,35 +404,64 @@ def save_perf_stats(perf_stats: dict, file_prefix: str):
             else:
                 return f"0.0%({t:.3f})"
         
-        # Append CSV row; write header if file does not exist
+        # Hierarchical CSV header
         header = [
-            'total_time',
-            'tokens_generated',
-            'tokens_per_second',
-            'token_match_rate',
-            'target_prefill_time',
+            # System metrics
+            'system_total_time',
+            'system_tokens_generated', 
+            'system_tokens_per_second',
+            'system_token_match_rate',
+            # Draft metrics
             'draft_prefill_time',
             'draft_generation_time',
-            'grpc_roundtrip_time',
+            'draft_runahead_time',
+            'draft_runahead_savings',
+            'draft_runahead_hits',
+            'draft_runahead_attempts',
+            'draft_runahead_timeouts',
+            'draft_runahead_mismatches',
+            'draft_cache_update_time',
+            'draft_sampling_filter_time',
+            'draft_tensor_alloc_time',
+            'draft_grpc_serialization_time',
+            # Target metrics
+            'target_prefill_time',
             'target_verification_time',
-            'sampling_filter_time',
+            'target_grpc_roundtrip_time',
         ]
 
         write_header = not os.path.exists(csv_path)
         with open(csv_path, "a", newline='') as cf:
             if write_header:
                 cf.write(",".join(header) + "\n")
+            
+            # Extract values with proper fallbacks for backward compatibility
+            tokens_generated = perf_stats.get("tokens_generated", system_data.get("tokens_generated", 0))
+            tokens_per_second = perf_stats.get("tokens_per_second", system_data.get("throughput", 0.0))
+            
             row = [
+                # System metrics
                 f"{total_time_val:.3f}",
-                perf_stats.get("tokens_generated", ""),
-                perf_stats.get("tokens_per_second", ""),
-                perf_stats.get("token_match_rate", ""),
-                fmt(perf_stats.get("target_prefill_time", 0.0)),
-                fmt(perf_stats.get("draft_prefill_time", 0.0)),
-                fmt(perf_stats.get("draft_generation_time", 0.0)),
-                fmt(perf_stats.get("grpc_roundtrip_time", 0.0)),
-                fmt(perf_stats.get("target_verification_time", 0.0)),
-                fmt(perf_stats.get("sampling_filter_time", 0.0)),
+                str(tokens_generated),
+                f"{tokens_per_second:.3f}",
+                f"{system_data.get('token_match_rate', perf_stats.get('token_match_rate', 0.0)):.3f}",
+                # Draft metrics
+                fmt(draft_data.get("prefill_time", 0.0)),
+                fmt(draft_data.get("generation_time", 0.0)),
+                fmt(draft_data.get("runahead_time", 0.0)),
+                fmt(draft_data.get("runahead_savings", 0.0)),
+                str(draft_data.get("runahead_hits", 0)),
+                str(draft_data.get("runahead_attempts", 0)),
+                str(draft_data.get("runahead_timeouts", 0)),
+                str(draft_data.get("runahead_mismatches", 0)),
+                fmt(draft_data.get("cache_update_time", 0.0)),
+                fmt(draft_data.get("sampling_filter_time", 0.0)),
+                fmt(draft_data.get("tensor_alloc_time", 0.0)),
+                fmt(draft_data.get("grpc_serialization_time", 0.0)),
+                # Target metrics
+                fmt(target_data.get("prefill_time", 0.0)),
+                fmt(target_data.get("verification_time", 0.0)),
+                fmt(target_data.get("grpc_roundtrip_time", 0.0)),
             ]
             cf.write(",".join(str(x) for x in row) + "\n")
 
@@ -554,7 +630,7 @@ def run_client(
     total_time = time.time() - start_time
     logger.info(f"Distributed speculative decode completed in {total_time:.2f}s.")
 
-def generate_draft_chunk_isolated(draft_model, prev_token_id, tokenizer, gamma, top_p, temperature) -> tuple[list[int], list[float], int, float, int | None]:
+def generate_draft_chunk_isolated(draft_model, prev_token_id, tokenizer, gamma, top_p, temperature) -> tuple[list[int], list[float], int, float, int | None, float, float]:
     """
     Generate a draft chunk speculatively while preserving the main model's cache state.
     
@@ -574,8 +650,12 @@ def generate_draft_chunk_isolated(draft_model, prev_token_id, tokenizer, gamma, 
         first_spec_token = None
         
         # Pre-allocate reusable tensors to reduce allocation overhead
+        tensor_alloc_time = 0.0
+        sampling_filter_time = 0.0
+        time_tensor_start = time.perf_counter()
         scratch_token = torch.empty((1, 1), dtype=torch.int64)
         context_tensor = torch.empty((1, 1), dtype=torch.int64)  # For ngram filtering
+        tensor_alloc_time += time.perf_counter() - time_tensor_start
         
         # Generate tokens sequentially - this is natural and safe
         for i in range(gamma):
@@ -587,6 +667,7 @@ def generate_draft_chunk_isolated(draft_model, prev_token_id, tokenizer, gamma, 
             # Optimize ngram filtering with pre-allocated tensor
             context_tensor[0, 0] = current_token
             actual_cache_pos = starting_cache_ptr + i
+            time_sampling_start = time.perf_counter()
             masked = sampling.filter_ngrams(
                 NGRAM_WINDOW,
                 context_tensor,
@@ -603,10 +684,13 @@ def generate_draft_chunk_isolated(draft_model, prev_token_id, tokenizer, gamma, 
                 top_k=TOP_K,
                 top_p=top_p
             )
+            sampling_filter_time += time.perf_counter() - time_sampling_start
 
             # Optimize sampling with fewer intermediate tensors
+            time_tensor_start = time.perf_counter()
             probs = torch.softmax(masked, dim=-1).squeeze(0)
             sample_in_topk = torch.multinomial(probs, 1).item()
+            tensor_alloc_time += time.perf_counter() - time_tensor_start
             token_id = int(candidate_idx[0, sample_in_topk])
             token_prob = float(probs[sample_in_topk])
 
@@ -624,13 +708,13 @@ def generate_draft_chunk_isolated(draft_model, prev_token_id, tokenizer, gamma, 
                 break
         
         generation_time = time.perf_counter() - start_time
-        return draft_tokens, draft_probs, current_token, generation_time, first_spec_token
+        return draft_tokens, draft_probs, current_token, generation_time, first_spec_token, tensor_alloc_time, sampling_filter_time
         
     except Exception as e:
         logger.exception(f"Error in isolated draft generation: {e}")
         # On any error, return empty result to fall back to sync generation
         generation_time = time.perf_counter() - start_time
-        return [], [], prev_token_id, generation_time, None
+        return [], [], prev_token_id, generation_time, None, 0.0, 0.0
 
 
 def generate_draft_chunk_sync(draft_model, prev_token_id, tokenizer, gamma, top_p, temperature) -> tuple[list[int], list[float], int]:
