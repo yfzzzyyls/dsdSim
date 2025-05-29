@@ -6,6 +6,8 @@ import json
 import threading
 import uuid
 from datetime import datetime
+from typing import Optional
+import concurrent.futures
 from grpc_comm import inference_pb2_grpc, inference_pb2, grpc_client
 from inference.model_loader import load_model, get_spec_bucket_for_gamma, pad_tokens_to_bucket
 from transformers import AutoTokenizer
@@ -95,6 +97,7 @@ def speculative_decode(
         "target_verification_time": 0.0,   # server‑side compute only
         "target_prefill_time":      0.0,   # server‑side prefill time
         "sampling_filter_time":     0.0,   # time spent on n‑gram mask + top‑k/p filter
+        "runhead_savings":          0.0,   # time saved by run-ahead optimization
     }
     
     # Feed the prompt so Neuron caches 0…L‑1, then set pointer to NEXT index (=L)
@@ -119,69 +122,55 @@ def speculative_decode(
     accepted_tokens_total = 0
     target_tokens_total = 0
 
+    # Run-ahead optimization setup
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    future_chunk: Optional[concurrent.futures.Future[tuple[list[int], list[float], int, float, int | None]]] = None
+    runahead_first = None  # Track first token of run-ahead speculation
+    
+    logger.debug(f"[session={session_id}] Run-ahead optimization ENABLED")
+
     while not finished and tokens_generated < max_new_tokens:
-        # Determine the bucket size needed for current gamma
-        spec_bucket = get_spec_bucket_for_gamma(current_gamma, SPEC_LENGTH_BUCKETS)
+        # === GENERATE CURRENT CHUNK ===
+        if future_chunk is not None and not future_chunk.cancelled():
+            # Try to use pre-generated chunk from run-ahead
+            try:
+                speculative_tokens, speculative_probs, final_token, generation_time, runahead_first = future_chunk.result(timeout=0.001)
+                timing['runhead_savings'] += generation_time
+                logger.debug(f"[session={session_id}] Using pre-generated chunk, saved {generation_time:.3f}s")
+                prev_token_id = final_token
+            except concurrent.futures.TimeoutError:
+                # Run-ahead not ready yet, generate synchronously
+                time_draftgen = time.perf_counter()
+                speculative_tokens, speculative_probs, final_token = generate_draft_chunk_sync(
+                    draft_model, prev_token_id, tokenizer, current_gamma, top_p, current_temp
+                )
+                timing['draft_generation_time'] += time.perf_counter() - time_draftgen
+                prev_token_id = final_token
+                runahead_first = None
+        else:
+            # Generate synchronously
+            time_draftgen = time.perf_counter()
+            speculative_tokens, speculative_probs, final_token = generate_draft_chunk_sync(
+                draft_model, prev_token_id, tokenizer, current_gamma, top_p, current_temp
+            )
+            timing['draft_generation_time'] += time.perf_counter() - time_draftgen
+            prev_token_id = final_token
+            runahead_first = None
         
-        # The draft model proposes up to 'current_gamma' tokens
-        speculative_tokens = []
-        speculative_probs = []
-
-        for i in range(current_gamma):
-            scratch_token[0, 0] = prev_token_id
-            # Compute the absolute KV-cache position for this token
-            current_ptr = int(draft_model.get_cache_id_vec().item())
-            next_pos = current_ptr + i
-            # Neuron decoder expects (B, 1) – wrap pos in an extra bracket
-            cache_vec = torch.tensor([[next_pos]],
-                                     dtype=torch.int32,
-                                     device=scratch_token.device)   # shape = (1, 1)
-            time_draftgen = time.perf_counter()            
-            logits, _ = draft_model.forward(input_ids=scratch_token, cache_ids=cache_vec)
-            timing["draft_generation_time"] += time.perf_counter() - time_draftgen
-
-            # Temperature‑scale logits then apply classic nucleus (top‑p) filter
-            time_sample = time.perf_counter()
-            # apply ngram filter
-            masked = sampling.filter_ngrams(
-                NGRAM_WINDOW,
-                torch.tensor(output_tokens + speculative_tokens).unsqueeze(0),
-                logits.unsqueeze(0),    # (1, V) expected
-                next_pos
-            )
-
-            # apply temperature scaling
-            logits = logits / current_temp
-
-            # apply top‑k and top‑p filtering
-            masked, candidate_idx = sampling.top_k_top_p_filtering(
-                logits.unsqueeze(0),             # (1, V) expected
-                top_k=TOP_K,
-                top_p=top_p
-            )
-            timing["sampling_filter_time"] += time.perf_counter() - time_sample
-
-            probs = torch.softmax(masked, dim=-1).squeeze(0)
-            sample_in_topk = torch.multinomial(probs, 1).item()
-            token_id   = int(candidate_idx[0, sample_in_topk])
-            token_prob = float(probs[sample_in_topk])
- 
-            # store the token and its probability for later verification
-            speculative_tokens.append(token_id)
-            speculative_probs.append(token_prob)
-            
-            prev_token_id = token_id
-            
-            # Stop if end-of-sequence or max_new_tokens reached
-            if tokenizer.eos_token_id is not None and token_id == tokenizer.eos_token_id:
-                finished = True
-                break
-            if tokens_generated + len(speculative_tokens) >= max_new_tokens:
-                break
-
         if not speculative_tokens:
             break
 
+        # === START RUN-AHEAD GENERATION ===
+        # Begin generating the next chunk speculatively if we haven't reached the token limit
+        if tokens_generated + len(speculative_tokens) < max_new_tokens:
+            future_chunk = executor.submit(
+                generate_draft_chunk_isolated,
+                draft_model, final_token, tokenizer, current_gamma, top_p, current_temp
+            )
+
+        # Determine the bucket size needed for current gamma
+        spec_bucket = get_spec_bucket_for_gamma(current_gamma, SPEC_LENGTH_BUCKETS)
+        
         # Pad draft tokens to the spec bucket size if needed (for target model compatibility)
         padded_tokens, original_length = pad_tokens_to_bucket(
             speculative_tokens, spec_bucket - 1, pad_token_id=0  # -1 because bucket includes bonus token
@@ -204,6 +193,32 @@ def speculative_decode(
         
         # Only consider acceptances up to the original draft length (ignore padded tokens)
         actual_accepted = min(accepted_count, original_length)
+        
+        # === PROCESS VERIFICATION RESULT ===
+        if actual_accepted < len(speculative_tokens):
+            # Rejection occurred - cancel run-ahead and prepare for rollback
+            if future_chunk:
+                future_chunk.cancel()
+                future_chunk = None
+            runahead_first = None
+            
+            logger.debug(f"[session={session_id}] Rejection at position {actual_accepted}, "
+                       f"accepted {actual_accepted}/{len(speculative_tokens)} draft tokens")
+        else:
+            # All tokens accepted - validate run-ahead if available
+            if runahead_first is not None and len(commit_ids) > 0:
+                bonus_token = commit_ids[-1]
+                if bonus_token != runahead_first:
+                    # Run-ahead mismatch - cancel and invalidate
+                    if future_chunk:
+                        future_chunk.cancel()
+                        future_chunk = None
+                    runahead_first = None
+                    logger.debug(f"[session={session_id}] Run-ahead mismatch: bonus={bonus_token} vs runahead_first={runahead_first}")
+                else:
+                    logger.debug(f"[session={session_id}] Run-ahead validated: bonus token matches prediction")
+            
+            logger.debug(f"[session={session_id}] All {len(speculative_tokens)} draft tokens accepted")
         
         # PID controller for gamma adjustment
         if original_length > 0:  # Avoid division by zero
@@ -387,7 +402,7 @@ def run_client(
     target_host: str = "localhost",
     port: int = 50051,
     prompt_text_file: str = "",
-    target_tokenizer: str = None,
+    target_tokenizer: Optional[str] = None,
     max_new_tokens: int = 50,
     sequence_length: int = 128,
     gamma: int = 4,
@@ -538,3 +553,148 @@ def run_client(
 
     total_time = time.time() - start_time
     logger.info(f"Distributed speculative decode completed in {total_time:.2f}s.")
+
+def generate_draft_chunk_isolated(draft_model, prev_token_id, tokenizer, gamma, top_p, temperature) -> tuple[list[int], list[float], int, float, int | None]:
+    """
+    Generate a draft chunk speculatively while preserving the main model's cache state.
+    This function saves the current cache state, generates tokens, then restores the cache.
+    
+    Returns: (tokens, probs, final_token, generation_time, first_speculative_token)
+    """
+    start_time = time.time()
+    
+    try:
+        # Save current cache state for restoration
+        original_cache_ptr = int(draft_model.get_cache_id_vec().item())
+        
+        # Generate draft tokens starting from the given token
+        draft_tokens = []
+        draft_probs = []
+        current_token = prev_token_id
+        first_spec_token = None
+        
+        # reusable scratch tensor (1,1) for single-token forwards
+        scratch_token = torch.empty((1, 1), dtype=torch.int64)
+        
+        for i in range(gamma):
+            scratch_token[0, 0] = current_token
+            # Use current cache position + offset for speculation
+            spec_pos = original_cache_ptr + i
+            cache_vec = torch.tensor([[spec_pos]], dtype=torch.int32, device=scratch_token.device)
+            
+            logits, _ = draft_model.forward(input_ids=scratch_token, cache_ids=cache_vec)
+
+            # Apply ngram filter
+            masked = sampling.filter_ngrams(
+                NGRAM_WINDOW,
+                torch.tensor([current_token]).unsqueeze(0),
+                logits.unsqueeze(0),
+                spec_pos
+            )
+
+            # Apply temperature scaling
+            logits = logits / temperature
+
+            # Apply top k and top p filtering
+            masked, candidate_idx = sampling.top_k_top_p_filtering(
+                logits.unsqueeze(0),
+                top_k=TOP_K,
+                top_p=top_p
+            )
+
+            probs = torch.softmax(masked, dim=-1).squeeze(0)
+            sample_in_topk = torch.multinomial(probs, 1).item()
+            token_id = int(candidate_idx[0, sample_in_topk])
+            token_prob = float(probs[sample_in_topk])
+
+            draft_tokens.append(token_id)
+            draft_probs.append(token_prob)
+            
+            # Track the first speculative token for validation
+            if i == 0:
+                first_spec_token = token_id
+            
+            current_token = token_id
+            
+            # Stop if end-of-sequence
+            if tokenizer.eos_token_id is not None and token_id == tokenizer.eos_token_id:
+                break
+        
+        # Restore original cache state (CRITICAL!)
+        current_ptr = int(draft_model.get_cache_id_vec().item())
+        restore_delta = original_cache_ptr - current_ptr
+        if restore_delta != 0:
+            draft_model.update_cache(restore_delta)
+        
+        generation_time = time.time() - start_time
+        return draft_tokens, draft_probs, current_token, generation_time, first_spec_token
+        
+    except Exception as e:
+        logger.exception(f"Error in isolated draft generation: {e}")
+        # Always try to restore cache state on error
+        try:
+            current_ptr = int(draft_model.get_cache_id_vec().item())
+            restore_delta = original_cache_ptr - current_ptr
+            if restore_delta != 0:
+                draft_model.update_cache(restore_delta)
+        except:
+            pass
+        generation_time = time.time() - start_time
+        return [], [], prev_token_id, generation_time, None
+
+
+def generate_draft_chunk_sync(draft_model, prev_token_id, tokenizer, gamma, top_p, temperature) -> tuple[list[int], list[float], int]:
+    """
+    Generate a draft chunk synchronously (fallback when run-ahead isn't available).
+    Returns: (tokens, probs, final_token)
+    """
+    draft_tokens = []
+    draft_probs = []
+    current_token = prev_token_id
+    
+    # reusable scratch tensor (1,1) for single-token forwards
+    scratch_token = torch.empty((1, 1), dtype=torch.int64)
+    
+    for i in range(gamma):
+        scratch_token[0, 0] = current_token
+        # Compute the absolute KV-cache position for this token
+        current_ptr = int(draft_model.get_cache_id_vec().item())
+        next_pos = current_ptr + i
+        # Neuron decoder expects (B, 1) – wrap pos in an extra bracket
+        cache_vec = torch.tensor([[next_pos]], dtype=torch.int32, device=scratch_token.device)
+        
+        logits, _ = draft_model.forward(input_ids=scratch_token, cache_ids=cache_vec)
+
+        # Apply ngram filter
+        masked = sampling.filter_ngrams(
+            NGRAM_WINDOW,
+            torch.tensor([current_token]).unsqueeze(0),
+            logits.unsqueeze(0),
+            next_pos
+        )
+
+        # Apply temperature scaling
+        logits = logits / temperature
+
+        # Apply top k and top p filtering
+        masked, candidate_idx = sampling.top_k_top_p_filtering(
+            logits.unsqueeze(0),
+            top_k=TOP_K,
+            top_p=top_p
+        )
+
+        probs = torch.softmax(masked, dim=-1).squeeze(0)
+        sample_in_topk = torch.multinomial(probs, 1).item()
+        token_id = int(candidate_idx[0, sample_in_topk])
+        token_prob = float(probs[sample_in_topk])
+
+        draft_tokens.append(token_id)
+        draft_probs.append(token_prob)
+        
+        current_token = token_id
+        
+        # Stop if end-of-sequence
+        if tokenizer.eos_token_id is not None and token_id == tokenizer.eos_token_id:
+            break
+    
+    return draft_tokens, draft_probs, current_token
