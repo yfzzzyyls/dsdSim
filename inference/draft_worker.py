@@ -79,23 +79,6 @@ class DraftModelStateManager:
         for cid in to_remove:
             del self.checkpoints[cid]
 
-def create_start_request(session_id, prompt, max_new_tokens, gamma):
-    """Create a StartRequest using the proper protobuf message."""
-    try:
-        # Try to use the protobuf message
-        return inference_pb2.StartRequest(
-            session_id=session_id,
-            prompt=prompt,
-            max_new_tokens=max_new_tokens,
-            gamma=gamma
-        )
-    except AttributeError:
-        # If StartRequest doesn't exist, log available messages and raise error
-        available_attrs = [attr for attr in dir(inference_pb2) if not attr.startswith('_')]
-        logger.error(f"StartRequest not found in inference_pb2. Available attributes: {available_attrs}")
-        logger.error("Please regenerate protobuf files by running: cd grpc_comm && python -m grpc_tools.protoc --python_out=. --grpc_python_out=. -I. inference.proto")
-        raise ValueError("StartRequest message not available. Please regenerate protobuf files.")
-
 def generate_draft_chunk(draft_model, prev_token_id, tokenizer, gamma, top_p, temperature):
     """
     Generate a chunk of draft tokens synchronously.
@@ -297,19 +280,6 @@ def speculative_decode(
 
             # measure RPC round trip and split into network vs. verify compute
             time_roundtrip = time.perf_counter()
-            
-            # Initialize session on first call
-            if session_id == 0:
-                start_request = create_start_request(
-                    session_id=0,  # 0 means "assign me a session"
-                    prompt=prompt,
-                    max_new_tokens=max_new_tokens,
-                    gamma=gamma
-                )
-                start_resp = stub.StartGeneration(start_request)
-                session_id = start_resp.session_id
-                logger.debug(f"Started session {session_id} on target server")
-            
             commit_ids, accepted_count, verify_time_ms, target_finished = grpc_client.verify_draft_tokens(
                 stub, padded_tokens, padded_probs, session_id=session_id
             )
@@ -573,13 +543,15 @@ def run_client(
     def _worker(prompt_idx, prompt_text):
         tokenizer = _get_tokenizer()        # thread-specific copy
         # Ask the target to assign a canonical session-id
-        start_request = create_start_request(
-            session_id=0,  # 0 → "please assign one for me"
-            prompt=prompt_text,
-            max_new_tokens=max_new_tokens,
-            gamma=gamma
-        )
-        start_resp = stub.StartGeneration(start_request)
+        # Create a simple request object that mimics the protobuf message
+        request = type('StartGenerationRequest', (), {
+            'session_id': 0,
+            'prompt': prompt_text,
+            'max_new_tokens': max_new_tokens,
+            'gamma': gamma,
+        })()
+        
+        start_resp = stub.StartGeneration(request)
         sid = start_resp.session_id
         t0 = time.time()
         gen_text, perf_stats = speculative_decode(
