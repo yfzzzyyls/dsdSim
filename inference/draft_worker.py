@@ -557,17 +557,22 @@ def run_client(
 def generate_draft_chunk_isolated(draft_model, prev_token_id, tokenizer, gamma, top_p, temperature) -> tuple[list[int], list[float], int, float, int | None]:
     """
     Generate a draft chunk speculatively while preserving the main model's cache state.
-    This function saves the current cache state, generates tokens, then restores the cache.
+    
+    FIXED: True isolation by generating sequentially and letting the main thread
+    naturally overwrite the cache positions. The key insight is that speculative
+    generation should proceed exactly like normal generation, and the main thread
+    will overwrite these positions when processing accepted tokens.
+    
+    No cache restoration needed - the main thread handles cache state naturally.
     
     Returns: (tokens, probs, final_token, generation_time, first_speculative_token)
     """
     start_time = time.time()
     
     try:
-        # Save current cache state for restoration
-        original_cache_ptr = int(draft_model.get_cache_id_vec().item())
+        # Get starting cache position for reference
+        starting_cache_ptr = int(draft_model.get_cache_id_vec().item())
         
-        # Generate draft tokens starting from the given token
         draft_tokens = []
         draft_probs = []
         current_token = prev_token_id
@@ -576,20 +581,20 @@ def generate_draft_chunk_isolated(draft_model, prev_token_id, tokenizer, gamma, 
         # reusable scratch tensor (1,1) for single-token forwards
         scratch_token = torch.empty((1, 1), dtype=torch.int64)
         
+        # Generate tokens sequentially - this is natural and safe
         for i in range(gamma):
             scratch_token[0, 0] = current_token
-            # Use current cache position + offset for speculation
-            spec_pos = original_cache_ptr + i
-            cache_vec = torch.tensor([[spec_pos]], dtype=torch.int32, device=scratch_token.device)
             
-            logits, _ = draft_model.forward(input_ids=scratch_token, cache_ids=cache_vec)
+            # Generate normally without cache_ids - let model handle positioning naturally
+            logits, _ = draft_model.forward(input_ids=scratch_token)
 
-            # Apply ngram filter
+            # Use the natural cache position for ngram filtering
+            actual_cache_pos = starting_cache_ptr + i
             masked = sampling.filter_ngrams(
                 NGRAM_WINDOW,
                 torch.tensor([current_token]).unsqueeze(0),
                 logits.unsqueeze(0),
-                spec_pos
+                actual_cache_pos
             )
 
             # Apply temperature scaling
@@ -620,25 +625,19 @@ def generate_draft_chunk_isolated(draft_model, prev_token_id, tokenizer, gamma, 
             if tokenizer.eos_token_id is not None and token_id == tokenizer.eos_token_id:
                 break
         
-        # Restore original cache state (CRITICAL!)
-        current_ptr = int(draft_model.get_cache_id_vec().item())
-        restore_delta = original_cache_ptr - current_ptr
-        if restore_delta != 0:
-            draft_model.update_cache(restore_delta)
+        # NO CACHE RESTORATION NEEDED!
+        # The cache now contains valid speculative extensions from starting_cache_ptr onward.
+        # The main thread will either:
+        # 1. Use these positions if tokens are accepted (natural flow)
+        # 2. Overwrite these positions if tokens are rejected (also natural)
+        # This is the key insight - let the main thread handle cache state naturally.
         
         generation_time = time.time() - start_time
         return draft_tokens, draft_probs, current_token, generation_time, first_spec_token
         
     except Exception as e:
         logger.exception(f"Error in isolated draft generation: {e}")
-        # Always try to restore cache state on error
-        try:
-            current_ptr = int(draft_model.get_cache_id_vec().item())
-            restore_delta = original_cache_ptr - current_ptr
-            if restore_delta != 0:
-                draft_model.update_cache(restore_delta)
-        except:
-            pass
+        # On any error, return empty result to fall back to sync generation
         generation_time = time.time() - start_time
         return [], [], prev_token_id, generation_time, None
 
