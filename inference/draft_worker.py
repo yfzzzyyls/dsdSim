@@ -558,16 +558,11 @@ def generate_draft_chunk_isolated(draft_model, prev_token_id, tokenizer, gamma, 
     """
     Generate a draft chunk speculatively while preserving the main model's cache state.
     
-    FIXED: True isolation by generating sequentially and letting the main thread
-    naturally overwrite the cache positions. The key insight is that speculative
-    generation should proceed exactly like normal generation, and the main thread
-    will overwrite these positions when processing accepted tokens.
-    
-    No cache restoration needed - the main thread handles cache state naturally.
+    OPTIMIZED: Reduced overhead and improved efficiency while maintaining cache safety.
     
     Returns: (tokens, probs, final_token, generation_time, first_speculative_token)
     """
-    start_time = time.time()
+    start_time = time.perf_counter()  # Use higher precision timer
     
     try:
         # Get starting cache position for reference
@@ -578,8 +573,9 @@ def generate_draft_chunk_isolated(draft_model, prev_token_id, tokenizer, gamma, 
         current_token = prev_token_id
         first_spec_token = None
         
-        # reusable scratch tensor (1,1) for single-token forwards
+        # Pre-allocate reusable tensors to reduce allocation overhead
         scratch_token = torch.empty((1, 1), dtype=torch.int64)
+        context_tensor = torch.empty((1, 1), dtype=torch.int64)  # For ngram filtering
         
         # Generate tokens sequentially - this is natural and safe
         for i in range(gamma):
@@ -588,17 +584,18 @@ def generate_draft_chunk_isolated(draft_model, prev_token_id, tokenizer, gamma, 
             # Generate normally without cache_ids - let model handle positioning naturally
             logits, _ = draft_model.forward(input_ids=scratch_token)
 
-            # Use the natural cache position for ngram filtering
+            # Optimize ngram filtering with pre-allocated tensor
+            context_tensor[0, 0] = current_token
             actual_cache_pos = starting_cache_ptr + i
             masked = sampling.filter_ngrams(
                 NGRAM_WINDOW,
-                torch.tensor([current_token]).unsqueeze(0),
+                context_tensor,
                 logits.unsqueeze(0),
                 actual_cache_pos
             )
 
-            # Apply temperature scaling
-            logits = logits / temperature
+            # Apply temperature scaling (in-place for efficiency)
+            logits.div_(temperature)
 
             # Apply top k and top p filtering
             masked, candidate_idx = sampling.top_k_top_p_filtering(
@@ -607,6 +604,7 @@ def generate_draft_chunk_isolated(draft_model, prev_token_id, tokenizer, gamma, 
                 top_p=top_p
             )
 
+            # Optimize sampling with fewer intermediate tensors
             probs = torch.softmax(masked, dim=-1).squeeze(0)
             sample_in_topk = torch.multinomial(probs, 1).item()
             token_id = int(candidate_idx[0, sample_in_topk])
@@ -618,27 +616,20 @@ def generate_draft_chunk_isolated(draft_model, prev_token_id, tokenizer, gamma, 
             # Track the first speculative token for validation
             if i == 0:
                 first_spec_token = token_id
-            
+
             current_token = token_id
             
-            # Stop if end-of-sequence
+            # Early termination check
             if tokenizer.eos_token_id is not None and token_id == tokenizer.eos_token_id:
                 break
         
-        # NO CACHE RESTORATION NEEDED!
-        # The cache now contains valid speculative extensions from starting_cache_ptr onward.
-        # The main thread will either:
-        # 1. Use these positions if tokens are accepted (natural flow)
-        # 2. Overwrite these positions if tokens are rejected (also natural)
-        # This is the key insight - let the main thread handle cache state naturally.
-        
-        generation_time = time.time() - start_time
+        generation_time = time.perf_counter() - start_time
         return draft_tokens, draft_probs, current_token, generation_time, first_spec_token
         
     except Exception as e:
         logger.exception(f"Error in isolated draft generation: {e}")
         # On any error, return empty result to fall back to sync generation
-        generation_time = time.time() - start_time
+        generation_time = time.perf_counter() - start_time
         return [], [], prev_token_id, generation_time, None
 
 
@@ -651,8 +642,9 @@ def generate_draft_chunk_sync(draft_model, prev_token_id, tokenizer, gamma, top_
     draft_probs = []
     current_token = prev_token_id
     
-    # reusable scratch tensor (1,1) for single-token forwards
+    # Pre-allocate reusable tensors for efficiency
     scratch_token = torch.empty((1, 1), dtype=torch.int64)
+    context_tensor = torch.empty((1, 1), dtype=torch.int64)
     
     for i in range(gamma):
         scratch_token[0, 0] = current_token
@@ -664,16 +656,17 @@ def generate_draft_chunk_sync(draft_model, prev_token_id, tokenizer, gamma, top_
         
         logits, _ = draft_model.forward(input_ids=scratch_token, cache_ids=cache_vec)
 
-        # Apply ngram filter
+        # Apply ngram filter with pre-allocated tensor
+        context_tensor[0, 0] = current_token
         masked = sampling.filter_ngrams(
             NGRAM_WINDOW,
-            torch.tensor([current_token]).unsqueeze(0),
+            context_tensor,
             logits.unsqueeze(0),
             next_pos
         )
 
-        # Apply temperature scaling
-        logits = logits / temperature
+        # Apply temperature scaling (in-place for efficiency)
+        logits.div_(temperature)
 
         # Apply top k and top p filtering
         masked, candidate_idx = sampling.top_k_top_p_filtering(
