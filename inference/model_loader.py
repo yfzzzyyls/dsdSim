@@ -476,3 +476,116 @@ def load_target_model(model_path: str,
     return compile_target_model(model_path,
                                 sequence_length=sequence_length,
                                 batch_size=batch_size)
+
+
+def load_fused_speculative_model(draft_model_path: str,
+                                 target_model_path: str,
+                                 sequence_length: int = DEFAULT_SEQUENCE_LENGTH,
+                                 speculation_length: int = 5,
+                                 batch_size: int = 1,
+                                 tp_degree: int = 4):
+    """
+    Load and compile a fused speculative decoding model.
+    
+    Args:
+        draft_model_path: Path to the draft model
+        target_model_path: Path to the target model
+        sequence_length: Maximum sequence length
+        speculation_length: Number of tokens to speculate at once
+        batch_size: Batch size
+        tp_degree: Tensor parallelism degree
+        
+    Returns:
+        (fused_model, tokenizer) tuple
+    """
+    logger.info(f"Loading fused speculative model with draft={draft_model_path}, target={target_model_path}")
+    
+    # Create NeuronConfig for fused model
+    from transformers_neuronx.config import GenerationConfig
+    
+    # Create a GenerationConfig for on-device generation
+    # This is required for fused speculative decoding
+    generation_config = GenerationConfig(
+        max_length=sequence_length,
+        do_sample=True,
+        top_k=128,      # Match distributed TOP_K
+        top_p=0.9,      # Match distributed default
+        temperature=1.0, # Match distributed default
+        eos_token_id=2,  # Common EOS token ID for LLaMA models
+        dynamic=False,   # Match distributed (no dynamic changes)
+    )
+    
+    # Create NeuronConfig with both on_device_embedding AND on_device_generation
+    neuron_config = NeuronConfig(
+        on_device_embedding=True,           # Required for fused speculation
+        on_device_generation=generation_config,  # Required for fused speculation
+        padding_side="right",
+    )
+    
+    # Load draft model
+    logger.info("Loading draft model...")
+    draft_model = LlamaForSampling.from_pretrained(
+        draft_model_path,
+        batch_size=batch_size,
+        amp='bf16',
+        n_positions=sequence_length,
+        context_length_estimate=sequence_length,
+        neuron_config=neuron_config,
+        tp_degree=tp_degree,  # Must match target model for fused speculation
+        return_dict=True,  # Changed from return_all_logits
+        use_cache=True,
+        fuse_qkv=True,
+        attention_layout="BSH",
+    )
+    
+    # Compile draft model to Neuron BEFORE creating fused decoder
+    logger.info("Compiling draft model to Neuron...")
+    draft_model.to_neuron()
+    
+    # Load target model
+    logger.info("Loading target model...")
+    target_model = LlamaForSampling.from_pretrained(
+        target_model_path,
+        batch_size=batch_size,
+        amp='bf16',
+        n_positions=sequence_length,
+        context_length_estimate=sequence_length,
+        neuron_config=neuron_config,
+        tp_degree=tp_degree,
+        return_dict=True,  # Changed from return_all_logits
+        use_cache=True,
+        fuse_qkv=True,
+        attention_layout="BSH",
+    )
+    
+    # Compile target model to Neuron BEFORE creating fused decoder
+    logger.info("Compiling target model to Neuron...")
+    target_model.to_neuron()
+    
+    # Create the fused speculative decoder
+    logger.info("Creating fused speculative decoder...")
+    fused_model = FusedSpeculativeDecoder(
+        draft_model,
+        target_model,
+        k=speculation_length  # k is the number of draft tokens to speculate
+    )
+    
+    # Compile fused model to Neuron
+    logger.info("Compiling fused model to Neuron...")
+    fused_model.to_neuron()
+    
+    # Load tokenizer (use target model's tokenizer)
+    tokenizer = AutoTokenizer.from_pretrained(
+        target_model_path,
+        trust_remote_code=True,
+        use_fast=False
+    )
+    
+    # Ensure pad token is set
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    if tokenizer.pad_token_id is None:
+        tokenizer.pad_token_id = tokenizer.eos_token_id
+    
+    logger.info("Fused speculative model loaded and compiled successfully")
+    return fused_model, tokenizer

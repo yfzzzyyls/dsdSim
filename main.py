@@ -27,10 +27,12 @@ logger = logging.getLogger(__name__)
 
 def main():
     parser = argparse.ArgumentParser(description="choral-spec main launcher")
-    parser.add_argument("--role", choices=["target", "draft", "verify_target", "verify_draft"], required=True,
+    parser.add_argument("--role", choices=["target", "draft", "verify_target", "verify_draft", "fused_target", "fused_client"], required=True,
                         help=("Role to run: 'target' for target server, 'draft' for draft client, "
                               "'verify_target' to run the target model standalone, "
-                              "'verify_draft' to run the draft model standalone"))
+                              "'verify_draft' to run the draft model standalone, "
+                              "'fused_target' for fused speculative server, "
+                              "'fused_client' for fused speculative client"))
     parser.add_argument("--model", type=str,
                         help="Model path for the primary model (for target, draft, or verification roles)")
     parser.add_argument("--target_model", type=str,
@@ -53,6 +55,10 @@ def main():
                         help="(Draft role only) Run draft model without target (standalone draft mode)")
     parser.add_argument("--gamma", type=int, default=4,
                         help="Number of draft tokens to generate per verification step (speculative decoding chunk size).")
+    parser.add_argument("--speculation_length", type=int, default=5,
+                        help="Number of tokens to speculate at once for fused speculative decoding.")
+    parser.add_argument("--tp_degree", type=int, default=4,
+                        help="Tensor parallelism degree for model compilation.")
     parser.add_argument("--top_p", type=float, default=0.9,
                         help="Top-p for draft sampling (default 0.9)")
     parser.add_argument("--temperature", type=float, default=1.0,
@@ -182,8 +188,46 @@ def main():
             output_text, perf_stats = res, None
         if args.profile and perf_stats:
             save_perf_stats(perf_stats, file_prefix="performance_verify_draft")
+            
+    elif args.role == "fused_target":
+        # Running the fused speculative server
+        draft_model = args.draft_model or args.model
+        target_model = args.target_model
+        if draft_model is None or target_model is None:
+            logger.error("Please specify both --draft_model and --target_model for fused_target role")
+            return
+        
+        from inference import fused_target_worker
+        fused_target_worker.run_fused_server(
+            draft_model_path=draft_model,
+            target_model_path=target_model,
+            port=args.port,
+            sequence_length=args.sequence_length,
+            speculation_length=args.speculation_length,
+            batch_size=args.batch,
+            profile=args.profile,
+            tp_degree=args.tp_degree
+        )
+        
+    elif args.role == "fused_client":
+        # Running the fused speculative client
+        if not args.prompt_text:
+            logger.error("Please specify --prompt_text for fused_client role")
+            return
+            
+        from inference import fused_draft_worker
+        fused_draft_worker.run_fused_client(
+            target_host=args.target_host,
+            port=args.port,
+            prompt_text_file=args.prompt_text,
+            max_new_tokens=args.max_new_tokens,
+            temperature=args.temperature,
+            top_p=args.top_p,
+            speculation_length=args.speculation_length,
+            profile=args.profile
+        )
     else:
-        logger.error("Unknown role. Use --role target|draft|verify_target|verify_draft.")
+        logger.error("Unknown role. Use --role target|draft|verify_target|verify_draft|fused_target|fused_client.")
 
 
 def run_model(

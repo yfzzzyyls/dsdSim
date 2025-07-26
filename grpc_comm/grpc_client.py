@@ -7,7 +7,14 @@ from . import inference_pb2_grpc
 
 
 def create_stub(target_address):
-    channel = grpc.insecure_channel(target_address)
+    # Enable compression to reduce message size
+    channel_options = [
+        ('grpc.max_message_length', 64 * 1024 * 1024),  # 64MB max message
+        ('grpc.max_receive_message_length', 64 * 1024 * 1024),
+        ('grpc.default_compression_algorithm', 'gzip'),  # Enable compression
+        ('grpc.default_compression_level', 'high'),     # High compression
+    ]
+    channel = grpc.insecure_channel(target_address, options=channel_options)
     stub = inference_pb2_grpc.SpeculativeServiceStub(channel)
     return stub
 
@@ -28,7 +35,8 @@ def verify_batch_tokens(stub, sequences):
             )
         )
     request = inference_pb2.VerifyBatchRequest(sequences=seq_msgs)
-    response = stub.VerifyBatchTokens(request)
+    # Use compression for batch requests (typically larger)
+    response = stub.VerifyBatchTokens(request, compression='gzip')
     # returns a list of results
     results = []
     for r in response.results:
@@ -37,6 +45,8 @@ def verify_batch_tokens(stub, sequences):
             'tokens_accepted': r.tokens_accepted,
             'target_token': r.target_token,
             'finished': r.finished,
+            'committed_ids': [],  # Add this field for compatibility
+            'verify_time_ms': 0.0,  # Add this field for compatibility
         })
     return results
 
@@ -72,7 +82,8 @@ def verify_draft_tokens(stub, draft_tokens, draft_probs, session_id=0):
         draft_tokens = draft_tokens,
         draft_probs  = draft_probs,   # <<<
     )
-    resp = stub.VerifyDraftTokens(request)
+    # Use compression for large messages
+    resp = stub.VerifyDraftTokens(request, compression='gzip')
     return (
         list(resp.committed_ids),
         resp.accepted_count,

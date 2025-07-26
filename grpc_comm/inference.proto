@@ -92,10 +92,23 @@ message FinalizeResponse {
 }
 
 // For a baseline generation.
-message GenerateRequest {}
+message GenerateRequest {
+  string prompt = 1;
+  uint32 max_new_tokens = 2;
+  float temperature = 3;
+  float top_p = 4;
+  uint32 speculation_length = 5;
+}
 
 message GenerateResponse {
   string output_text = 1;
+  string generated_text = 2;
+  uint32 total_tokens = 3;
+  float generation_time_ms = 4;
+  float tokens_per_second = 5;
+  uint32 total_speculations = 6;
+  uint32 accepted_tokens = 7;
+  float acceptance_rate = 8;
 }
 
 // Speculative Decoding gRPC Service definition
@@ -112,4 +125,7 @@ service SpeculativeService {
 
   // Optional full generation for baseline
   rpc GenerateFull(StartRequest) returns (GenerateResponse);
+  
+  // Fused speculative decoding - single request/response
+  rpc Generate(GenerateRequest) returns (GenerateResponse);
 }

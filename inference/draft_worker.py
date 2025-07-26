@@ -79,6 +79,9 @@ def speculative_decode(
         f"initial_gamma={current_gamma}, max_gamma={gamma_max}, buckets={SPEC_LENGTH_BUCKETS}"
     )
 
+    # Track overall execution time for throughput optimization
+    start_time = time.perf_counter()
+
     # Initial setup: process prompt through draft model to initialize cache
     output_tokens = []
     
@@ -139,6 +142,11 @@ def speculative_decode(
     recent_deque  = collections.deque(maxlen=50)
     finished = False
     accepted_tokens_total = 0
+    
+    # Batching configuration for optimized gRPC calls
+    batch_size = 2  # Number of draft chunks to accumulate before sending
+    pending_drafts = []  # Store draft generations for batching
+    batch_sessions = []  # Track session IDs for batched calls
     target_tokens_total = 0
 
     # Run-ahead optimization setup
@@ -186,9 +194,15 @@ def speculative_decode(
         if not speculative_tokens:
             break
 
-        # === START RUN-AHEAD GENERATION ===
+        # === START OPTIMIZED RUN-AHEAD GENERATION ===
         # Begin generating the next chunk speculatively if we haven't reached the token limit
-        if tokens_generated + len(speculative_tokens) < max_new_tokens:
+        # Only start run-ahead if current acceptance rate justifies the computational cost
+        should_start_runahead = (
+            tokens_generated + len(speculative_tokens) < max_new_tokens and
+            (not hasattr(locals(), 'acceptance_rate') or acceptance_rate > 0.4)  # Only if acceptance rate > 40%
+        )
+        
+        if should_start_runahead:
             timing['draft']['runahead_attempts'] += 1
             future_chunk = executor.submit(
                 generate_draft_chunk_isolated,
@@ -198,19 +212,44 @@ def speculative_decode(
         # Determine the bucket size needed for current gamma
         spec_bucket = get_spec_bucket_for_gamma(current_gamma, SPEC_LENGTH_BUCKETS)
         
-        # Pad draft tokens to the spec bucket size if needed (for target model compatibility)
-        padded_tokens, original_length = pad_tokens_to_bucket(
-            speculative_tokens, spec_bucket - 1, pad_token_id=0  # -1 because bucket includes bonus token
-        )
-        padded_probs = speculative_probs + [0.0] * (len(padded_tokens) - len(speculative_probs))
+        # Optimize padding - only pad if necessary for target model compatibility
+        if len(speculative_tokens) < spec_bucket - 1:
+            padded_tokens, original_length = pad_tokens_to_bucket(
+                speculative_tokens, spec_bucket - 1, pad_token_id=0  # -1 because bucket includes bonus token
+            )
+            padded_probs = speculative_probs + [0.0] * (len(padded_tokens) - len(speculative_probs))
+        else:
+            # No padding needed - use tokens as-is
+            padded_tokens = speculative_tokens
+            padded_probs = speculative_probs
+            original_length = len(speculative_tokens)
 
         # ----- measure RPC round‑trip and split into network vs. verify compute -----
         time_grpc_start = time.perf_counter()
         time_serialization = time.perf_counter()
-        # Serialization happens during the gRPC call
-        commit_ids, accepted_count, verify_time_ms, target_finished = grpc_client.verify_draft_tokens(
-            stub, padded_tokens, padded_probs, session_id=session_id
-        )
+        
+        # Use batch verification for better performance
+        if hasattr(grpc_client, 'verify_batch_tokens'):
+            # Try batched approach first (more efficient)
+            sequences = [(session_id, padded_tokens)]
+            batch_results = grpc_client.verify_batch_tokens(stub, sequences)
+            if batch_results:
+                result = batch_results[0]
+                commit_ids = result.get('committed_ids', [])
+                accepted_count = result.get('tokens_accepted', 0)
+                verify_time_ms = result.get('verify_time_ms', 0.0)
+                target_finished = result.get('finished', False)
+            else:
+                # Fallback to single verification
+                commit_ids, accepted_count, verify_time_ms, target_finished = grpc_client.verify_draft_tokens(
+                    stub, padded_tokens, padded_probs, session_id=session_id
+                )
+        else:
+            # Fallback to single verification
+            commit_ids, accepted_count, verify_time_ms, target_finished = grpc_client.verify_draft_tokens(
+                stub, padded_tokens, padded_probs, session_id=session_id
+            )
+        
         grpc_serialization_time = time.perf_counter() - time_serialization
         timing["draft"]["grpc_serialization_time"] += grpc_serialization_time
         rpc_roundtrip = time.perf_counter() - time_grpc_start
@@ -252,9 +291,24 @@ def speculative_decode(
             
             logger.debug(f"[session={session_id}] All {len(speculative_tokens)} draft tokens accepted")
         
-        # PID controller for gamma adjustment
+        # Smart gamma adjustment for performance optimization
         if original_length > 0:  # Avoid division by zero
             acceptance_rate = actual_accepted / original_length
+            
+            # Dynamic gamma adjustment based on performance metrics
+            current_throughput = tokens_generated / (time.perf_counter() - start_time) if tokens_generated > 0 else 0
+            target_throughput = 40.0  # Target: 40 tokens/s
+            
+            if current_throughput < target_throughput * 0.8:  # If significantly below target
+                if acceptance_rate > 0.7:  # High acceptance rate - increase gamma
+                    gamma = min(gamma + 1, max(SPEC_LENGTH_BUCKETS))
+                    logger.debug(f"[session={session_id}] Increasing gamma to {gamma} (acceptance={acceptance_rate:.2%}, throughput={current_throughput:.1f})")
+                elif acceptance_rate < 0.3:  # Low acceptance rate - decrease gamma
+                    gamma = max(gamma - 1, 1)
+                    logger.debug(f"[session={session_id}] Decreasing gamma to {gamma} (acceptance={acceptance_rate:.2%}, throughput={current_throughput:.1f})")
+            
+            # Update spec bucket for next iteration
+            spec_bucket = get_spec_bucket_for_gamma(gamma)
             
             # PID controller update
             error = target_accept - acceptance_rate

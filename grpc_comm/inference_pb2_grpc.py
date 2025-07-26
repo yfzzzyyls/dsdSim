@@ -3,7 +3,7 @@
 import grpc
 import warnings
 
-from . import inference_pb2 as inference__pb2
+from grpc_comm import inference_pb2 as grpc__comm_dot_inference__pb2
 
 GRPC_GENERATED_VERSION = '1.66.2'
 GRPC_VERSION = grpc.__version__
@@ -18,7 +18,7 @@ except ImportError:
 if _version_not_supported:
     raise RuntimeError(
         f'The grpc package installed is at version {GRPC_VERSION},'
-        + f' but the generated code in inference_pb2_grpc.py depends on'
+        + f' but the generated code in grpc_comm/inference_pb2_grpc.py depends on'
         + f' grpcio>={GRPC_GENERATED_VERSION}.'
         + f' Please upgrade your grpc module to grpcio>={GRPC_GENERATED_VERSION}'
         + f' or downgrade your generated code using grpcio-tools<={GRPC_VERSION}.'
@@ -37,33 +37,38 @@ class SpeculativeServiceStub(object):
         """
         self.StartGeneration = channel.unary_unary(
                 '/specdecode.SpeculativeService/StartGeneration',
-                request_serializer=inference__pb2.StartRequest.SerializeToString,
-                response_deserializer=inference__pb2.StartResponse.FromString,
+                request_serializer=grpc__comm_dot_inference__pb2.StartRequest.SerializeToString,
+                response_deserializer=grpc__comm_dot_inference__pb2.StartResponse.FromString,
                 _registered_method=True)
         self.VerifyBatchTokens = channel.unary_unary(
                 '/specdecode.SpeculativeService/VerifyBatchTokens',
-                request_serializer=inference__pb2.VerifyBatchRequest.SerializeToString,
-                response_deserializer=inference__pb2.VerifyBatchResponse.FromString,
+                request_serializer=grpc__comm_dot_inference__pb2.VerifyBatchRequest.SerializeToString,
+                response_deserializer=grpc__comm_dot_inference__pb2.VerifyBatchResponse.FromString,
                 _registered_method=True)
         self.FinalizeBatchTokens = channel.unary_unary(
                 '/specdecode.SpeculativeService/FinalizeBatchTokens',
-                request_serializer=inference__pb2.FinalizeBatchRequest.SerializeToString,
-                response_deserializer=inference__pb2.FinalizeBatchResponse.FromString,
+                request_serializer=grpc__comm_dot_inference__pb2.FinalizeBatchRequest.SerializeToString,
+                response_deserializer=grpc__comm_dot_inference__pb2.FinalizeBatchResponse.FromString,
                 _registered_method=True)
         self.VerifyDraftTokens = channel.unary_unary(
                 '/specdecode.SpeculativeService/VerifyDraftTokens',
-                request_serializer=inference__pb2.VerifyRequest.SerializeToString,
-                response_deserializer=inference__pb2.VerifyResponse.FromString,
+                request_serializer=grpc__comm_dot_inference__pb2.VerifyRequest.SerializeToString,
+                response_deserializer=grpc__comm_dot_inference__pb2.VerifyResponse.FromString,
                 _registered_method=True)
         self.FinalizeTokens = channel.unary_unary(
                 '/specdecode.SpeculativeService/FinalizeTokens',
-                request_serializer=inference__pb2.FinalizeRequest.SerializeToString,
-                response_deserializer=inference__pb2.FinalizeResponse.FromString,
+                request_serializer=grpc__comm_dot_inference__pb2.FinalizeRequest.SerializeToString,
+                response_deserializer=grpc__comm_dot_inference__pb2.FinalizeResponse.FromString,
                 _registered_method=True)
         self.GenerateFull = channel.unary_unary(
                 '/specdecode.SpeculativeService/GenerateFull',
-                request_serializer=inference__pb2.StartRequest.SerializeToString,
-                response_deserializer=inference__pb2.GenerateResponse.FromString,
+                request_serializer=grpc__comm_dot_inference__pb2.StartRequest.SerializeToString,
+                response_deserializer=grpc__comm_dot_inference__pb2.GenerateResponse.FromString,
+                _registered_method=True)
+        self.Generate = channel.unary_unary(
+                '/specdecode.SpeculativeService/Generate',
+                request_serializer=grpc__comm_dot_inference__pb2.GenerateRequest.SerializeToString,
+                response_deserializer=grpc__comm_dot_inference__pb2.GenerateResponse.FromString,
                 _registered_method=True)
 
 
@@ -110,38 +115,50 @@ class SpeculativeServiceServicer(object):
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def Generate(self, request, context):
+        """Fused speculative decoding - single request/response
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
 
 def add_SpeculativeServiceServicer_to_server(servicer, server):
     rpc_method_handlers = {
             'StartGeneration': grpc.unary_unary_rpc_method_handler(
                     servicer.StartGeneration,
-                    request_deserializer=inference__pb2.StartRequest.FromString,
-                    response_serializer=inference__pb2.StartResponse.SerializeToString,
+                    request_deserializer=grpc__comm_dot_inference__pb2.StartRequest.FromString,
+                    response_serializer=grpc__comm_dot_inference__pb2.StartResponse.SerializeToString,
             ),
             'VerifyBatchTokens': grpc.unary_unary_rpc_method_handler(
                     servicer.VerifyBatchTokens,
-                    request_deserializer=inference__pb2.VerifyBatchRequest.FromString,
-                    response_serializer=inference__pb2.VerifyBatchResponse.SerializeToString,
+                    request_deserializer=grpc__comm_dot_inference__pb2.VerifyBatchRequest.FromString,
+                    response_serializer=grpc__comm_dot_inference__pb2.VerifyBatchResponse.SerializeToString,
             ),
             'FinalizeBatchTokens': grpc.unary_unary_rpc_method_handler(
                     servicer.FinalizeBatchTokens,
-                    request_deserializer=inference__pb2.FinalizeBatchRequest.FromString,
-                    response_serializer=inference__pb2.FinalizeBatchResponse.SerializeToString,
+                    request_deserializer=grpc__comm_dot_inference__pb2.FinalizeBatchRequest.FromString,
+                    response_serializer=grpc__comm_dot_inference__pb2.FinalizeBatchResponse.SerializeToString,
             ),
             'VerifyDraftTokens': grpc.unary_unary_rpc_method_handler(
                     servicer.VerifyDraftTokens,
-                    request_deserializer=inference__pb2.VerifyRequest.FromString,
-                    response_serializer=inference__pb2.VerifyResponse.SerializeToString,
+                    request_deserializer=grpc__comm_dot_inference__pb2.VerifyRequest.FromString,
+                    response_serializer=grpc__comm_dot_inference__pb2.VerifyResponse.SerializeToString,
             ),
             'FinalizeTokens': grpc.unary_unary_rpc_method_handler(
                     servicer.FinalizeTokens,
-                    request_deserializer=inference__pb2.FinalizeRequest.FromString,
-                    response_serializer=inference__pb2.FinalizeResponse.SerializeToString,
+                    request_deserializer=grpc__comm_dot_inference__pb2.FinalizeRequest.FromString,
+                    response_serializer=grpc__comm_dot_inference__pb2.FinalizeResponse.SerializeToString,
             ),
             'GenerateFull': grpc.unary_unary_rpc_method_handler(
                     servicer.GenerateFull,
-                    request_deserializer=inference__pb2.StartRequest.FromString,
-                    response_serializer=inference__pb2.GenerateResponse.SerializeToString,
+                    request_deserializer=grpc__comm_dot_inference__pb2.StartRequest.FromString,
+                    response_serializer=grpc__comm_dot_inference__pb2.GenerateResponse.SerializeToString,
+            ),
+            'Generate': grpc.unary_unary_rpc_method_handler(
+                    servicer.Generate,
+                    request_deserializer=grpc__comm_dot_inference__pb2.GenerateRequest.FromString,
+                    response_serializer=grpc__comm_dot_inference__pb2.GenerateResponse.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
@@ -170,8 +187,8 @@ class SpeculativeService(object):
             request,
             target,
             '/specdecode.SpeculativeService/StartGeneration',
-            inference__pb2.StartRequest.SerializeToString,
-            inference__pb2.StartResponse.FromString,
+            grpc__comm_dot_inference__pb2.StartRequest.SerializeToString,
+            grpc__comm_dot_inference__pb2.StartResponse.FromString,
             options,
             channel_credentials,
             insecure,
@@ -197,8 +214,8 @@ class SpeculativeService(object):
             request,
             target,
             '/specdecode.SpeculativeService/VerifyBatchTokens',
-            inference__pb2.VerifyBatchRequest.SerializeToString,
-            inference__pb2.VerifyBatchResponse.FromString,
+            grpc__comm_dot_inference__pb2.VerifyBatchRequest.SerializeToString,
+            grpc__comm_dot_inference__pb2.VerifyBatchResponse.FromString,
             options,
             channel_credentials,
             insecure,
@@ -224,8 +241,8 @@ class SpeculativeService(object):
             request,
             target,
             '/specdecode.SpeculativeService/FinalizeBatchTokens',
-            inference__pb2.FinalizeBatchRequest.SerializeToString,
-            inference__pb2.FinalizeBatchResponse.FromString,
+            grpc__comm_dot_inference__pb2.FinalizeBatchRequest.SerializeToString,
+            grpc__comm_dot_inference__pb2.FinalizeBatchResponse.FromString,
             options,
             channel_credentials,
             insecure,
@@ -251,8 +268,8 @@ class SpeculativeService(object):
             request,
             target,
             '/specdecode.SpeculativeService/VerifyDraftTokens',
-            inference__pb2.VerifyRequest.SerializeToString,
-            inference__pb2.VerifyResponse.FromString,
+            grpc__comm_dot_inference__pb2.VerifyRequest.SerializeToString,
+            grpc__comm_dot_inference__pb2.VerifyResponse.FromString,
             options,
             channel_credentials,
             insecure,
@@ -278,8 +295,8 @@ class SpeculativeService(object):
             request,
             target,
             '/specdecode.SpeculativeService/FinalizeTokens',
-            inference__pb2.FinalizeRequest.SerializeToString,
-            inference__pb2.FinalizeResponse.FromString,
+            grpc__comm_dot_inference__pb2.FinalizeRequest.SerializeToString,
+            grpc__comm_dot_inference__pb2.FinalizeResponse.FromString,
             options,
             channel_credentials,
             insecure,
@@ -305,8 +322,35 @@ class SpeculativeService(object):
             request,
             target,
             '/specdecode.SpeculativeService/GenerateFull',
-            inference__pb2.StartRequest.SerializeToString,
-            inference__pb2.GenerateResponse.FromString,
+            grpc__comm_dot_inference__pb2.StartRequest.SerializeToString,
+            grpc__comm_dot_inference__pb2.GenerateResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def Generate(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/specdecode.SpeculativeService/Generate',
+            grpc__comm_dot_inference__pb2.GenerateRequest.SerializeToString,
+            grpc__comm_dot_inference__pb2.GenerateResponse.FromString,
             options,
             channel_credentials,
             insecure,
