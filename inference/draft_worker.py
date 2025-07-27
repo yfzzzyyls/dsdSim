@@ -51,14 +51,6 @@ def speculative_decode(
     Extended to handle a session_id so multiple prompts can run concurrently on the server.
     Uses dynamic gamma adjustment with PID controller.
     """
-    # Handle None max_new_tokens - calculate based on sequence length
-    if max_new_tokens is None:
-        # Estimate prompt length and calculate tokens to generate
-        prompt_tokens = len(tokenizer.encode(prompt))
-        # Assuming sequence_length is 128 (from model config)
-        max_new_tokens = max(1, 128 - prompt_tokens - 10)  # Leave some buffer
-        logger.info(f"max_new_tokens is None, calculated: {max_new_tokens} (prompt_tokens={prompt_tokens})")
-    
     # Derive valid gammas and gamma_max from the bucket list
     valid_gammas = tuple(b - 1 for b in SPEC_LENGTH_BUCKETS if b > 1)
 
