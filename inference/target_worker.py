@@ -351,6 +351,36 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
             finished=finished,
         )
 
+    def VerifyBatchTokens(self, request, context):
+        """
+        Batch verification of tokens - processes multiple sequences in one call.
+        For now, we process them sequentially but this could be optimized later.
+        """
+        results = []
+        
+        for seq in request.sequences:
+            # Create a single verification request
+            single_request = inference_pb2.VerifyRequest(
+                session_id=seq.session_id,
+                draft_tokens=seq.draft_tokens,
+                draft_probs=[]  # Not used in batch mode currently
+            )
+            
+            # Process using existing single verification logic
+            response = self.VerifyDraftTokens(single_request, context)
+            
+            # Convert to batch result format
+            result = inference_pb2.VerifyBatchResult(
+                session_id=seq.session_id,
+                committed_ids=response.committed_ids,
+                tokens_accepted=response.accepted_count,
+                verify_time_ms=response.verify_time_ms,
+                finished=response.finished
+            )
+            results.append(result)
+        
+        return inference_pb2.VerifyBatchResponse(results=results)
+
     # ------------------------------------------------------------------
     # STAGE‑2: scheduler thread that batches requests
     # ------------------------------------------------------------------
