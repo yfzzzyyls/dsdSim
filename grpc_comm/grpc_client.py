@@ -36,7 +36,7 @@ def verify_batch_tokens(stub, sequences):
         )
     request = inference_pb2.VerifyBatchRequest(sequences=seq_msgs)
     # Use compression for batch requests (typically larger)
-    response = stub.VerifyBatchTokens(request)
+    response = stub.VerifyBatchTokens(request, compression='gzip')
     # returns a list of results
     results = []
     for r in response.results:
@@ -83,7 +83,7 @@ def verify_draft_tokens(stub, draft_tokens, draft_probs, session_id=0):
         draft_probs  = draft_probs,   # <<<
     )
     # Use compression for large messages
-    resp = stub.VerifyDraftTokens(request)
+    resp = stub.VerifyDraftTokens(request, compression='gzip')
     return (
         list(resp.committed_ids),
         resp.accepted_count,
