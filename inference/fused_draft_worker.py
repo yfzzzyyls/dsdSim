@@ -96,11 +96,12 @@ def run_fused_client(
     target_host: str = "localhost",
     port: int = 50051,
     prompt_text_file: str = "",
-    max_new_tokens: int = 50,
+    max_new_tokens: int = None,
     temperature: float = 1.0,
     top_p: float = 0.9,
     speculation_length: int = 5,
-    profile: bool = False
+    profile: bool = False,
+    sequence_length: int = 128
 ):
     """Run the fused speculative client with file-based prompts."""
     import os
@@ -124,9 +125,20 @@ def run_fused_client(
         for i, prompt in enumerate(prompts):
             logger.info(f"\n{'='*60}\nProcessing prompt {i+1}/{len(prompts)}\n{'='*60}")
             
+            # If max_new_tokens is None, calculate based on sequence length and prompt length
+            if max_new_tokens is None:
+                # Estimate prompt tokens (rough approximation)
+                prompt_tokens = len(prompt.split()) * 2  # Rough estimate
+                tokens_to_generate = max(1, sequence_length - prompt_tokens - 10)  # Leave some buffer
+                logger.info(f"max_new_tokens is None, calculated tokens_to_generate={tokens_to_generate} "
+                           f"(sequence_length={sequence_length}, estimated prompt_tokens={prompt_tokens})")
+            else:
+                tokens_to_generate = max_new_tokens
+                logger.info(f"Using specified max_new_tokens={max_new_tokens}")
+            
             result = client.generate(
                 prompt=prompt,
-                max_new_tokens=max_new_tokens,
+                max_new_tokens=tokens_to_generate,
                 temperature=temperature,
                 top_p=top_p,
                 speculation_length=speculation_length

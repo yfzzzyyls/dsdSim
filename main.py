@@ -47,8 +47,8 @@ def main():
                         help="Target server host address (for draft role to connect to target server)")
     parser.add_argument("--sequence_length", type=int, default=128,
                         help="Sequence length for model compilation (if not already compiled)")
-    parser.add_argument("--max_new_tokens", type=int, default=50,
-                        help="Maximum number of new tokens to generate")
+    parser.add_argument("--max_new_tokens", type=int, default=0,
+                        help="Maximum number of new tokens to generate (0 or unspecified: generate up to sequence length)")
     parser.add_argument("--profile", action="store_true",
                         help="Enable performance profiling (latency/throughput metrics)")
     parser.add_argument("--no_target", action="store_true",
@@ -224,7 +224,8 @@ def main():
             temperature=args.temperature,
             top_p=args.top_p,
             speculation_length=args.speculation_length,
-            profile=args.profile
+            profile=args.profile,
+            sequence_length=args.sequence_length
         )
     else:
         logger.error("Unknown role. Use --role target|draft|verify_target|verify_draft|fused_target|fused_client.")
