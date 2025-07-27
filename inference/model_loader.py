@@ -492,13 +492,16 @@ def load_fused_speculative_model(draft_model_path: str,
         target_model_path: Path to the target model
         sequence_length: Maximum sequence length
         speculation_length: Number of tokens to speculate at once
-        batch_size: Batch size
+        batch_size: Batch size (ignored - fused models always use batch_size=1)
         tp_degree: Tensor parallelism degree
         
     Returns:
         (fused_model, tokenizer) tuple
     """
     logger.info(f"Loading fused speculative model with draft={draft_model_path}, target={target_model_path}")
+    
+    # Fused models always use batch_size=1
+    batch_size = 1
     
     # Create NeuronConfig for fused model
     from transformers_neuronx.config import GenerationConfig
@@ -526,13 +529,13 @@ def load_fused_speculative_model(draft_model_path: str,
     logger.info("Loading draft model...")
     draft_model = LlamaForSampling.from_pretrained(
         draft_model_path,
-        batch_size=batch_size,
+        batch_size=1,  # Fused models use batch_size=1
         amp='bf16',
         n_positions=sequence_length,
-        context_length_estimate=sequence_length,
+        context_length_estimate=sequence_length,  # Single value, not list
         neuron_config=neuron_config,
         tp_degree=tp_degree,  # Must match target model for fused speculation
-        return_dict=True,  # Changed from return_all_logits
+        return_dict=True,
         use_cache=True,
         fuse_qkv=True,
         attention_layout="BSH",
@@ -546,13 +549,13 @@ def load_fused_speculative_model(draft_model_path: str,
     logger.info("Loading target model...")
     target_model = LlamaForSampling.from_pretrained(
         target_model_path,
-        batch_size=batch_size,
+        batch_size=1,  # Fused models use batch_size=1
         amp='bf16',
         n_positions=sequence_length,
-        context_length_estimate=sequence_length,
+        context_length_estimate=sequence_length,  # Single value, not list
         neuron_config=neuron_config,
         tp_degree=tp_degree,
-        return_dict=True,  # Changed from return_all_logits
+        return_dict=True,
         use_cache=True,
         fuse_qkv=True,
         attention_layout="BSH",

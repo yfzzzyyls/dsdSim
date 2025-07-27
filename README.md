@@ -1,27 +1,33 @@
-# Distributed Speculative Decoding on AWS Trainium
+# Distributed and Fused Speculative Decoding on AWS Trainium
 
-This repository has been adapted for **multi-device** AWS Trainium usage with **speculative decoding**, using **Meta LLaMA 3.2** (1B draft + 3B target) in **bfloat16**.
+This repository supports two architectures for **speculative decoding** on AWS Trainium, using **Meta LLaMA 3.2-1B** (draft) and **LLaMA 3.1-8B** (target) models:
+
+1. **Distributed Architecture**: Client-side draft model with multiple round-trips
+2. **Fused Architecture**: Server-side fused model with single round-trip
 
 ## Project Structure
 
 Below is an overview of the repository structure and how the modules relate to each other:
 
 ```
-Choral-Spec/
-├── main.py                  # CLI entry point; parses args and launches roles (draft, target, compile, verify)
-├── inference/               # Package for model loading, speculative decoding, and verification logic
-│   ├── model_loader.py      # Utilities to load or compile LLaMA models on AWS Neuron, provides `load_model` and `compile_model`
-│   ├── draft_worker.py      # Draft client process: performs speculative decoding, communicates with target server via gRPC
-│   ├── target_worker.py     # Target server process: serves the target model over gRPC (one token at a time)
-│   ├── speculative.py       # Implements the speculative decoding algorithm (combines draft model predictions with target verification)
-│   └── verify.py            # Verification utilities: can run a model standalone for debugging, and compare draft vs target outputs
-├── grpc_comm/               # gRPC definitions and generated code for inter-process communication
-│   ├── grpc_client.py          # Definition of SpeculativeService (gRPC 
-│   ├── inference.proto          # Definition of SpeculativeService (gRPC service for generation and verification)
-│   ├── inference_pb2.py         # Generated Python classes from the proto definitions
-│   └── inference_pb2_grpc.py    # Generated gRPC client/server code based on the proto
-├── requirements.txt         # Python dependencies for the project
-└── README.md                # Documentation and usage instructions
+choral-spec-internal/
+├── main.py                      # CLI entry point; parses args and launches roles (draft, target, fused_target, fused_client, verify)
+├── inference/                   # Package for model loading, speculative decoding, and verification logic
+│   ├── model_loader.py          # Utilities to load/compile models, includes load_fused_speculative_model()
+│   ├── draft_worker.py          # Distributed: Draft client with speculative decoding
+│   ├── target_worker.py         # Distributed: Target server (token-by-token verification)
+│   ├── fused_draft_worker.py    # Fused: Simple client that sends requests
+│   ├── fused_target_worker.py   # Fused: Server with FusedSpeculativeDecoder
+│   ├── speculative.py           # Distributed speculative decoding algorithm
+│   └── verify.py                # Verification utilities for standalone model testing
+├── grpc_comm/                   # gRPC definitions and generated code
+│   ├── inference.proto          # Protocol definitions for both architectures
+│   ├── inference_pb2.py         # Generated Python classes
+│   └── inference_pb2_grpc.py    # Generated gRPC client/server code
+├── compare_architectures.py     # Automated performance comparison script
+├── requirements.txt             # Python dependencies
+├── README.md                    # Documentation
+└── CLAUDE.md                    # Instructions for future Claude instances
 
 ```
 
@@ -88,29 +94,63 @@ Clean cache before compile:
 rm -r /var/tmp/neuron-compile-cache
 ```
 
-### **Compile & Run the Target Model Server**
+### **Distributed Architecture**
+
+#### **1. Start the Target Model Server**
 
 ```
 python main.py --role target --model /home/ubuntu/models/llama-3.1-8b/ --port 50051 --sequence_length 128 --batch 2 --profile --top_p 1.0
 ```
 
-### **Compile & Run the Draft Model server**
+#### **2. Run the Draft Model Client**
 
 ```
-python main.py --role draft --model /home/ubuntu/models/llama-3.2-1b/ --target_host 52.15.111.1 --port 50051 --prompt_text prompt.txt --max_new_tokens 100 --sequence_length 128 --profile --top_p 1.0 --temperature 0.9
+python main.py --role draft --model /home/ubuntu/models/llama-3.2-1b/ --target_host 18.189.128.139 --port 50051 --prompt_text prompt.txt --sequence_length 128 --profile --top_p 1.0 --temperature 0.9
 ```
+
+### **Fused Architecture**
+
+#### **1. Start the Fused Speculative Server**
+
+```
+python main.py --role fused_target --draft_model /home/ubuntu/models/llama-3.2-1b --target_model /home/ubuntu/models/llama-3.1-8b --port 50051 --sequence_length 128 --batch 2 --tp_degree 2 --speculation_length 5
+```
+
+#### **2. Run the Fused Client**
+
+```
+python main.py --role fused_client --target_host 18.189.128.139 --port 50051 --prompt_text prompt.txt --temperature 0.9 --top_p 1.0 --speculation_length 5 --profile
+```
+
+### **Performance Comparison**
+
+Run automated comparison between both architectures:
+
+```
+python compare_architectures.py --prompt-file prompt.txt --num-runs 3
+```
+
+Note: By default, both architectures will generate tokens up to the maximum sequence length (128) for fair comparison.
 
 ### **Example Output**
 
+#### Distributed Architecture:
 ```
-2025-04-25 03:36:14,234 INFO inference.draft_worker: [BATCH] Decoding prompt 0: What is the difference between llama and alpaca?
-2025-04-25 03:36:22,733 INFO inference.speculative: Latency: 8.49 seconds
-2025-04-25 03:36:22,733 INFO inference.speculative: Speculative decoding match rate: 9.38% (Draft accepted: 6, Target generated: 58)
-2025-04-25 03:36:22,733 INFO inference.draft_worker: Batched decode completed in 8.50s.
+2025-07-26 23:04:15,748 INFO inference.draft_worker: [Thread 0] completed in 1.41s, tokens=48, throughput=34.15 t/s
 
-=== Final Outputs (BATCH approach) ===
+=== Final Outputs (CONCURRENT) ===
 [Prompt 0 Output]:
-What is the difference between llama and alpaca? Alpacas are native to South America Peru, Bolivia, Chile have grey, brown, white, rose grey and fawn coloured coats while llamas have been domestic garded for over 4,000 years, are usually brown in colour, have thick woolly coats and longer legs and have been used far quieter and
+The history of AI can be traced back to 1960s, when the AI pioneers started to develop symbolic AI, also named as the von Neumann program. The early programs developed in the 1950s, including the Logic Theorist, a program that can prove various
+```
+
+#### Fused Architecture:
+```
+2025-07-27 00:45:28,733 INFO inference.fused_draft_worker: Server generation time: 2582.84ms
+2025-07-27 00:45:28,733 INFO inference.fused_draft_worker: Tokens per second: 19.36
+2025-07-27 00:45:28,733 INFO inference.fused_draft_worker: Acceptance rate: 71.07%
+
+[Prompt 0 Output]:
+The history of AI can be traced back to the 1950s with the advent of the computer. The first application of AI was in the field of mathematics, where it was used to solve complex equations. Since then, AI has been used in a variety of fields, including finance, healthcare
 ```
 
 ## **Performance Profiling Stats**
@@ -128,20 +168,42 @@ You can also run either the draft or target model **standalone** (without specul
 To run the **target model** by itself on a prompt:
 
 ```
-python main.py --role verify_target --model /home/ubuntu/models/llama-3.1-8b --prompt_text prompt.txt --sequence_length 128 --max_new_tokens 100 --profile
+python main.py --role verify_target --model /home/ubuntu/models/llama-3.1-8b --prompt_text prompt.txt --sequence_length 128 --profile
 ```
 
-This will load the 8B target model and generate 64 tokens continuing the prompt, printing each generated token as it arrives, followed by the full output text.
+This will load the 8B target model and generate tokens up to the sequence length, printing each generated token as it arrives, followed by the full output text.
 
 Similarly, to run the **draft model** by itself:
 
 ```
-python main.py --role verify_target --model /home/ubuntu/models/llama-3.2-1b --prompt_text prompt.txt --sequence_length 128 --max_new_tokens 100 --profile
+python main.py --role verify_draft --model /home/ubuntu/models/llama-3.2-1b --prompt_text prompt.txt --sequence_length 128 --profile
 ```
 
 This will use the 1B draft model to generate text token-by-token for the given prompt.
 
-*Note:* In verification modes, the model will be compiled on the fly if a compiled Neuron model is not found. By default, **`--sequence_length 128` is used; ensure you use the same sequence length that the model was compiled with (or specify** **`--sequence_length` accordingly) to avoid recompilation. The** `--max_tokens` option controls how many new tokens to generate for the prompt.
+*Note:* In verification modes, the model will be compiled on the fly if a compiled Neuron model is not found. By default, **`--sequence_length 128`** is used; ensure you use the same sequence length that the model was compiled with (or specify `--sequence_length` accordingly) to avoid recompilation.
 
-## **Supported features**
+## **Key Parameters**
+
+### Common Parameters:
+- `--sequence_length`: Maximum sequence length (default: 128)
+- `--max_new_tokens`: Maximum number of tokens to generate
+- `--temperature`: Temperature for sampling (default: 1.0)
+- `--top_p`: Top-p for nucleus sampling (default: 0.9)
+- `--profile`: Enable performance profiling
+
+### Distributed-Specific:
+- `--gamma`: Number of draft tokens per verification step (default: 4)
+- `--batch`: Batch size for model compilation (default: 2)
+
+### Fused-Specific:
+- `--speculation_length`: Number of tokens to speculate at once (default: 5)
+- `--tp_degree`: Tensor parallelism degree (default: 2 for trn1.2xlarge)
+
+## **Performance Notes**
+
+- **Distributed architecture**: ~34 tokens/second throughput
+- **Fused architecture**: ~19 tokens/second throughput
+- Fused models always use `batch_size=1` internally
+- Both architectures can use the same port (just not simultaneously)
 
