@@ -91,6 +91,11 @@ class FusedSpeculativeServicer(inference_pb2_grpc.SpeculativeServiceServicer):
             
             # Use the fused model's sample method
             # FusedSpeculativeDecoder.sample() takes sequence_length (total), not max_new_tokens
+            if max_new_tokens is None or max_new_tokens == 0:
+                # Calculate based on model's sequence length minus input length
+                max_new_tokens = self.sequence_length - input_ids.shape[1] - 10  # Leave some buffer
+                logger.info(f"max_new_tokens is None/0, calculating based on sequence_length: {max_new_tokens}")
+            
             sequence_length = input_ids.shape[1] + max_new_tokens
             
             with torch.no_grad():

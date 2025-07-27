@@ -47,8 +47,8 @@ def main():
                         help="Target server host address (for draft role to connect to target server)")
     parser.add_argument("--sequence_length", type=int, default=128,
                         help="Sequence length for model compilation (if not already compiled)")
-    parser.add_argument("--max_new_tokens", type=int, default=128,
-                        help="Maximum number of new tokens to generate (default: 128)")
+    parser.add_argument("--max_new_tokens", type=int, default=None,
+                        help="Maximum number of new tokens to generate (None or unspecified: generate up to sequence length)")
     parser.add_argument("--profile", action="store_true",
                         help="Enable performance profiling (latency/throughput metrics)")
     parser.add_argument("--no_target", action="store_true",
@@ -79,9 +79,6 @@ def main():
         logger.setLevel(logging.DEBUG)
         logger.debug("Global DEBUG logging enabled via --debug flag")
 
-    # Set max_new_tokens to sequence_length if not specified
-    if args.max_new_tokens is None:
-        args.max_new_tokens = args.sequence_length
 
     if args.role == "target":
         model_name = args.model or args.target_model
