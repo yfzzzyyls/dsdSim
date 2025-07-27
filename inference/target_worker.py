@@ -370,11 +370,10 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
             response = self.VerifyDraftTokens(single_request, context)
             
             # Convert to batch result format
-            result = inference_pb2.VerifyBatchResult(
+            result = inference_pb2.VerifyResult(
                 session_id=seq.session_id,
-                committed_ids=response.committed_ids,
                 tokens_accepted=response.accepted_count,
-                verify_time_ms=response.verify_time_ms,
+                target_token=0,  # Not used in this implementation
                 finished=response.finished
             )
             results.append(result)

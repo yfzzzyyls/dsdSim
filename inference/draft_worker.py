@@ -228,27 +228,10 @@ def speculative_decode(
         time_grpc_start = time.perf_counter()
         time_serialization = time.perf_counter()
         
-        # Use batch verification for better performance
-        if hasattr(grpc_client, 'verify_batch_tokens'):
-            # Try batched approach first (more efficient)
-            sequences = [(session_id, padded_tokens)]
-            batch_results = grpc_client.verify_batch_tokens(stub, sequences)
-            if batch_results:
-                result = batch_results[0]
-                commit_ids = result.get('committed_ids', [])
-                accepted_count = result.get('tokens_accepted', 0)
-                verify_time_ms = result.get('verify_time_ms', 0.0)
-                target_finished = result.get('finished', False)
-            else:
-                # Fallback to single verification
-                commit_ids, accepted_count, verify_time_ms, target_finished = grpc_client.verify_draft_tokens(
-                    stub, padded_tokens, padded_probs, session_id=session_id
-                )
-        else:
-            # Fallback to single verification
-            commit_ids, accepted_count, verify_time_ms, target_finished = grpc_client.verify_draft_tokens(
-                stub, padded_tokens, padded_probs, session_id=session_id
-            )
+        # Use single verification (batch verification needs proper implementation)
+        commit_ids, accepted_count, verify_time_ms, target_finished = grpc_client.verify_draft_tokens(
+            stub, padded_tokens, padded_probs, session_id=session_id
+        )
         
         grpc_serialization_time = time.perf_counter() - time_serialization
         timing["draft"]["grpc_serialization_time"] += grpc_serialization_time
@@ -301,14 +284,15 @@ def speculative_decode(
             
             if current_throughput < target_throughput * 0.8:  # If significantly below target
                 if acceptance_rate > 0.7:  # High acceptance rate - increase gamma
-                    gamma = min(gamma + 1, max(SPEC_LENGTH_BUCKETS))
+                    gamma = min(gamma + 1, max(SPEC_LENGTH_BUCKETS) - 1)  # -1 because we need gamma+1 tokens
                     logger.debug(f"[session={session_id}] Increasing gamma to {gamma} (acceptance={acceptance_rate:.2%}, throughput={current_throughput:.1f})")
                 elif acceptance_rate < 0.3:  # Low acceptance rate - decrease gamma
                     gamma = max(gamma - 1, 1)
                     logger.debug(f"[session={session_id}] Decreasing gamma to {gamma} (acceptance={acceptance_rate:.2%}, throughput={current_throughput:.1f})")
             
             # Update spec bucket for next iteration
-            spec_bucket = get_spec_bucket_for_gamma(gamma)
+            logger.debug(f"Updating spec bucket for gamma={gamma}")
+            spec_bucket = get_spec_bucket_for_gamma(gamma, SPEC_LENGTH_BUCKETS)
             
             # PID controller update
             error = target_accept - acceptance_rate
@@ -740,9 +724,27 @@ def generate_draft_chunk_isolated(draft_model, prev_token_id, tokenizer, gamma, 
             )
             sampling_filter_time += time.perf_counter() - time_sampling_start
 
+            # Check if masking resulted in empty tensor
+            if masked.numel() == 0 or torch.all(masked == float('-inf')):
+                logger.error(f"Masking resulted in empty or all-masked tensor!")
+                logger.error(f"Logits shape: {logits.shape}, min: {logits.min()}, max: {logits.max()}")
+                # Fallback to original logits without masking
+                masked = logits.unsqueeze(0)
+                candidate_idx = torch.arange(logits.shape[-1]).unsqueeze(0)
+
             # Optimize sampling with fewer intermediate tensors
             time_tensor_start = time.perf_counter()
             probs = torch.softmax(masked, dim=-1).squeeze(0)
+            
+            # Debug logging for probability issues
+            if torch.isnan(probs).any() or torch.isinf(probs).any() or (probs < 0).any():
+                logger.error(f"Invalid probabilities detected: nan={torch.isnan(probs).any()}, inf={torch.isinf(probs).any()}, negative={(probs < 0).any()}")
+                logger.error(f"Masked logits shape: {masked.shape}, min={masked.min()}, max={masked.max()}")
+                logger.error(f"Original logits shape: {logits.shape}, min={logits.min()}, max={logits.max()}")
+                logger.error(f"Temperature: {temperature}, top_p: {top_p}")
+                # Try to recover by using uniform distribution
+                probs = torch.ones_like(probs) / probs.numel()
+            
             sample_in_topk = torch.multinomial(probs, 1).item()
             tensor_alloc_time += time.perf_counter() - time_tensor_start
             token_id = int(candidate_idx[0, sample_in_topk])
@@ -812,8 +814,26 @@ def generate_draft_chunk_sync(draft_model, prev_token_id, tokenizer, gamma, top_
             top_k=TOP_K,
             top_p=top_p
         )
+        
+        # Check if masking resulted in empty tensor
+        if masked.numel() == 0 or torch.all(masked == float('-inf')):
+            logger.error(f"[SYNC] Masking resulted in empty or all-masked tensor!")
+            logger.error(f"[SYNC] Logits shape: {logits.shape}, min: {logits.min()}, max: {logits.max()}")
+            # Fallback to original logits without masking
+            masked = logits.unsqueeze(0)
+            candidate_idx = torch.arange(logits.shape[-1]).unsqueeze(0)
 
         probs = torch.softmax(masked, dim=-1).squeeze(0)
+        
+        # Debug logging for probability issues
+        if torch.isnan(probs).any() or torch.isinf(probs).any() or (probs < 0).any():
+            logger.error(f"[SYNC] Invalid probabilities detected: nan={torch.isnan(probs).any()}, inf={torch.isinf(probs).any()}, negative={(probs < 0).any()}")
+            logger.error(f"[SYNC] Masked logits shape: {masked.shape}, min={masked.min()}, max={masked.max()}")
+            logger.error(f"[SYNC] Original logits shape: {logits.shape}, min={logits.min()}, max={logits.max()}")
+            logger.error(f"[SYNC] Temperature: {temperature}, top_p: {top_p}")
+            # Try to recover by using uniform distribution
+            probs = torch.ones_like(probs) / probs.numel()
+        
         sample_in_topk = torch.multinomial(probs, 1).item()
         token_id = int(candidate_idx[0, sample_in_topk])
         token_prob = float(probs[sample_in_topk])
