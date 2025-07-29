@@ -655,15 +655,49 @@ def run_client(
     # Sort results by original prompt order
     results.sort(key=lambda r: r["prompt_idx"])
 
-    # Pretty‑print outputs
-    print("\n=== Final Outputs (CONCURRENT) ===")
-    for r in results:
-        print(f"[Prompt {r['prompt_idx']} Output]:\n{r['text']}\n")
+    # Pretty‑print outputs with detailed statistics
+    print("\n" + "="*60)
+    print("DISTRIBUTED SPECULATIVE DECODING RESULTS")
+    print("="*60)
+    
+    for i, r in enumerate(results):
+        print(f"\nProcessing prompt {i+1}/{len(results)}")
+        print("="*60)
+        
+        perf = r['perf']
+        tokens_generated = perf.get('tokens_generated', 0)
+        total_time = perf.get('total_time', 0)
+        tokens_per_second = perf.get('tokens_per_second', 0)
+        match_rate = perf.get('token_match_rate', 0) * 100
+        
+        print(f"Tokens generated: {tokens_generated}")
+        print(f"Total latency: {total_time*1000:.2f}ms")
+        print(f"Tokens per second: {tokens_per_second:.2f}")
+        print(f"Acceptance rate: {match_rate:.2f}%")
+        print(f"\n[Prompt {r['prompt_idx']} Output]:\n{r['text']}\n")
 
+    # Summary statistics
+    print("\n" + "="*60)
+    print("SUMMARY STATISTICS")
+    print("="*60)
+    
+    if results:
+        avg_latency = sum(r['perf'].get('total_time', 0) for r in results) / len(results)
+        avg_tokens_per_second = sum(r['perf'].get('tokens_per_second', 0) for r in results) / len(results)
+        avg_match_rate = sum(r['perf'].get('token_match_rate', 0) for r in results) / len(results) * 100
+        total_tokens = sum(r['perf'].get('tokens_generated', 0) for r in results)
+        
+        print(f"Total prompts processed: {len(results)}")
+        print(f"Average latency: {avg_latency*1000:.2f}ms")
+        print(f"Average tokens/second: {avg_tokens_per_second:.2f}")
+        print(f"Average acceptance rate: {avg_match_rate:.2f}%")
+        print(f"Total tokens generated: {total_tokens}")
+    
     # Aggregate CSV if profiling
     if profile:
         for r in results:
             save_perf_stats(r["perf"], file_prefix="performance_speculative")
+        print(f"\nPerformance data saved to performance_speculative.csv and performance_speculative.json")
 
     total_time = time.time() - start_time
     logger.info(f"Distributed speculative decode completed in {total_time:.2f}s.")
