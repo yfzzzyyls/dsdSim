@@ -18,7 +18,7 @@ import types
  # Speculation buckets are specified by *length*; the compiler will build
  # both batch‑1 and batch‑2 heads automatically when `dynamic_batch_size=True`.
 SPEC_LENGTH_BUCKETS = [3, 5]  # supports gamma=2 and gamma=4
-BATCH_BUCKETS = [1, 2]
+BATCH_BUCKETS = [1, 2, 3]
 logger = logging.getLogger(__name__)
 
 def get_spec_bucket_for_gamma(gamma: int, available_buckets=None) -> int:
