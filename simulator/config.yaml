@@ -4,6 +4,10 @@ burn_in_ms: 1000  # Ignore first 1s for warm-up
 verbose: true     # Print progress updates
 debug: false      # Show batch formation details
 
+# Speculative decoding parameters
+execution_mode: blocking  # blocking | speculative (only blocking supported now)
+gamma: 4                  # Number of draft tokens per chunk
+
 # Router can be: round_robin | jsq2 | wjsq2
 router: wjsq2
 router_params:
@@ -11,7 +15,7 @@ router_params:
 
 workload:
   arrival: poisson        # deterministic | poisson
-  rate_rps: 120           # used for poisson
+  rate_rps: 120           # total system request rate
   interarrival_ms: 12.0   # used for deterministic
 
 devices:
@@ -29,10 +33,68 @@ devices:
     batch_size: 48
     verify_latency_ms: 11.0
 
-  # Three drafts generating requests
+  # Three drafts with heterogeneous capabilities (edge devices)
+  # High-end device (e.g., iPhone 15 Pro, M3 MacBook)
   - id: d0
     role: draft
+    capability: 1.5       # Can generate 1.5x base rate
+    network_delay_ms: 15  # Good 5G/WiFi connection
+    burst_factor: 1.3     # Can burst 30% above steady rate
+    reliability: 0.99     # 99% reliable connection
+    
+  # Mid-range device (e.g., typical Android phone)
   - id: d1
     role: draft
+    capability: 1.0       # Baseline performance
+    network_delay_ms: 30  # Average 4G connection
+    burst_factor: 1.1     # Small burst capacity
+    reliability: 0.95     # 95% reliable
+    
+  # Low-end device (e.g., old phone, Raspberry Pi)
   - id: d2
     role: draft
+    capability: 0.5       # Only 50% of baseline
+    network_delay_ms: 60  # Poor connection/3G
+    burst_factor: 1.0     # No burst capacity
+    reliability: 0.90     # May disconnect more often
+
+# Connection-specific parameters between draft-target pairs
+connections:
+  # d0 (high-end device) connections
+  - draft: d0
+    target: t0
+    forward_latency_ms: 12     # Fast 5G to nearby target
+    response_latency_ms: 10
+    acceptance_rate: 0.85       # Good model alignment
+    
+  - draft: d0
+    target: t1
+    forward_latency_ms: 20     # Further target
+    response_latency_ms: 18
+    acceptance_rate: 0.75       # t1 is different model, lower acceptance
+    
+  # d1 (mid-range device) connections  
+  - draft: d1
+    target: t0
+    forward_latency_ms: 25     # Average 4G connection
+    response_latency_ms: 22
+    acceptance_rate: 0.80
+    
+  - draft: d1
+    target: t1
+    forward_latency_ms: 35
+    response_latency_ms: 30
+    acceptance_rate: 0.70
+    
+  # d2 (low-end device) connections
+  - draft: d2
+    target: t0
+    forward_latency_ms: 50     # Poor 3G connection
+    response_latency_ms: 45
+    acceptance_rate: 0.65       # Weaker draft model
+    
+  - draft: d2
+    target: t1
+    forward_latency_ms: 65
+    response_latency_ms: 60
+    acceptance_rate: 0.60

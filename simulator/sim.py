@@ -20,6 +20,40 @@ class TargetParams:
     verify_latency_ms: float = 8.0    # fixed service time per batch
 
 @dataclass
+class DraftParams:
+    id: str
+    capability: float = 1.0           # relative compute speed (affects generation rate)
+    network_delay_ms: float = 20.0    # network RTT to cloud targets (deprecated, use connections)
+    burst_factor: float = 1.0         # short-term burst multiplier
+    reliability: float = 0.99         # connection reliability (0-1)
+
+@dataclass
+class ConnectionParams:
+    draft_id: str
+    target_id: str
+    forward_latency_ms: float         # draft -> target latency
+    response_latency_ms: float        # target -> draft latency
+    acceptance_rate: float            # probability each token is accepted
+
+@dataclass
+class DraftChunk:
+    chunk_id: int
+    session_id: int
+    draft_id: str
+    target_id: str
+    tokens: int                      # number of tokens (we don't simulate actual tokens)
+    created_ms: float
+    sent_ms: float
+    expected_response_ms: float
+
+@dataclass
+class VerifyResult:
+    chunk_id: int
+    accepted_tokens: int
+    rejected_tokens: int
+    total_tokens: int
+
+@dataclass
 class WorkloadCfg:
     arrival: str = "deterministic"    # "deterministic" | "poisson"
     interarrival_ms: float = 12.0     # used if deterministic
@@ -29,9 +63,12 @@ class WorkloadCfg:
 class Config:
     sim_time_ms: float = 10_000
     seed: int = 0
+    execution_mode: str = "blocking"  # "blocking" | "speculative"
+    gamma: int = 4                     # tokens per chunk
     router: str = "round_robin"       # "round_robin" | "jsq2" | "wjsq2"
     router_params: Dict[str, Any] = field(default_factory=lambda: {"d_choices": 2})
     devices: List[Dict[str, Any]] = field(default_factory=list)   # list of dicts with role/params
+    connections: List[Dict[str, Any]] = field(default_factory=list)  # draft-target connections
     workload: WorkloadCfg = field(default_factory=WorkloadCfg)
     burn_in_ms: float = 0.0           # Ignore first X ms for stats
     verbose: bool = True               # Print progress updates
@@ -202,68 +239,177 @@ class TargetServer:
                 self.metrics.add(j)
 
 class DraftServer:
-    """Generates verify jobs according to the workload model."""
-    def __init__(self, env: simpy.Environment, draft_id: str, cfg: Config, router, num_drafts: int = 1):
+    """Simulates draft model generating chunks and waiting for verification (blocking mode)."""
+    def __init__(self, env: simpy.Environment, params: DraftParams, cfg: Config, 
+                 router, connections: Dict[str, ConnectionParams], total_capability: float = 1.0):
         self.env = env
-        self.id = draft_id
+        self.p = params
+        self.id = params.id
         self.cfg = cfg
         self.router = router
-        self.num_drafts = num_drafts  # Total number of draft servers
-        self.jid = 0
-        self.proc = env.process(self._generate())
+        self.connections = connections  # Map of target_id -> ConnectionParams
+        self.total_capability = total_capability
+        self.gamma = cfg.gamma  # tokens per chunk
+        
+        # Metrics
+        self.chunks_sent = 0
+        self.total_tokens_generated = 0
+        self.total_tokens_accepted = 0
+        self.total_tokens_rejected = 0
+        self.total_round_trip_time = 0.0
+        
+        self.proc = env.process(self._generate_blocking())
 
     def _ia(self) -> float:
+        """Inter-arrival time between generation sessions"""
         wl = self.cfg.workload
         if wl.arrival == "poisson":
-            # Divide rate by number of drafts to get per-draft rate
-            per_draft_rate = max(wl.rate_rps / self.num_drafts, 1e-9)
-            lam = per_draft_rate / 1000.0  # events per ms
+            # Capability-weighted rate distribution
+            my_share = self.p.capability / self.total_capability
+            my_rate = max(wl.rate_rps * my_share, 1e-9)
+            lam = my_rate / 1000.0  # events per ms
             return random.expovariate(lam)
-        # default deterministic - also divide by number of drafts
-        return self.cfg.workload.interarrival_ms * self.num_drafts
-
-    def _generate(self):
-        if self.cfg.debug and self.id == "d0":  # Only print for first draft to reduce noise
-            print(f"[{self.env.now:.1f}ms] Draft {self.id} starting generation (rate per draft: {self.cfg.workload.rate_rps/self.num_drafts:.1f} req/s)", flush=True)
+        # default deterministic - also capability-weighted
+        base_ia = self.cfg.workload.interarrival_ms
+        return base_ia * self.total_capability / self.p.capability
+    
+    def _select_target(self) -> tuple[str, ConnectionParams]:
+        """Select a target server using router logic and return its ID and connection params"""
+        # Use the router to select the best target
+        # Create a dummy job for routing decision
+        dummy_job = Job(jid=-1, created_ms=self.env.now, draft_id=self.id)
         
-        job_count = 0
+        # Get the target selection from router (but don't actually enqueue)
+        if hasattr(self.router, '_weighted_sample_k'):
+            # For wJSQ2 router
+            candidates = self.router._weighted_sample_k(self.router.d)
+            target = min(candidates, key=lambda t: t.work_left_score())
+        elif hasattr(self.router, 'targets'):
+            # For round-robin or other routers, just pick based on queue length
+            target = min(self.router.targets, key=lambda t: t.queue_len())
+        else:
+            # Fallback to random
+            target_ids = list(self.connections.keys())
+            if not target_ids:
+                raise ValueError(f"Draft {self.id} has no connections configured")
+            target_id = random.choice(target_ids)
+            return target_id, self.connections[target_id]
+        
+        target_id = target.p.id
+        if target_id not in self.connections:
+            # If no connection configured for this target, pick first available
+            target_ids = list(self.connections.keys())
+            if target_ids:
+                target_id = target_ids[0]
+            else:
+                raise ValueError(f"Draft {self.id} has no connections configured")
+        
+        return target_id, self.connections[target_id]
+    
+    def _simulate_verification(self, tokens: int, acceptance_rate: float) -> VerifyResult:
+        """Simulate target verification of draft tokens"""
+        accepted = 0
+        for i in range(tokens):
+            if random.random() < acceptance_rate:
+                accepted += 1
+            else:
+                # First rejection stops acceptance
+                break
+        
+        rejected = tokens - accepted
+        return VerifyResult(
+            chunk_id=self.chunks_sent,
+            accepted_tokens=accepted,
+            rejected_tokens=rejected,
+            total_tokens=tokens
+        )
+    
+    def _generate_blocking(self):
+        """Blocking mode: generate chunk, send, wait for response, then continue"""
+        if self.cfg.verbose:
+            my_share = self.p.capability / self.total_capability
+            my_rate = self.cfg.workload.rate_rps * my_share
+            print(f"[{self.env.now:.1f}ms] Draft {self.id} starting blocking mode (gamma={self.gamma}, rate={my_rate:.1f} req/s)", flush=True)
+        
+        session_count = 0
+        
         while self.env.now < self.cfg.sim_time_ms:
-            job = Job(jid=self.jid, created_ms=self.env.now, draft_id=self.id)
-            self.jid += 1
-            job_count += 1
+            # Start a new generation session
+            session_count += 1
+            session_start = self.env.now
             
-            if self.cfg.debug and self.jid <= 3:  # Print first 3 jobs only
-                print(f"[{self.env.now:.1f}ms] Draft {self.id} generated job {self.jid}", flush=True)
+            # Select target for this session
+            target_id, conn = self._select_target()
             
-            # Add periodic debug even when debug is off
-            if job_count % 50 == 0 and job_count > 0:
-                print(f"[{self.env.now:.1f}ms] Draft {self.id}: Generated {job_count} jobs so far", flush=True)
+            # Generate a chunk of gamma tokens locally (no delay for local generation)
+            self.chunks_sent += 1
+            self.total_tokens_generated += self.gamma
             
-            # Debug after 1000ms
-            if self.env.now > 1000 and job_count % 10 == 0:
-                print(f"[{self.env.now:.1f}ms] Draft {self.id}: Still generating, job #{job_count}", flush=True)
+            if self.cfg.debug:
+                print(f"[{self.env.now:.1f}ms] Draft {self.id}: Generating chunk #{self.chunks_sent} ({self.gamma} tokens) for target {target_id}", flush=True)
             
-            # Debug: check if routing is slow
-            if self.env.now > 1020 and self.env.now < 1030:
-                print(f"[{self.env.now:.1f}ms] Draft {self.id}: About to route job {job_count}", flush=True)
+            # Create a job representing this chunk verification request
+            job = Job(jid=self.chunks_sent, created_ms=self.env.now, draft_id=self.id)
             
-            self.router.route(job)
+            # Send chunk to target (forward latency)
+            yield self.env.timeout(conn.forward_latency_ms)
             
-            if self.env.now > 1020 and self.env.now < 1030:
-                print(f"[{self.env.now:.1f}ms] Draft {self.id}: Routing complete", flush=True)
+            # Job arrives at target after network delay
+            job.created_ms = self.env.now
             
+            # Find the target server and enqueue the job
+            target_server = None
+            for target in self.router.targets:
+                if target.p.id == target_id:
+                    target_server = target
+                    target.enqueue(job)
+                    break
+            
+            if not target_server:
+                print(f"Warning: Target {target_id} not found for draft {self.id}", flush=True)
+                continue
+            
+            # In blocking mode, draft waits for:
+            # 1. Target to process the verification (target's verify_latency_ms handles this)
+            # 2. Response to travel back (response_latency_ms)
+            
+            # The target will process this job in its batch window + verify_latency
+            # For now, we simulate the total round-trip time
+            # In reality, the target processing happens asynchronously
+            
+            # Wait for response (response latency after target processes)
+            yield self.env.timeout(conn.response_latency_ms)
+            
+            # Simulate verification result
+            result = self._simulate_verification(self.gamma, conn.acceptance_rate)
+            self.total_tokens_accepted += result.accepted_tokens
+            self.total_tokens_rejected += result.rejected_tokens
+            
+            # Calculate round-trip time
+            rtt = self.env.now - session_start
+            self.total_round_trip_time += rtt
+            
+            if self.cfg.debug or (self.chunks_sent % 10 == 0):
+                acceptance_rate = self.total_tokens_accepted / self.total_tokens_generated if self.total_tokens_generated > 0 else 0
+                avg_rtt = self.total_round_trip_time / self.chunks_sent if self.chunks_sent > 0 else 0
+                print(f"[{self.env.now:.1f}ms] Draft {self.id}: Chunk #{self.chunks_sent} result: {result.accepted_tokens}/{self.gamma} accepted, "
+                      f"overall acceptance={acceptance_rate:.2%}, avg RTT={avg_rtt:.1f}ms", flush=True)
+            
+            # Wait before starting next chunk (inter-arrival time)
             ia = self._ia()
-            
-            if self.cfg.debug and self.jid <= 2:  # Print interarrival for first 2
-                print(f"  Draft {self.id} waiting {ia:.1f}ms until next job", flush=True)
-            
             yield self.env.timeout(ia)
-            
-            # Extra debug if we're past 1000ms and haven't printed in a while
-            if self.env.now > 1000 and self.env.now < 1100:
-                print(f"[{self.env.now:.1f}ms] Draft {self.id}: About to loop, job_count={job_count}, next check at {self.env.now + ia:.1f}ms", flush=True)
         
-        print(f"[{self.env.now:.1f}ms] Draft {self.id}: Finished generating (total: {job_count} jobs)", flush=True)
+        # Final statistics
+        if self.chunks_sent > 0:
+            acceptance_rate = self.total_tokens_accepted / self.total_tokens_generated
+            avg_rtt = self.total_round_trip_time / self.chunks_sent
+        else:
+            acceptance_rate = 0
+            avg_rtt = 0
+        
+        print(f"[{self.env.now:.1f}ms] Draft {self.id} finished: chunks={self.chunks_sent}, "
+              f"tokens={self.total_tokens_generated}, accepted={self.total_tokens_accepted} ({acceptance_rate:.2%}), "
+              f"avg RTT={avg_rtt:.1f}ms", flush=True)
 
 # ---------- Routers ----------
 
@@ -368,9 +514,12 @@ def load_config(path: str) -> Config:
     cfg = Config(
         sim_time_ms=raw.get("sim_time_ms", 10_000),
         seed=raw.get("seed", 0),
+        execution_mode=raw.get("execution_mode", "blocking"),
+        gamma=raw.get("gamma", 4),
         router=raw.get("router", "round_robin"),
         router_params=raw.get("router_params", {"d_choices": 2}),
         devices=raw.get("devices", []),
+        connections=raw.get("connections", []),
         workload=wl,
         burn_in_ms=raw.get("burn_in_ms", 0.0),
         verbose=raw.get("verbose", True),
@@ -394,19 +543,13 @@ def build(env: simpy.Environment, cfg: Config):
     targets: List[TargetServer] = []
     drafts: List[DraftServer] = []
 
-    # If devices list is empty, fall back to 2 drafts + 2 targets
+    # Require devices to be specified in config
     if not cfg.devices:
-        targets = [TargetServer(env, TargetParams(id=f"t{i}"), metrics, debug=cfg.debug) for i in range(2)]
-        router = ROUTERS[cfg.router](targets, **cfg.router_params) if cfg.router != "round_robin" \
-            else ROUTERS[cfg.router](targets)
-        num_drafts = 2
-        drafts = [DraftServer(env, f"d{i}", cfg, router, num_drafts) for i in range(num_drafts)]
-        # Start heartbeat monitor
-        if cfg.verbose:
-            env.process(heartbeat_monitor(env, metrics, targets, cfg))
-        return metrics, targets
+        raise ValueError("No devices specified in config. Please define at least one target and one draft device.")
 
     # Build from devices list
+    draft_configs = []
+    
     for d in cfg.devices:
         role = d.get("role", "target")
         if role == "target":
@@ -418,6 +561,9 @@ def build(env: simpy.Environment, cfg: Config):
                 verify_latency_ms=float(d.get("verify_latency_ms", 8.0)),
             )
             targets.append(TargetServer(env, params, metrics, debug=cfg.debug))
+        elif role == "draft":
+            # Store draft configs for later processing
+            draft_configs.append(d)
 
     RouterCls = ROUTERS.get(cfg.router, RoundRobinRouter)
     if RouterCls == WeightedJSQ2Router:
@@ -427,28 +573,71 @@ def build(env: simpy.Environment, cfg: Config):
     else:
         router = RouterCls(targets)
 
-    # Count drafts first
-    num_drafts = sum(1 for d in cfg.devices if d.get("role") == "draft")
+    # Validate we have at least one target and one draft
+    if not targets:
+        raise ValueError("No target devices specified in config. At least one target is required.")
+    if not draft_configs:
+        raise ValueError("No draft devices specified in config. At least one draft is required.")
     
-    for d in cfg.devices:
-        role = d.get("role", "target")
-        if role == "draft":
-            drafts.append(DraftServer(env, d["id"], cfg, router, num_drafts))
+    # Calculate total draft capability for weighted distribution
+    total_capability = sum(float(d.get("capability", 1.0)) for d in draft_configs)
+    if total_capability <= 0:
+        raise ValueError("Total draft capability must be positive.")
+    
+    # Build connection matrix
+    connection_map = {}  # draft_id -> {target_id -> ConnectionParams}
+    for conn_cfg in cfg.connections:
+        draft_id = conn_cfg.get("draft")
+        target_id = conn_cfg.get("target")
+        if not draft_id or not target_id:
+            continue
+            
+        if draft_id not in connection_map:
+            connection_map[draft_id] = {}
+            
+        connection_map[draft_id][target_id] = ConnectionParams(
+            draft_id=draft_id,
+            target_id=target_id,
+            forward_latency_ms=float(conn_cfg.get("forward_latency_ms", 20.0)),
+            response_latency_ms=float(conn_cfg.get("response_latency_ms", 20.0)),
+            acceptance_rate=float(conn_cfg.get("acceptance_rate", 0.8)),
+        )
+    
+    # Create draft servers with connections
+    for d in draft_configs:
+        params = DraftParams(
+            id=d["id"],
+            capability=float(d.get("capability", 1.0)),
+            network_delay_ms=float(d.get("network_delay_ms", 20.0)),
+            burst_factor=float(d.get("burst_factor", 1.0)),
+            reliability=float(d.get("reliability", 0.99)),
+        )
+        
+        # Get connections for this draft
+        draft_connections = connection_map.get(d["id"], {})
+        if not draft_connections:
+            print(f"Warning: Draft {d['id']} has no connections configured", flush=True)
+        
+        drafts.append(DraftServer(env, params, cfg, router, draft_connections, total_capability))
 
     # Start heartbeat monitor
     if cfg.verbose:
         env.process(heartbeat_monitor(env, metrics, targets, cfg))
     
-    return metrics, targets
+    return metrics, targets, drafts
 
 def run(cfg: Config):
     env = simpy.Environment()
     result = build(env, cfg)
-    if isinstance(result, tuple):
+    if isinstance(result, tuple) and len(result) == 3:
+        metrics, targets, drafts = result
+    elif isinstance(result, tuple) and len(result) == 2:
         metrics, targets = result
+        drafts = []
     else:
         metrics = result
         targets = []
+        drafts = []
     
     # Progress reporting with correct estimation
     if cfg.verbose:
@@ -495,7 +684,7 @@ def run(cfg: Config):
         print(f"\nSimulation complete in {elapsed_real_time:.2f}s real time")
         print(f"Processed {len(metrics.completed)} total jobs")
     
-    return metrics.summary(), targets
+    return metrics.summary(), targets, drafts
 
 def get_target_metrics(targets: List[TargetServer], sim_time_ms: float) -> Dict[str, Dict[str, float]]:
     """Extract per-target metrics."""
@@ -518,6 +707,28 @@ def get_target_metrics(targets: List[TargetServer], sim_time_ms: float) -> Dict[
         }
     return results
 
+def get_draft_metrics(drafts: List[DraftServer]) -> Dict[str, Dict[str, Any]]:
+    """Extract per-draft metrics for speculative decoding."""
+    results = {}
+    for d in drafts:
+        if d.chunks_sent > 0:
+            acceptance_rate = d.total_tokens_accepted / d.total_tokens_generated
+            avg_rtt = d.total_round_trip_time / d.chunks_sent
+        else:
+            acceptance_rate = 0
+            avg_rtt = 0
+            
+        results[d.p.id] = {
+            "capability": d.p.capability,
+            "chunks_sent": d.chunks_sent,
+            "tokens_generated": d.total_tokens_generated,
+            "tokens_accepted": d.total_tokens_accepted,
+            "tokens_rejected": d.total_tokens_rejected,
+            "acceptance_rate": acceptance_rate,
+            "avg_rtt_ms": avg_rtt,
+        }
+    return results
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", "-c", default="config.yaml")
@@ -525,11 +736,15 @@ def main():
     cfg = load_config(args.config)
     
     result = run(cfg)
-    if isinstance(result, tuple):
+    if isinstance(result, tuple) and len(result) == 3:
+        summary, targets, drafts = result
+    elif isinstance(result, tuple) and len(result) == 2:
         summary, targets = result
+        drafts = []
     else:
         summary = result
         targets = []
+        drafts = []
     
     # Print results
     print("\n" + "="*60)
@@ -555,6 +770,18 @@ def main():
             print(f"    Total batches: {metrics['total_batches']}")
             print(f"    Avg queue len: {metrics['avg_queue_len']:.1f}")
             print(f"    P95 queue len: {metrics['p95_queue_len']:.0f}")
+    
+    if drafts:
+        print("\nPer-Draft Metrics (Speculative Decoding):")
+        draft_metrics = get_draft_metrics(drafts)
+        for did, metrics in draft_metrics.items():
+            print(f"  {did}:")
+            print(f"    Capability: {metrics['capability']:.1f}x")
+            print(f"    Chunks sent: {metrics['chunks_sent']}")
+            print(f"    Tokens generated: {metrics['tokens_generated']}")
+            print(f"    Tokens accepted: {metrics['tokens_accepted']}")
+            print(f"    Acceptance rate: {metrics['acceptance_rate']:.2%}")
+            print(f"    Avg RTT: {metrics['avg_rtt_ms']:.1f}ms")
 
 if __name__ == "__main__":
     main()
