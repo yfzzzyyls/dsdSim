@@ -23,6 +23,7 @@ class TargetParams:
 class DraftParams:
     id: str
     capability: float = 1.0           # relative compute speed (affects generation rate)
+    generation_latency_ms: float = 0.0  # time to generate gamma tokens (0 = instant)
     burst_factor: float = 1.0         # short-term burst multiplier
     reliability: float = 0.99         # connection reliability (0-1)
 
@@ -328,7 +329,8 @@ class DraftServer:
         if self.cfg.verbose:
             my_share = self.p.capability / self.total_capability
             my_rate = self.cfg.workload.rate_rps * my_share
-            print(f"[{self.env.now:.1f}ms] Draft {self.id} starting blocking mode (gamma={self.gamma}, rate={my_rate:.1f} req/s)", flush=True)
+            gen_info = f", gen_latency={self.p.generation_latency_ms:.0f}ms" if self.p.generation_latency_ms > 0 else ""
+            print(f"[{self.env.now:.1f}ms] Draft {self.id} starting blocking mode (gamma={self.gamma}, rate={my_rate:.1f} req/s{gen_info})", flush=True)
         
         session_count = 0
         
@@ -340,12 +342,15 @@ class DraftServer:
             # Select target for this session
             target_id, conn = self._select_target()
             
-            # Generate a chunk of gamma tokens locally (no delay for local generation)
+            # Generate a chunk of gamma tokens (takes time on edge device!)
+            if self.p.generation_latency_ms > 0:
+                yield self.env.timeout(self.p.generation_latency_ms)
+            
             self.chunks_sent += 1
             self.total_tokens_generated += self.gamma
             
             if self.cfg.debug:
-                print(f"[{self.env.now:.1f}ms] Draft {self.id}: Generating chunk #{self.chunks_sent} ({self.gamma} tokens) for target {target_id}", flush=True)
+                print(f"[{self.env.now:.1f}ms] Draft {self.id}: Generated chunk #{self.chunks_sent} ({self.gamma} tokens) for target {target_id}", flush=True)
             
             # Create a job representing this chunk verification request
             job = Job(jid=self.chunks_sent, created_ms=self.env.now, draft_id=self.id)
@@ -607,6 +612,7 @@ def build(env: simpy.Environment, cfg: Config):
         params = DraftParams(
             id=d["id"],
             capability=float(d.get("capability", 1.0)),
+            generation_latency_ms=float(d.get("generation_latency_ms", 0.0)),
             burst_factor=float(d.get("burst_factor", 1.0)),
             reliability=float(d.get("reliability", 0.99)),
         )

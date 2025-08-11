@@ -38,6 +38,7 @@ devices:
   - id: d0
     role: draft
     capability: 1.5       # Can generate 1.5x base rate
+    generation_latency_ms: 0  # ZERO latency for baseline comparison
     burst_factor: 1.3     # Can burst 30% above steady rate
     reliability: 0.99     # 99% reliable connection
     
@@ -45,6 +46,7 @@ devices:
   - id: d1
     role: draft
     capability: 1.0       # Baseline performance
+    generation_latency_ms: 133  # Time to generate 4 tokens (~30 tok/s)
     burst_factor: 1.1     # Small burst capacity
     reliability: 0.95     # 95% reliable
     
@@ -52,6 +54,7 @@ devices:
   - id: d2
     role: draft
     capability: 0.5       # Only 50% of baseline
+    generation_latency_ms: 400  # Time to generate 4 tokens (~10 tok/s)
     burst_factor: 1.0     # No burst capacity
     reliability: 0.90     # May disconnect more often
 
