@@ -23,7 +23,6 @@ class TargetParams:
 class DraftParams:
     id: str
     capability: float = 1.0           # relative compute speed (affects generation rate)
-    network_delay_ms: float = 20.0    # network RTT to cloud targets (deprecated, use connections)
     burst_factor: float = 1.0         # short-term burst multiplier
     reliability: float = 0.99         # connection reliability (0-1)
 
@@ -608,7 +607,6 @@ def build(env: simpy.Environment, cfg: Config):
         params = DraftParams(
             id=d["id"],
             capability=float(d.get("capability", 1.0)),
-            network_delay_ms=float(d.get("network_delay_ms", 20.0)),
             burst_factor=float(d.get("burst_factor", 1.0)),
             reliability=float(d.get("reliability", 0.99)),
         )
