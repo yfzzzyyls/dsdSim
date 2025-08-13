@@ -114,6 +114,37 @@ def run_experiment(num_drafts: int) -> Tuple[float, dict]:
         if os.path.exists(temp_config):
             os.remove(temp_config)
 
+def calculate_theoretical_per_draft(gamma: int = 4) -> float:
+    """Calculate theoretical max tokens/s per draft based on config."""
+    # Load template to get actual parameters
+    template_path = os.path.join(os.path.dirname(__file__), '../configs/homogeneous_draft.yaml')
+    with open(template_path, 'r') as f:
+        config = yaml.safe_load(f)
+    
+    # Get target parameters
+    target_config = next((d for d in config['devices'] if d['role'] == 'target'), None)
+    if not target_config:
+        return 24.5  # fallback
+    
+    # Calculate typical decode batch latency
+    decode_latency_per_token = target_config.get('decode_latency_per_token', 9.25)
+    decode_batch_latency = gamma * decode_latency_per_token  # 37ms for gamma=4
+    batch_window = target_config.get('batch_window_ms', 10.0)
+    
+    # Total batch cycle time
+    batch_cycle = decode_batch_latency + batch_window  # 47ms
+    
+    # Requests per second per draft (no queueing)
+    # Draft takes: 24ms gen + 20ms forward + batch_cycle + 20ms response = 64ms + batch_cycle
+    draft_cycle = 24.0 + 20.0 + batch_cycle + 20.0  # 111ms for our params
+    req_per_s = 1000.0 / draft_cycle  # ~9.01 req/s
+    
+    # Tokens per request (85% per-token acceptance, sequential)
+    acceptance_rate = 0.85
+    tokens_per_req = sum(acceptance_rate**k for k in range(1, gamma+1))  # ~2.71
+    
+    return req_per_s * tokens_per_req
+
 def plot_results(results: List[dict], output_dir: str):
     """Create visualization of scaling results."""
     
@@ -121,9 +152,7 @@ def plot_results(results: List[dict], output_dir: str):
     tps = [r['effective_tps'] for r in results]
     
     # Calculate speedup and efficiency
-    # The theoretical maximum per draft is ~24.5 tok/s
-    # (9.01 req/s * 2.72 accepted tokens per request)
-    theoretical_per_draft = 24.5  # Based on our calculations
+    theoretical_per_draft = calculate_theoretical_per_draft(gamma=4)
     
     # Use 1-draft result as baseline for speedup comparison
     baseline = tps[0] if tps[0] > 0 else 13.0
@@ -133,8 +162,8 @@ def plot_results(results: List[dict], output_dir: str):
     # Efficiency = actual_tps / (num_drafts * theoretical_per_draft)
     efficiencies = [t / (d * theoretical_per_draft) if d > 0 else 0 for t, d in zip(tps, drafts)]
     
-    # Create figure with 3 subplots
-    fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(15, 5))
+    # Create figure with 2 subplots
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
     
     # Plot 1: Tokens per second
     ax1.plot(drafts, tps, 'b-o', linewidth=0.6, markersize=4, label='Actual throughput')
@@ -160,25 +189,7 @@ def plot_results(results: List[dict], output_dir: str):
     ax2.legend(loc='upper left')
     ax2.set_xticks([d for d in drafts if d % 10 == 0])  # Show multiples of 10
     
-    # Plot 3: Efficiency
-    # Efficiency measures how well the system scales compared to theoretical maximum
-    # 100% = achieving theoretical max throughput per draft
-    # 80% = good scaling, minor bottlenecks
-    # 50% = significant bottlenecks, half the theoretical capacity
-    ax3.plot(drafts, [e * 100 for e in efficiencies], 'r-^', linewidth=0.6, markersize=4, label='System efficiency')
-    ax3.axhline(y=100, color='g', linestyle='--', alpha=0.3, linewidth=0.4)
-    ax3.axhline(y=80, color='orange', linestyle='--', alpha=0.3, linewidth=0.4)
-    ax3.axhline(y=50, color='blue', linestyle='--', alpha=0.3, linewidth=0.4)
-    ax3.set_xlabel('Number of Drafts')
-    ax3.set_ylabel('Efficiency (%)')
-    ax3.set_title('Scaling Efficiency\n(% of theoretical max per draft)')
-    ax3.grid(True, alpha=0.3)
-    # Only show legend for the main efficiency line, not the reference lines
-    ax3.legend(['System efficiency'], loc='upper right', fontsize=9)
-    ax3.set_ylim([0, 100])
-    ax3.set_xticks([d for d in drafts if d % 10 == 0])  # Show multiples of 10
-    
-    plt.suptitle('Homogeneous Draft Scaling Experiment\n(24ms generation, mixed batching: 37ms decode/50ms prefill, 68% acceptance)', fontsize=14)
+    plt.suptitle('Homogeneous Draft Scaling Experiment\n(24ms gen, mixed batch: 37ms decode/50ms prefill, Δ=10ms window, p=0.85/token→E[accept]=2.71/4)', fontsize=13)
     plt.tight_layout()
     plot_path = os.path.join(output_dir, 'scaling_curve.png')
     plt.savefig(plot_path, dpi=150)
@@ -193,8 +204,8 @@ def print_summary(results: List[dict]):
     print("SUMMARY")
     print("=" * 70)
     
-    # Theoretical maximum per draft
-    theoretical_per_draft = 24.5  # tok/s
+    # Theoretical maximum per draft (calculated from actual config)
+    theoretical_per_draft = calculate_theoretical_per_draft(gamma=4)
     
     # Use 1-draft result as baseline for speedup
     baseline = results[0]['effective_tps'] if results[0]['effective_tps'] > 0 else 13.0
@@ -227,7 +238,6 @@ def print_summary(results: List[dict]):
     print(f"Max speedup: {max_tps/baseline:.2f}x")
     
     # Find efficiency drop point (< 50%)
-    theoretical_per_draft = 24.5
     for r in results:
         efficiency = (r['effective_tps'] / (r['num_drafts'] * theoretical_per_draft) * 100) if r['num_drafts'] > 0 else 0
         if efficiency < 50:
@@ -249,10 +259,14 @@ def main():
     print("Configuration:")
     print("  - Draft generation: 24ms (6ms/token × 4 tokens)")
     print("  - Target batch processing (mixed batching):")
-    print("    * Decode-only batches: 37ms (4 tokens × 9.25ms)")
-    print("    * Prefill-containing batches: 50ms (100 tokens × 0.5ms)")
-    print("  - Network latency: 20ms each way")
-    print("  - Acceptance rate: ~68% overall (85% per token)")
+    print("    * Decode-only batches: 37ms (4 tokens × 9.25ms/token)")
+    print("    * Prefill-containing batches: 50ms (100 tokens × 0.5ms/token)")
+    print("    * Batch window (Δ): 10ms")
+    print("    * Max batch size: 8")
+    print("  - Network latency: 20ms forward, 20ms response")
+    print("  - Acceptance: p=0.85 per token → E[accepted]=2.71/4 tokens (67.7%)")
+    print("  - Prompt: 100 tokens fixed (prompt_scale_by_capability=false)")
+    print("  - Answer: 20 tokens per conversation (5 decode rounds)")
     print("  - Simulation duration: 60 seconds")
     print("=" * 70)
     

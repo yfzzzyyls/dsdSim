@@ -444,13 +444,19 @@ class DraftServer:
         """Sample prompt length based on device capability"""
         if self.cfg.prompt_scale_by_capability:
             # Weaker devices get shorter prompts
-            # Map capability [0,1] to prompt length range
-            normalized_cap = self.p.capability / max(1.0, self.total_capability)
+            # Use capability directly (assumed to be in [0,1] range), not normalized by total
+            # This ensures prompt lengths don't change as we add more drafts
+            normalized_cap = min(1.0, self.p.capability)  # Cap at 1.0 for safety
             length_range = self.cfg.prompt_length_max - self.cfg.prompt_length_min
             prompt_length = int(self.cfg.prompt_length_min + normalized_cap * length_range)
         else:
-            # Uniform random between min and max
-            prompt_length = random.randint(self.cfg.prompt_length_min, self.cfg.prompt_length_max)
+            # For homogeneous experiments with fixed prompt length (min == max),
+            # this gives a consistent prompt length
+            if self.cfg.prompt_length_min == self.cfg.prompt_length_max:
+                prompt_length = self.cfg.prompt_length_min
+            else:
+                # Uniform random between min and max
+                prompt_length = random.randint(self.cfg.prompt_length_min, self.cfg.prompt_length_max)
         return prompt_length
     
     def _generate_blocking(self):
@@ -584,10 +590,11 @@ class DraftServer:
                 self.total_tokens_rejected += result.rejected_tokens
                 tokens_accepted_in_conversation += result.accepted_tokens
                 
-                # Update global token metrics
-                self.metrics.token_metrics.total_generated_tokens += tokens_this_round
-                self.metrics.token_metrics.total_accepted_tokens += result.accepted_tokens
-                self.metrics.token_metrics.total_rejected_tokens += result.rejected_tokens
+                # Update global token metrics (only count after burn-in)
+                if self.env.now >= self.cfg.burn_in_ms:
+                    self.metrics.token_metrics.total_generated_tokens += tokens_this_round
+                    self.metrics.token_metrics.total_accepted_tokens += result.accepted_tokens
+                    self.metrics.token_metrics.total_rejected_tokens += result.rejected_tokens
                 
                 # Calculate round-trip time
                 rtt = self.env.now - round_start
@@ -727,6 +734,12 @@ def load_config(path: str) -> Config:
         seed=raw.get("seed", 0),
         execution_mode=raw.get("execution_mode", "blocking"),
         gamma=raw.get("gamma", 4),
+        # Conversation parameters - IMPORTANT: read from YAML
+        answer_length=raw.get("answer_length", 20),
+        prompt_length_min=raw.get("prompt_length_min", 10),
+        prompt_length_max=raw.get("prompt_length_max", 200),
+        prompt_scale_by_capability=raw.get("prompt_scale_by_capability", True),
+        mixed_batching=raw.get("mixed_batching", True),
         router=raw.get("router", "round_robin"),
         router_params=raw.get("router_params", {"d_choices": 2}),
         devices=raw.get("devices", []),
@@ -899,6 +912,17 @@ def run(cfg: Config):
                 print(f"Event queue empty: {len(env._queue) == 0}")
                 break
             last_checkpoint = env.now
+    
+    # Run to the full simulation time if we haven't reached it yet
+    if env.now < cfg.sim_time_ms:
+        print(f"Running final segment from {env.now}ms to {cfg.sim_time_ms}ms...", flush=True)
+        try:
+            env.run(until=cfg.sim_time_ms)
+            print(f"[{env.now:.0f}ms] Simulation complete, jobs completed: {len(metrics.completed)}", flush=True)
+        except Exception as e:
+            print(f"ERROR at {env.now}ms: {e}", flush=True)
+            import traceback
+            traceback.print_exc()
     
     elapsed_real_time = time.time() - start_real_time
     print(f"env.run() completed at {env.now:.0f}ms", flush=True)
