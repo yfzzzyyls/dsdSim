@@ -1,4 +1,4 @@
-sim_time_ms: 30000
+sim_time_ms: 60000
 seed: null
 burn_in_ms: 1000  # Ignore first 1s for warm-up
 verbose: true     # Print progress updates
@@ -7,6 +7,15 @@ debug: false      # Show batch formation details
 # Speculative decoding parameters
 execution_mode: blocking  # blocking | speculative (only blocking supported now)
 gamma: 4                  # Number of draft tokens per chunk
+
+# Conversation parameters (NEW)
+answer_length: 20         # tokens per answer (requires multiple rounds)
+prompt_length_min: 10     # minimum prompt length
+prompt_length_max: 200    # maximum prompt length  
+prompt_scale_by_capability: true  # scale prompt by device capability
+
+# Mixed batching parameters
+mixed_batching: true      # Allow prefill and decode in same batch
 
 # Router can be: round_robin | jsq2 | wjsq2
 router: wjsq2
@@ -25,13 +34,17 @@ devices:
     weight: 1.0
     batch_window_ms: 6.0
     batch_size: 32
-    verify_latency_ms: 8.0
+    verify_latency_ms: 8.0  # Used only when mixed_batching=false
+    prefill_latency_per_token: 0.5  # 0.5ms per token for prefill
+    decode_latency_per_token: 2.0   # 2ms per token for decode (4 tokens = 8ms)
   - id: t1
     role: target
     weight: 0.6
     batch_window_ms: 8.0
     batch_size: 48
-    verify_latency_ms: 11.0
+    verify_latency_ms: 11.0  # Used only when mixed_batching=false
+    prefill_latency_per_token: 0.3  # Faster prefill than t0
+    decode_latency_per_token: 2.75  # Slower decode than t0
 
   # Three drafts with heterogeneous capabilities (edge devices)
   # High-end device (e.g., iPhone 15 Pro, M3 MacBook)

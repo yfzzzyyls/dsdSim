@@ -1,0 +1,52 @@
+sim_time_ms: 60000  # 60 seconds simulation
+seed: 42  # Fixed seed for reproducibility
+burn_in_ms: 1000  # 1 second burn-in
+verbose: true
+debug: false
+
+# Speculative decoding parameters
+execution_mode: blocking
+gamma: 4  # 4 tokens per speculation
+
+# Conversation parameters
+answer_length: 20  # tokens per answer (5 rounds with gamma=4)
+prompt_length_min: 100  # fixed prompt length for homogeneous
+prompt_length_max: 100  # fixed prompt length for homogeneous
+prompt_scale_by_capability: false  # all drafts get same prompt
+
+# Mixed batching - ENABLED for realistic per-token latency
+mixed_batching: true  # Use per-token latencies
+
+# Router configuration
+router: wjsq2
+router_params:
+  d_choices: 2
+
+# Workload will be scaled based on number of drafts
+workload:
+  arrival: poisson
+  rate_rps: PLACEHOLDER  # Will be replaced by script
+
+# Devices - only targets defined here, drafts will be added by script
+devices:
+  # Two homogeneous target servers with per-token latencies
+  - id: t0
+    role: target
+    weight: 1.0
+    batch_window_ms: 10.0
+    batch_size: 8
+    # Per-token latencies (more realistic than fixed batch time)
+    prefill_latency_per_token: 0.5   # 0.5ms per token for prefill (100 tokens = 50ms)
+    decode_latency_per_token: 9.25   # 9.25ms per token for decode (4 tokens = 37ms)
+    
+  - id: t1
+    role: target
+    weight: 1.0
+    batch_window_ms: 10.0
+    batch_size: 8
+    # Same as t0 for homogeneous setup
+    prefill_latency_per_token: 0.5   # 0.5ms per token for prefill
+    decode_latency_per_token: 9.25   # 9.25ms per token for decode
+
+# Connections will be added by script
+connections: []

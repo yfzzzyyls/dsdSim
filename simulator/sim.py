@@ -1,4 +1,4 @@
-# sim.py  v1 minimal distributed speculative-decoding simulator
+# sim.py v1 minimal distributed speculative-decoding simulator
 # deps: pip install simpy pyyaml
 
 import argparse, random, simpy, yaml, math
@@ -17,7 +17,9 @@ class TargetParams:
     weight: float = 1.0               # capacity weight (relative speed)
     batch_window_ms: float = 6.0      # Delta: wait to form a batch
     batch_size: int = 32              # B: max jobs per batch
-    verify_latency_ms: float = 8.0    # fixed service time per batch
+    verify_latency_ms: float = 8.0    # fixed service time per batch (legacy, for non-mixed mode)
+    prefill_latency_per_token: float = 0.5  # ms per token for prefill requests
+    decode_latency_per_token: float = 2.5   # ms per token for decode requests
 
 @dataclass
 class DraftParams:
@@ -65,6 +67,16 @@ class Config:
     seed: int = 0
     execution_mode: str = "blocking"  # "blocking" | "speculative"
     gamma: int = 4                     # tokens per chunk
+    
+    # Conversation parameters (NEW)
+    answer_length: int = 20           # tokens per answer (fixed for simplicity)
+    prompt_length_min: int = 10       # minimum prompt length
+    prompt_length_max: int = 200      # maximum prompt length
+    prompt_scale_by_capability: bool = True  # scale prompt length by device capability
+    
+    # Batching parameters for mixed prefill/decode
+    mixed_batching: bool = True  # Allow mixing prefill and decode in same batch
+    
     router: str = "round_robin"       # "round_robin" | "jsq2" | "wjsq2"
     router_params: Dict[str, Any] = field(default_factory=lambda: {"d_choices": 2})
     devices: List[Dict[str, Any]] = field(default_factory=list)   # list of dicts with role/params
@@ -79,14 +91,40 @@ class Job:
     jid: int
     created_ms: float
     draft_id: str
+    job_type: str = "decode"  # "prefill" or "decode"
+    token_count: int = 4  # Number of tokens to process
     started_ms: Optional[float] = None
     finished_ms: Optional[float] = None
+
+@dataclass
+class TokenMetrics:
+    """Track token generation and acceptance across all devices."""
+    total_accepted_tokens: int = 0
+    total_rejected_tokens: int = 0
+    total_generated_tokens: int = 0
+    start_time_ms: float = 0
+    end_time_ms: float = 0
+    
+    def get_effective_tokens_per_second(self) -> float:
+        """Calculate the ONE metric that matters."""
+        if self.end_time_ms == 0 or self.start_time_ms == 0:
+            return 0
+        duration_s = (self.end_time_ms - self.start_time_ms) / 1000.0
+        if duration_s <= 0:
+            return 0
+        return self.total_accepted_tokens / duration_s
+    
+    def get_acceptance_rate(self) -> float:
+        if self.total_generated_tokens == 0:
+            return 0
+        return self.total_accepted_tokens / self.total_generated_tokens
 
 class Metrics:
     def __init__(self, verbose: bool = True, burn_in_ms: float = 0.0) -> None:
         self.completed: List[Job] = []
         self.verbose = verbose
         self.burn_in_ms = burn_in_ms
+        self.token_metrics = TokenMetrics()  # Add token tracking
 
     def add(self, job: Job):
         self.completed.append(job)
@@ -121,12 +159,18 @@ class Metrics:
 
 class TargetServer:
     """Continuous-batching-style target: collect for Delta or until B, then serve in fixed time."""
-    def __init__(self, env: simpy.Environment, params: TargetParams, metrics: Metrics, debug: bool = False):
+    def __init__(self, env: simpy.Environment, params: TargetParams, metrics: Metrics, cfg: Config = None, debug: bool = False):
         self.env = env
         self.p = params
+        self.cfg = cfg or Config()  # Use default config if not provided
         self.metrics = metrics
         self.debug = debug
         self.q = simpy.Store(env)           # FIFO queue of Job
+        
+        # CRITICAL FIX: Add Resource to enforce single-server processing
+        # This ensures batch collection and processing cannot overlap
+        self.server = simpy.Resource(env, capacity=1)
+        
         self._busy = False                  # coarse busy flag (for rough work-left estimate)
         self._enqueued_count = 0            # track items in queue
         self._busy_until = 0.0              # when current batch finishes
@@ -135,6 +179,7 @@ class TargetServer:
         self.total_batches = 0
         self.total_batch_items = 0
         self.queue_samples = []             # Track queue length over time
+        self.max_concurrency = 0            # Track max parallelism (should always be 1)
         self.proc = env.process(self._serve_loop())
 
     # queue helpers
@@ -148,6 +193,24 @@ class TargetServer:
     def queue_len(self) -> int:
         return self._enqueued_count
 
+    def _calculate_batch_latency(self, batch: List[Job]) -> float:
+        """Calculate batch processing time as max of all job latencies.
+        Each job's latency depends on its type and token count."""
+        if not self.cfg.mixed_batching:
+            # Use uniform latency if not mixing
+            return self.p.verify_latency_ms
+        
+        max_latency = 0
+        for job in batch:
+            if job.job_type == "prefill":
+                # Prefill latency = tokens * per-token latency
+                latency = job.token_count * self.p.prefill_latency_per_token
+            else:
+                # Decode latency = tokens * per-token latency  
+                latency = job.token_count * self.p.decode_latency_per_token
+            max_latency = max(max_latency, latency)
+        return max_latency
+    
     def work_left_score(self) -> float:
         # Better ETA-based scoring
         B = max(1, self.p.batch_size)
@@ -164,84 +227,100 @@ class TargetServer:
         tp = self.p
         serve_count = 0
         while True:
-            # Debug around problem time
-            if self.env.now > 1020 and self.env.now < 1030:
-                print(f"[{self.env.now:.1f}ms] Target {self.p.id}: Waiting for job, queue has {self._enqueued_count} items", flush=True)
-            
-            first = yield self.q.get()              # wait for first job
-            self._enqueued_count -= 1
-            batch = [first]
-            t0 = self.env.now
-            serve_count += 1
-            
-            if self.env.now > 1020 and self.env.now < 1030:
-                print(f"[{self.env.now:.1f}ms] Target {self.p.id}: Got first job, starting batch collection", flush=True)
-            
-            # Debug trace every 50 batches
-            if serve_count % 50 == 0:
-                print(f"[{self.env.now:.1f}ms] Target {self.p.id}: Served {serve_count} batches, queue={self._enqueued_count}", flush=True)
-
-            # collect more jobs up to window or size cap
-            while len(batch) < tp.batch_size:
-                remaining = tp.batch_window_ms - (self.env.now - t0)
+            # CRITICAL: Acquire server resource BEFORE collecting batch
+            # This ensures only one batch is being collected/processed at a time
+            with self.server.request() as req:
+                yield req  # Wait for server to be available
                 
-                # CRITICAL FIX: Check for timeout BEFORE doing anything else
-                # Use a small epsilon to avoid floating point issues
-                if remaining <= 0.001:  # 0.001ms epsilon for floating point safety
-                    if self.env.now > 1020 and self.env.now < 1030:
-                        print(f"[{self.env.now:.1f}ms] Target {self.p.id}: Batch window expired (remaining={remaining:.3f}), serving {len(batch)} jobs", flush=True)
-                    break
-                    
+                # Track concurrency (should always be 1)
+                self.max_concurrency = max(self.max_concurrency, len(self.server.users))
+                
+                # Debug around problem time
                 if self.env.now > 1020 and self.env.now < 1030:
-                    print(f"[{self.env.now:.1f}ms] Target {self.p.id}: Waiting for more jobs, {remaining:.1f}ms left in window", flush=True)
+                    print(f"[{self.env.now:.1f}ms] Target {self.p.id}: Waiting for job, queue has {self._enqueued_count} items", flush=True)
                 
-                get_ev = self.q.get()
-                timeout_ev = self.env.timeout(remaining)
+                first = yield self.q.get()              # wait for first job
+                self._enqueued_count -= 1
+                batch = [first]
+                t0 = self.env.now
+                serve_count += 1
                 
-                # Back-compat for AnyOf
-                try:
-                    got = yield self.env.any_of([get_ev, timeout_ev])
-                except AttributeError:
-                    # Fallback for older SimPy versions
-                    got = yield simpy.events.AnyOf(self.env, [get_ev, timeout_ev])
+                if self.env.now > 1020 and self.env.now < 1030:
+                    print(f"[{self.env.now:.1f}ms] Target {self.p.id}: Got first job, starting batch collection", flush=True)
                 
-                if get_ev in got:
-                    job = got[get_ev]
-                    self._enqueued_count -= 1
-                    batch.append(job)
-                else:
-                    # timeout fired; must cancel the pending get to avoid a dangling consumer
-                    # (this is recommended in SimPy's shared-resource patterns)
-                    if hasattr(get_ev, 'cancel'):
-                        get_ev.cancel()
+                # Debug trace every 50 batches
+                if serve_count % 50 == 0:
+                    print(f"[{self.env.now:.1f}ms] Target {self.p.id}: Served {serve_count} batches, queue={self._enqueued_count}", flush=True)
 
-            # "serve" the batch with fixed latency
-            if self.debug and self.total_batches < 5:  # Only print first 5 batches
-                print(f"[{self.env.now:.1f}ms] Target {self.p.id}: Serving batch of {len(batch)} jobs", flush=True)
-            
-            for j in batch:
-                j.started_ms = self.env.now
-            self._busy = True
-            self._busy_until = self.env.now + tp.verify_latency_ms
-            start_time = self.env.now
-            
-            yield self.env.timeout(tp.verify_latency_ms)   # fixed service time per batch
-            
-            self._busy = False
-            self.busy_ms += self.env.now - start_time
-            self.total_batches += 1
-            self.total_batch_items += len(batch)
-            self.queue_samples.append((self.env.now, self._enqueued_count))
-            
-            tdone = self.env.now
-            for j in batch:
-                j.finished_ms = tdone
-                self.metrics.add(j)
+                # collect more jobs up to window or size cap
+                while len(batch) < tp.batch_size:
+                    remaining = tp.batch_window_ms - (self.env.now - t0)
+                    
+                    # CRITICAL FIX: Check for timeout BEFORE doing anything else
+                    # Use a small epsilon to avoid floating point issues
+                    if remaining <= 0.001:  # 0.001ms epsilon for floating point safety
+                        if self.env.now > 1020 and self.env.now < 1030:
+                            print(f"[{self.env.now:.1f}ms] Target {self.p.id}: Batch window expired (remaining={remaining:.3f}), serving {len(batch)} jobs", flush=True)
+                        break
+                    
+                    if self.env.now > 1020 and self.env.now < 1030:
+                        print(f"[{self.env.now:.1f}ms] Target {self.p.id}: Waiting for more jobs, {remaining:.1f}ms left in window", flush=True)
+                    
+                    get_ev = self.q.get()
+                    timeout_ev = self.env.timeout(remaining)
+                    
+                    # Back-compat for AnyOf
+                    try:
+                        got = yield self.env.any_of([get_ev, timeout_ev])
+                    except AttributeError:
+                        # Fallback for older SimPy versions
+                        got = yield simpy.events.AnyOf(self.env, [get_ev, timeout_ev])
+                    
+                    if get_ev in got:
+                        job = got[get_ev]
+                        self._enqueued_count -= 1
+                        batch.append(job)
+                    else:
+                        # timeout fired; must cancel the pending get to avoid a dangling consumer
+                        # (this is recommended in SimPy's shared-resource patterns)
+                        if hasattr(get_ev, 'cancel'):
+                            get_ev.cancel()
+
+                # Calculate batch processing time (max of all job latencies)
+                batch_latency = self._calculate_batch_latency(batch)
+                
+                # "serve" the batch
+                if self.cfg.verbose or (self.debug and self.total_batches < 5):  # Print if verbose or first 5 batches
+                    prefill_count = sum(1 for j in batch if j.job_type == "prefill")
+                    decode_count = len(batch) - prefill_count
+                    print(f"[{self.env.now:.1f}ms] Target {self.p.id}: Serving batch of {len(batch)} jobs "
+                          f"({prefill_count} prefill, {decode_count} decode), latency={batch_latency:.1f}ms", flush=True)
+                
+                for j in batch:
+                    j.started_ms = self.env.now
+                self._busy = True
+                self._busy_until = self.env.now + batch_latency
+                start_time = self.env.now
+                
+                yield self.env.timeout(batch_latency)   # batch time = max of all job latencies
+                
+                self._busy = False
+                self.busy_ms += self.env.now - start_time
+                self.total_batches += 1
+                self.total_batch_items += len(batch)
+                self.queue_samples.append((self.env.now, self._enqueued_count))
+                
+                tdone = self.env.now
+                for j in batch:
+                    j.finished_ms = tdone
+                    self.metrics.add(j)
+                
+                # Server resource automatically released at end of with block
 
 class DraftServer:
     """Simulates draft model generating chunks and waiting for verification (blocking mode)."""
     def __init__(self, env: simpy.Environment, params: DraftParams, cfg: Config, 
-                 router, connections: Dict[str, ConnectionParams], total_capability: float = 1.0):
+                 router, connections: Dict[str, ConnectionParams], total_capability: float = 1.0, metrics: Metrics = None):
         self.env = env
         self.p = params
         self.id = params.id
@@ -250,6 +329,7 @@ class DraftServer:
         self.connections = connections  # Map of target_id -> ConnectionParams
         self.total_capability = total_capability
         self.gamma = cfg.gamma  # tokens per chunk
+        self.metrics = metrics  # Reference to global metrics
         
         # Metrics
         self.chunks_sent = 0
@@ -324,82 +404,175 @@ class DraftServer:
             total_tokens=tokens
         )
     
+    def _sample_prompt_length(self) -> int:
+        """Sample prompt length based on device capability"""
+        if self.cfg.prompt_scale_by_capability:
+            # Weaker devices get shorter prompts
+            # Map capability [0,1] to prompt length range
+            normalized_cap = self.p.capability / max(1.0, self.total_capability)
+            length_range = self.cfg.prompt_length_max - self.cfg.prompt_length_min
+            prompt_length = int(self.cfg.prompt_length_min + normalized_cap * length_range)
+        else:
+            # Uniform random between min and max
+            prompt_length = random.randint(self.cfg.prompt_length_min, self.cfg.prompt_length_max)
+        return prompt_length
+    
     def _generate_blocking(self):
-        """Blocking mode: generate chunk, send, wait for response, then continue"""
+        """Blocking mode: generate full conversations with multiple speculation rounds"""
         if self.cfg.verbose:
             my_share = self.p.capability / self.total_capability
             my_rate = self.cfg.workload.rate_rps * my_share
             gen_info = f", gen_latency={self.p.generation_latency_ms:.0f}ms" if self.p.generation_latency_ms > 0 else ""
             print(f"[{self.env.now:.1f}ms] Draft {self.id} starting blocking mode (gamma={self.gamma}, rate={my_rate:.1f} req/s{gen_info})", flush=True)
         
-        session_count = 0
+        conversation_count = 0
         
         while self.env.now < self.cfg.sim_time_ms:
-            # Start a new generation session
-            session_count += 1
-            session_start = self.env.now
+            # Start a new conversation
+            conversation_count += 1
+            conversation_start = self.env.now
             
-            # Select target for this session
+            # Sample prompt length for this conversation
+            prompt_length = self._sample_prompt_length()
+            
+            # Select target for this entire conversation
             target_id, conn = self._select_target()
             
-            # Generate a chunk of gamma tokens (takes time on edge device!)
-            if self.p.generation_latency_ms > 0:
-                yield self.env.timeout(self.p.generation_latency_ms)
-            
-            self.chunks_sent += 1
-            self.total_tokens_generated += self.gamma
-            
             if self.cfg.debug:
-                print(f"[{self.env.now:.1f}ms] Draft {self.id}: Generated chunk #{self.chunks_sent} ({self.gamma} tokens) for target {target_id}", flush=True)
+                print(f"[{self.env.now:.1f}ms] Draft {self.id}: Starting conversation #{conversation_count} "
+                      f"(prompt={prompt_length} tokens, answer={self.cfg.answer_length} tokens) with target {target_id}", flush=True)
             
-            # Create a job representing this chunk verification request
-            job = Job(jid=self.chunks_sent, created_ms=self.env.now, draft_id=self.id)
+            # Phase 1: Send prefill request to target
+            if self.cfg.debug:
+                print(f"[{self.env.now:.1f}ms] Draft {self.id}: Sending prefill request ({prompt_length} tokens) to target {target_id}", flush=True)
             
-            # Send chunk to target (forward latency)
+            # Create prefill job
+            prefill_job = Job(
+                jid=self.chunks_sent,
+                created_ms=self.env.now,
+                draft_id=self.id,
+                job_type="prefill",
+                token_count=prompt_length
+            )
+            self.chunks_sent += 1
+            
+            # Send prefill request to target
             yield self.env.timeout(conn.forward_latency_ms)
+            prefill_job.created_ms = self.env.now
             
-            # Job arrives at target after network delay
-            job.created_ms = self.env.now
-            
-            # Find the target server and enqueue the job
+            # Enqueue prefill job at target
             target_server = None
             for target in self.router.targets:
                 if target.p.id == target_id:
                     target_server = target
-                    target.enqueue(job)
+                    target.enqueue(prefill_job)
                     break
             
             if not target_server:
                 print(f"Warning: Target {target_id} not found for draft {self.id}", flush=True)
                 continue
             
-            # In blocking mode, draft waits for:
-            # 1. Target to process the verification (target's verify_latency_ms handles this)
-            # 2. Response to travel back (response_latency_ms)
+            # Wait for prefill processing (batch collection + processing + response)
+            # The actual processing time depends on the prefill length and target's per-token latency
+            prefill_processing_time = prompt_length * target_server.p.prefill_latency_per_token
+            prefill_wait_time = target_server.p.batch_window_ms + prefill_processing_time
+            yield self.env.timeout(prefill_wait_time)
             
-            # The target will process this job in its batch window + verify_latency
-            # For now, we simulate the total round-trip time
-            # In reality, the target processing happens asynchronously
-            
-            # Wait for response (response latency after target processes)
+            # Wait for response
             yield self.env.timeout(conn.response_latency_ms)
             
-            # Simulate verification result
-            result = self._simulate_verification(self.gamma, conn.acceptance_rate)
-            self.total_tokens_accepted += result.accepted_tokens
-            self.total_tokens_rejected += result.rejected_tokens
+            if self.cfg.debug:
+                print(f"[{self.env.now:.1f}ms] Draft {self.id}: Prefill completed for {prompt_length} tokens", flush=True)
             
-            # Calculate round-trip time
-            rtt = self.env.now - session_start
-            self.total_round_trip_time += rtt
+            # Phase 2: Generate answer with multiple speculation rounds
+            rounds_needed = (self.cfg.answer_length + self.gamma - 1) // self.gamma  # ceiling division
+            tokens_generated_in_conversation = 0
+            tokens_accepted_in_conversation = 0
             
-            if self.cfg.debug or (self.chunks_sent % 10 == 0):
-                acceptance_rate = self.total_tokens_accepted / self.total_tokens_generated if self.total_tokens_generated > 0 else 0
-                avg_rtt = self.total_round_trip_time / self.chunks_sent if self.chunks_sent > 0 else 0
-                print(f"[{self.env.now:.1f}ms] Draft {self.id}: Chunk #{self.chunks_sent} result: {result.accepted_tokens}/{self.gamma} accepted, "
-                      f"overall acceptance={acceptance_rate:.2%}, avg RTT={avg_rtt:.1f}ms", flush=True)
+            for round_num in range(rounds_needed):
+                round_start = self.env.now
+                
+                # Determine how many tokens to generate in this round
+                tokens_remaining = self.cfg.answer_length - tokens_generated_in_conversation
+                tokens_this_round = min(self.gamma, tokens_remaining)
+                
+                # Generate draft tokens (takes time on edge device!)
+                if self.p.generation_latency_ms > 0:
+                    yield self.env.timeout(self.p.generation_latency_ms)
+                
+                self.chunks_sent += 1
+                self.total_tokens_generated += tokens_this_round
+                tokens_generated_in_conversation += tokens_this_round
+                
+                if self.cfg.debug:
+                    print(f"[{self.env.now:.1f}ms] Draft {self.id}: Round {round_num+1}/{rounds_needed} - "
+                          f"Generated {tokens_this_round} tokens for target {target_id}", flush=True)
+                
+                # Create a decode job for this chunk verification
+                job = Job(
+                    jid=self.chunks_sent, 
+                    created_ms=self.env.now, 
+                    draft_id=self.id,
+                    job_type="decode",
+                    token_count=tokens_this_round
+                )
+                
+                # Send chunk to target (forward latency)
+                yield self.env.timeout(conn.forward_latency_ms)
+                
+                # Job arrives at target after network delay
+                job.created_ms = self.env.now
+                
+                # Find the target server and enqueue the job
+                target_server = None
+                for target in self.router.targets:
+                    if target.p.id == target_id:
+                        target_server = target
+                        target.enqueue(job)
+                        break
+                
+                if not target_server:
+                    print(f"Warning: Target {target_id} not found for draft {self.id}", flush=True)
+                    break
+                
+                # Wait for target to process the job
+                # For decode requests, latency = tokens * per-token decode latency
+                decode_processing_time = tokens_this_round * target_server.p.decode_latency_per_token
+                target_processing_time = target_server.p.batch_window_ms + decode_processing_time
+                yield self.env.timeout(target_processing_time)
+                
+                # Wait for response to travel back
+                yield self.env.timeout(conn.response_latency_ms)
+                
+                # Simulate verification result
+                result = self._simulate_verification(tokens_this_round, conn.acceptance_rate)
+                self.total_tokens_accepted += result.accepted_tokens
+                self.total_tokens_rejected += result.rejected_tokens
+                tokens_accepted_in_conversation += result.accepted_tokens
+                
+                # Update global token metrics
+                self.metrics.token_metrics.total_generated_tokens += tokens_this_round
+                self.metrics.token_metrics.total_accepted_tokens += result.accepted_tokens
+                self.metrics.token_metrics.total_rejected_tokens += result.rejected_tokens
+                
+                # Calculate round-trip time
+                rtt = self.env.now - round_start
+                self.total_round_trip_time += rtt
+                
+                if self.cfg.debug:
+                    print(f"[{self.env.now:.1f}ms] Draft {self.id}: Round {round_num+1} result: "
+                          f"{result.accepted_tokens}/{tokens_this_round} accepted, RTT={rtt:.1f}ms", flush=True)
             
-            # Wait before starting next chunk (inter-arrival time)
+            # Conversation completed
+            conversation_time = self.env.now - conversation_start
+            conversation_acceptance = tokens_accepted_in_conversation / tokens_generated_in_conversation if tokens_generated_in_conversation > 0 else 0
+            
+            if self.cfg.verbose or self.cfg.debug:
+                print(f"[{self.env.now:.1f}ms] Draft {self.id}: Conversation #{conversation_count} completed - "
+                      f"prompt={prompt_length}, answer={tokens_generated_in_conversation}/{self.cfg.answer_length} tokens, "
+                      f"acceptance={conversation_acceptance:.2%}, time={conversation_time:.1f}ms", flush=True)
+            
+            # Wait before starting next conversation (inter-arrival time)
             ia = self._ia()
             yield self.env.timeout(ia)
         
@@ -563,8 +736,10 @@ def build(env: simpy.Environment, cfg: Config):
                 batch_window_ms=float(d.get("batch_window_ms", 6.0)),
                 batch_size=int(d.get("batch_size", 32)),
                 verify_latency_ms=float(d.get("verify_latency_ms", 8.0)),
+                prefill_latency_per_token=float(d.get("prefill_latency_per_token", 0.5)),
+                decode_latency_per_token=float(d.get("decode_latency_per_token", 2.5)),
             )
-            targets.append(TargetServer(env, params, metrics, debug=cfg.debug))
+            targets.append(TargetServer(env, params, metrics, cfg=cfg, debug=cfg.debug))
         elif role == "draft":
             # Store draft configs for later processing
             draft_configs.append(d)
@@ -622,7 +797,7 @@ def build(env: simpy.Environment, cfg: Config):
         if not draft_connections:
             print(f"Warning: Draft {d['id']} has no connections configured", flush=True)
         
-        drafts.append(DraftServer(env, params, cfg, router, draft_connections, total_capability))
+        drafts.append(DraftServer(env, params, cfg, router, draft_connections, total_capability, metrics))
 
     # Start heartbeat monitor
     if cfg.verbose:
@@ -656,6 +831,9 @@ def run(cfg: Config):
         if cfg.burn_in_ms > 0:
             print(f"Burn-in period: {cfg.burn_in_ms:.0f}ms", flush=True)
     
+    # Initialize token metrics timing
+    metrics.token_metrics.start_time_ms = cfg.burn_in_ms  # Start after burn-in
+    
     start_real_time = time.time()
     print(f"Starting env.run(until={cfg.sim_time_ms})...", flush=True)
     
@@ -684,11 +862,14 @@ def run(cfg: Config):
     elapsed_real_time = time.time() - start_real_time
     print(f"env.run() completed at {env.now:.0f}ms", flush=True)
     
+    # Finalize token metrics
+    metrics.token_metrics.end_time_ms = env.now
+    
     if cfg.verbose:
         print(f"\nSimulation complete in {elapsed_real_time:.2f}s real time")
         print(f"Processed {len(metrics.completed)} total jobs")
     
-    return metrics.summary(), targets, drafts
+    return metrics, targets, drafts
 
 def get_target_metrics(targets: List[TargetServer], sim_time_ms: float) -> Dict[str, Dict[str, float]]:
     """Extract per-target metrics."""
@@ -741,19 +922,33 @@ def main():
     
     result = run(cfg)
     if isinstance(result, tuple) and len(result) == 3:
-        summary, targets, drafts = result
+        metrics, targets, drafts = result
     elif isinstance(result, tuple) and len(result) == 2:
-        summary, targets = result
+        metrics, targets = result
         drafts = []
     else:
-        summary = result
+        metrics = result
         targets = []
         drafts = []
+    
+    # Get the summary from metrics
+    summary = metrics.summary() if hasattr(metrics, 'summary') else {}
     
     # Print results
     print("\n" + "="*60)
     print("SIMULATION RESULTS")
     print("="*60)
+    
+    # THE ONE METRIC THAT MATTERS
+    if hasattr(metrics, 'token_metrics') and metrics.token_metrics.total_generated_tokens > 0:
+        effective_tps = metrics.token_metrics.get_effective_tokens_per_second()
+        acceptance_rate = metrics.token_metrics.get_acceptance_rate()
+        print("\n🎯 TOKEN PERFORMANCE (THE KEY METRIC):")
+        print(f"  Effective Tokens/Second: {effective_tps:.1f} tok/s")
+        print(f"  Acceptance Rate: {acceptance_rate:.1%}")
+        print(f"  Total Accepted: {metrics.token_metrics.total_accepted_tokens}")
+        print(f"  Total Generated: {metrics.token_metrics.total_generated_tokens}")
+        print(f"  Wasted Work: {metrics.token_metrics.total_rejected_tokens} ({metrics.token_metrics.total_rejected_tokens/max(1,metrics.token_metrics.total_generated_tokens)*100:.1f}%)")
     
     print("\nSummary Metrics:")
     for key, value in summary.items():
@@ -774,6 +969,13 @@ def main():
             print(f"    Total batches: {metrics['total_batches']}")
             print(f"    Avg queue len: {metrics['avg_queue_len']:.1f}")
             print(f"    P95 queue len: {metrics['p95_queue_len']:.0f}")
+        
+        # CRITICAL: Verify single-server enforcement
+        print("\n🔍 Concurrency Check (MUST be 1 for correct simulation):")
+        for target in targets:
+            print(f"  {target.p.id}: max_concurrency = {target.max_concurrency}")
+            if target.max_concurrency > 1:
+                print(f"    ⚠️ WARNING: Parallelism detected! Fix required.")
     
     if drafts:
         print("\nPer-Draft Metrics (Speculative Decoding):")
@@ -786,6 +988,12 @@ def main():
             print(f"    Tokens accepted: {metrics['tokens_accepted']}")
             print(f"    Acceptance rate: {metrics['acceptance_rate']:.2%}")
             print(f"    Avg RTT: {metrics['avg_rtt_ms']:.1f}ms")
+    
+    # Final reminder of the key metric
+    if hasattr(metrics, 'token_metrics') and metrics.token_metrics.total_generated_tokens > 0:
+        print("\n" + "="*60)
+        print(f"🚀 FINAL RESULT: {metrics.token_metrics.get_effective_tokens_per_second():.1f} tokens per second")
+        print("="*60)
 
 if __name__ == "__main__":
     main()
