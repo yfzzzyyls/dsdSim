@@ -95,6 +95,7 @@ class Job:
     token_count: int = 4  # Number of tokens to process
     started_ms: Optional[float] = None
     finished_ms: Optional[float] = None
+    completion_event: Optional[Any] = None  # SimPy event signaled when job completes
 
 @dataclass
 class TokenMetrics:
@@ -155,6 +156,16 @@ class Metrics:
             "p99_ms": pct(0.99) if lat else 0,
         }
 
+# ---------- Helper Functions ----------
+
+def get_typical_verify_ms(target_config: dict, gamma: int = 4) -> float:
+    """Calculate typical verification time for mixed batching or return verify_latency_ms if available."""
+    if 'verify_latency_ms' in target_config:
+        return target_config['verify_latency_ms']
+    # For mixed batching, use decode latency as typical case (most batches are decode-only)
+    decode_per_token = target_config.get('decode_latency_per_token', 9.25)
+    return gamma * decode_per_token
+
 # ---------- Servers ----------
 
 class TargetServer:
@@ -180,6 +191,12 @@ class TargetServer:
         self.total_batch_items = 0
         self.queue_samples = []             # Track queue length over time
         self.max_concurrency = 0            # Track max parallelism (should always be 1)
+        
+        # Track average batch latency for better ETA calculations in mixed batching
+        self._recent_batch_latencies = []  # Keep last N batch latencies
+        self._max_latency_history = 20  # Track last 20 batches
+        self._avg_batch_latency_ms = None  # Running average
+        
         self.proc = env.process(self._serve_loop())
 
     # queue helpers
@@ -217,8 +234,18 @@ class TargetServer:
         batches_queued = math.ceil(self._enqueued_count / B)
         # Time until current batch finishes
         remaining_ms = max(0, self._busy_until - self.env.now) if self._busy else 0
+        
+        # Use average batch latency if available (for mixed batching), otherwise use typical verify time
+        if self._avg_batch_latency_ms is not None:
+            batch_latency = self._avg_batch_latency_ms
+        elif hasattr(self.p, 'verify_latency_ms'):
+            batch_latency = self.p.verify_latency_ms
+        else:
+            # Estimate based on decode latency (most common case)
+            batch_latency = self.cfg.gamma * self.p.decode_latency_per_token if hasattr(self.p, 'decode_latency_per_token') else 37.0
+        
         # Total estimated time to clear queue
-        eta_ms = remaining_ms + batches_queued * self.p.verify_latency_ms
+        eta_ms = remaining_ms + batches_queued * batch_latency
         # Normalize by capacity weight
         return eta_ms / max(self.p.weight, 1e-6)
 
@@ -289,6 +316,12 @@ class TargetServer:
                 # Calculate batch processing time (max of all job latencies)
                 batch_latency = self._calculate_batch_latency(batch)
                 
+                # Update running average of batch latencies for better ETA calculations
+                self._recent_batch_latencies.append(batch_latency)
+                if len(self._recent_batch_latencies) > self._max_latency_history:
+                    self._recent_batch_latencies.pop(0)
+                self._avg_batch_latency_ms = sum(self._recent_batch_latencies) / len(self._recent_batch_latencies)
+                
                 # "serve" the batch
                 if self.cfg.verbose or (self.debug and self.total_batches < 5):  # Print if verbose or first 5 batches
                     prefill_count = sum(1 for j in batch if j.job_type == "prefill")
@@ -314,6 +347,9 @@ class TargetServer:
                 for j in batch:
                     j.finished_ms = tdone
                     self.metrics.add(j)
+                    # Signal completion to waiting draft
+                    if j.completion_event and not j.completion_event.triggered:
+                        j.completion_event.succeed()
                 
                 # Server resource automatically released at end of with block
 
@@ -446,13 +482,15 @@ class DraftServer:
             if self.cfg.debug:
                 print(f"[{self.env.now:.1f}ms] Draft {self.id}: Sending prefill request ({prompt_length} tokens) to target {target_id}", flush=True)
             
-            # Create prefill job
+            # Create prefill job with completion event
+            prefill_completion = self.env.event()
             prefill_job = Job(
                 jid=self.chunks_sent,
                 created_ms=self.env.now,
                 draft_id=self.id,
                 job_type="prefill",
-                token_count=prompt_length
+                token_count=prompt_length,
+                completion_event=prefill_completion
             )
             self.chunks_sent += 1
             
@@ -472,13 +510,10 @@ class DraftServer:
                 print(f"Warning: Target {target_id} not found for draft {self.id}", flush=True)
                 continue
             
-            # Wait for prefill processing (batch collection + processing + response)
-            # The actual processing time depends on the prefill length and target's per-token latency
-            prefill_processing_time = prompt_length * target_server.p.prefill_latency_per_token
-            prefill_wait_time = target_server.p.batch_window_ms + prefill_processing_time
-            yield self.env.timeout(prefill_wait_time)
+            # Wait for actual job completion instead of synthetic sleep
+            yield prefill_completion
             
-            # Wait for response
+            # Wait for response to travel back
             yield self.env.timeout(conn.response_latency_ms)
             
             if self.cfg.debug:
@@ -508,13 +543,15 @@ class DraftServer:
                     print(f"[{self.env.now:.1f}ms] Draft {self.id}: Round {round_num+1}/{rounds_needed} - "
                           f"Generated {tokens_this_round} tokens for target {target_id}", flush=True)
                 
-                # Create a decode job for this chunk verification
+                # Create a decode job with completion event
+                decode_completion = self.env.event()
                 job = Job(
                     jid=self.chunks_sent, 
                     created_ms=self.env.now, 
                     draft_id=self.id,
                     job_type="decode",
-                    token_count=tokens_this_round
+                    token_count=tokens_this_round,
+                    completion_event=decode_completion
                 )
                 
                 # Send chunk to target (forward latency)
@@ -535,11 +572,8 @@ class DraftServer:
                     print(f"Warning: Target {target_id} not found for draft {self.id}", flush=True)
                     break
                 
-                # Wait for target to process the job
-                # For decode requests, latency = tokens * per-token decode latency
-                decode_processing_time = tokens_this_round * target_server.p.decode_latency_per_token
-                target_processing_time = target_server.p.batch_window_ms + decode_processing_time
-                yield self.env.timeout(target_processing_time)
+                # Wait for actual job completion instead of synthetic sleep
+                yield decode_completion
                 
                 # Wait for response to travel back
                 yield self.env.timeout(conn.response_latency_ms)
@@ -730,12 +764,19 @@ def build(env: simpy.Environment, cfg: Config):
     for d in cfg.devices:
         role = d.get("role", "target")
         if role == "target":
+            # Calculate typical verify latency if not provided (for mixed batching)
+            if "verify_latency_ms" in d:
+                verify_ms = float(d["verify_latency_ms"])
+            else:
+                # Use decode latency as typical case (most batches are decode-only)
+                verify_ms = cfg.gamma * float(d.get("decode_latency_per_token", 9.25))
+            
             params = TargetParams(
                 id=d["id"],
                 weight=float(d.get("weight", 1.0)),
                 batch_window_ms=float(d.get("batch_window_ms", 6.0)),
                 batch_size=int(d.get("batch_size", 32)),
-                verify_latency_ms=float(d.get("verify_latency_ms", 8.0)),
+                verify_latency_ms=verify_ms,
                 prefill_latency_per_token=float(d.get("prefill_latency_per_token", 0.5)),
                 decode_latency_per_token=float(d.get("decode_latency_per_token", 2.5)),
             )

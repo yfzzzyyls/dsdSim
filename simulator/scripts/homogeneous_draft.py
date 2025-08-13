@@ -137,43 +137,48 @@ def plot_results(results: List[dict], output_dir: str):
     fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(15, 5))
     
     # Plot 1: Tokens per second
-    ax1.plot(drafts, tps, 'b-o', linewidth=2, markersize=8)
-    ax1.axhline(y=baseline, color='r', linestyle='--', alpha=0.5, label='Baseline (no speculation)')
+    ax1.plot(drafts, tps, 'b-o', linewidth=0.6, markersize=4, label='Actual throughput')
+    # Removed baseline line since it's always near zero
     ax1.set_xlabel('Number of Drafts')
     ax1.set_ylabel('Effective Tokens/Second')
     ax1.set_title('Scaling: Effective Tokens/Second')
     ax1.grid(True, alpha=0.3)
-    ax1.legend()
-    ax1.set_xticks([d for d in drafts if d % 5 == 0])  # Show only multiples of 5 for clarity
+    ax1.set_xticks([d for d in drafts if d % 10 == 0])  # Show multiples of 10 for clarity
     
-    # Add ideal linear scaling line (theoretical maximum)
+    # Add ideal linear scaling line (theoretical maximum) with proper label
     ideal_tps = [theoretical_per_draft * d for d in drafts]
-    ax1.plot(drafts, ideal_tps, 'g--', alpha=0.3, label='Theoretical max (no bottleneck)')
+    ax1.plot(drafts, ideal_tps, 'g--', alpha=0.4, linewidth=0.5, label='Theoretical max (no bottleneck)')
+    ax1.legend(loc='upper left')
     
     # Plot 2: Speedup
-    ax2.plot(drafts, speedups, 'g-s', linewidth=2, markersize=8)
-    ax2.plot(drafts, drafts, 'r--', alpha=0.3, label='Ideal speedup')
+    ax2.plot(drafts, speedups, 'g-s', linewidth=0.6, markersize=4, label='Actual speedup')
+    ax2.plot(drafts, drafts, 'r--', alpha=0.4, linewidth=0.5, label='Perfect linear speedup')
     ax2.set_xlabel('Number of Drafts')
-    ax2.set_ylabel('Speedup (vs 25 drafts)')  # Updated baseline reference
+    ax2.set_ylabel('Speedup (vs 1 draft)')  # Corrected baseline reference
     ax2.set_title('Speedup Factor')
     ax2.grid(True, alpha=0.3)
-    ax2.legend()
-    ax2.set_xticks([d for d in drafts if d % 5 == 0])  # Show only multiples of 5
+    ax2.legend(loc='upper left')
+    ax2.set_xticks([d for d in drafts if d % 10 == 0])  # Show multiples of 10
     
     # Plot 3: Efficiency
-    ax3.plot(drafts, [e * 100 for e in efficiencies], 'r-^', linewidth=2, markersize=8)
-    ax3.axhline(y=100, color='g', linestyle='--', alpha=0.3, label='Perfect efficiency')
-    ax3.axhline(y=80, color='orange', linestyle='--', alpha=0.3, label='80% efficiency')
-    ax3.axhline(y=50, color='blue', linestyle='--', alpha=0.3, label='50% efficiency')
+    # Efficiency measures how well the system scales compared to theoretical maximum
+    # 100% = achieving theoretical max throughput per draft
+    # 80% = good scaling, minor bottlenecks
+    # 50% = significant bottlenecks, half the theoretical capacity
+    ax3.plot(drafts, [e * 100 for e in efficiencies], 'r-^', linewidth=0.6, markersize=4, label='System efficiency')
+    ax3.axhline(y=100, color='g', linestyle='--', alpha=0.3, linewidth=0.4)
+    ax3.axhline(y=80, color='orange', linestyle='--', alpha=0.3, linewidth=0.4)
+    ax3.axhline(y=50, color='blue', linestyle='--', alpha=0.3, linewidth=0.4)
     ax3.set_xlabel('Number of Drafts')
     ax3.set_ylabel('Efficiency (%)')
-    ax3.set_title('Scaling Efficiency (vs Theoretical Max)')
+    ax3.set_title('Scaling Efficiency\n(% of theoretical max per draft)')
     ax3.grid(True, alpha=0.3)
-    ax3.legend()
+    # Only show legend for the main efficiency line, not the reference lines
+    ax3.legend(['System efficiency'], loc='upper right', fontsize=9)
     ax3.set_ylim([0, 100])
-    ax3.set_xticks([d for d in drafts if d % 5 == 0])  # Show only multiples of 5
+    ax3.set_xticks([d for d in drafts if d % 10 == 0])  # Show multiples of 10
     
-    plt.suptitle('Homogeneous Draft Scaling Experiment\n(24ms generation, 37ms verification, 70% acceptance)', fontsize=14)
+    plt.suptitle('Homogeneous Draft Scaling Experiment\n(24ms generation, mixed batching: 37ms decode/50ms prefill, 68% acceptance)', fontsize=14)
     plt.tight_layout()
     plot_path = os.path.join(output_dir, 'scaling_curve.png')
     plt.savefig(plot_path, dpi=150)
@@ -243,14 +248,16 @@ def main():
     print("=" * 70)
     print("Configuration:")
     print("  - Draft generation: 24ms (6ms/token × 4 tokens)")
-    print("  - Target verification: 37ms")
+    print("  - Target batch processing (mixed batching):")
+    print("    * Decode-only batches: 37ms (4 tokens × 9.25ms)")
+    print("    * Prefill-containing batches: 50ms (100 tokens × 0.5ms)")
     print("  - Network latency: 20ms each way")
-    print("  - Acceptance rate: 70%")
+    print("  - Acceptance rate: ~68% overall (85% per token)")
     print("  - Simulation duration: 60 seconds")
     print("=" * 70)
     
-    # Test points for scaling curve (1 to 120 drafts)
-    draft_counts = list(range(1, 121))  # [1, 2, 3, ..., 120]
+    # Test points for scaling curve (1 to 100 drafts)
+    draft_counts = list(range(1, 101))  # [1, 2, 3, ..., 100]
     
     results = []
     for n in draft_counts:
