@@ -33,13 +33,18 @@ CONNECTION_TEMPLATE = {
     'acceptance_rate': 0.85  # This gives ~65% overall with sequential acceptance
 }
 
-def generate_config(num_drafts: int, output_path: str = None) -> dict:
-    """Generate config with N identical drafts."""
+def generate_config(num_drafts: int, output_path: str = None, batch_window_ms: float = 10.0) -> dict:
+    """Generate config with N identical drafts and specified batch window."""
     
     # Load template
     template_path = os.path.join(os.path.dirname(__file__), '../configs/homogeneous_draft.yaml')
     with open(template_path, 'r') as f:
         config = yaml.safe_load(f)
+    
+    # Update batch window for all targets
+    for device in config['devices']:
+        if device.get('role') == 'target':
+            device['batch_window_ms'] = batch_window_ms
     
     # Add N draft devices (all identical)
     for i in range(num_drafts):
@@ -70,13 +75,13 @@ def generate_config(num_drafts: int, output_path: str = None) -> dict:
     
     return config
 
-def run_experiment(num_drafts: int) -> Tuple[float, dict]:
+def run_experiment(num_drafts: int, batch_window_ms: float = 10.0) -> Tuple[float, dict]:
     """Run simulation and return effective tokens/second and full metrics."""
     
     print(f"Testing with {num_drafts} draft(s)...")
     
-    # Generate config
-    config = generate_config(num_drafts)
+    # Generate config with specified batch window
+    config = generate_config(num_drafts, batch_window_ms=batch_window_ms)
     
     # Save temp config
     temp_config = f'temp_config_{num_drafts:02d}_drafts.yaml'
@@ -162,10 +167,10 @@ def plot_results(results: List[dict], output_dir: str):
     # Efficiency = actual_tps / (num_drafts * theoretical_per_draft)
     efficiencies = [t / (d * theoretical_per_draft) if d > 0 else 0 for t, d in zip(tps, drafts)]
     
-    # Create figure with 2 subplots
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
+    # Create figure with single plot
+    fig, ax1 = plt.subplots(1, 1, figsize=(10, 6))
     
-    # Plot 1: Tokens per second
+    # Plot Tokens per second
     ax1.plot(drafts, tps, 'b-o', linewidth=0.6, markersize=4, label='Actual throughput')
     # Removed baseline line since it's always near zero
     ax1.set_xlabel('Number of Drafts')
@@ -179,17 +184,7 @@ def plot_results(results: List[dict], output_dir: str):
     ax1.plot(drafts, ideal_tps, 'g--', alpha=0.4, linewidth=0.5, label='Theoretical max (no bottleneck)')
     ax1.legend(loc='upper left')
     
-    # Plot 2: Speedup
-    ax2.plot(drafts, speedups, 'g-s', linewidth=0.6, markersize=4, label='Actual speedup')
-    ax2.plot(drafts, drafts, 'r--', alpha=0.4, linewidth=0.5, label='Perfect linear speedup')
-    ax2.set_xlabel('Number of Drafts')
-    ax2.set_ylabel('Speedup (vs 1 draft)')  # Corrected baseline reference
-    ax2.set_title('Speedup Factor')
-    ax2.grid(True, alpha=0.3)
-    ax2.legend(loc='upper left')
-    ax2.set_xticks([d for d in drafts if d % 10 == 0])  # Show multiples of 10
-    
-    plt.suptitle('Homogeneous Draft Scaling Experiment\n(24ms gen, mixed batch: 37ms decode/50ms prefill, Δ=10ms window, p=0.85/token→E[accept]=2.71/4)', fontsize=13)
+    plt.suptitle('Homogeneous Draft Scaling Experiment\n(24ms gen, mixed batch: 37ms decode/50ms prefill, Δ=2ms window, p=0.85/token→E[accept]=2.71/4)', fontsize=13)
     plt.tight_layout()
     plot_path = os.path.join(output_dir, 'scaling_curve.png')
     plt.savefig(plot_path, dpi=150)
@@ -244,6 +239,128 @@ def print_summary(results: List[dict]):
             print(f"Efficiency drops below 50% at: {r['num_drafts']} drafts")
             break
 
+def run_batch_window_comparison():
+    """Run experiments for both 10ms and 100ms batch windows and create comparison plot."""
+    
+    print("=" * 70)
+    print("BATCH WINDOW COMPARISON EXPERIMENT")
+    print("=" * 70)
+    
+    # Test points for scaling curve (1 to 100 drafts)
+    draft_counts = list(range(1, 101))  # [1, 2, 3, ..., 100]
+    
+    # Run 10ms experiment
+    print("\n" + "=" * 70)
+    print("RUNNING 10ms BATCH WINDOW")
+    print("=" * 70)
+    results_10ms = []
+    for n in draft_counts:
+        tps, metrics = run_experiment(n, batch_window_ms=10.0)
+        results_10ms.append(metrics)
+    
+    # Run 100ms experiment
+    print("\n" + "=" * 70)
+    print("RUNNING 100ms BATCH WINDOW")
+    print("=" * 70)
+    results_100ms = []
+    for n in draft_counts:
+        tps, metrics = run_experiment(n, batch_window_ms=100.0)
+        results_100ms.append(metrics)
+    
+    # Create comparison plot
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 10))
+    
+    # Extract data
+    drafts_10ms = [r['num_drafts'] for r in results_10ms]
+    tps_10ms = [r['effective_tps'] for r in results_10ms]
+    
+    drafts_100ms = [r['num_drafts'] for r in results_100ms]
+    tps_100ms = [r['effective_tps'] for r in results_100ms]
+    
+    # Plot 1: Both curves
+    ax1.plot(drafts_10ms, tps_10ms, 'b-', linewidth=2, label='10ms batch window', alpha=0.8)
+    ax1.plot(drafts_100ms, tps_100ms, 'r-', linewidth=2, label='100ms batch window', alpha=0.8)
+    
+    # Mark the step region
+    ax1.axvspan(52, 55, alpha=0.1, color='yellow', label='Step region (10ms)')
+    
+    ax1.set_xlabel('Number of Draft Models', fontsize=12)
+    ax1.set_ylabel('Throughput (tokens/second)', fontsize=12)
+    ax1.set_title('Scaling Curves: 10ms vs 100ms Batch Window', fontsize=14, fontweight='bold')
+    ax1.grid(True, alpha=0.3)
+    ax1.legend(loc='lower right')
+    ax1.set_xlim(0, 100)
+    ax1.set_ylim(0, max(max(tps_10ms), max(tps_100ms)) * 1.1)
+    
+    # Plot 2: Difference
+    min_len = min(len(tps_10ms), len(tps_100ms))
+    difference = [tps_100ms[i] - tps_10ms[i] for i in range(min_len)]
+    drafts_common = drafts_10ms[:min_len]
+    
+    ax2.plot(drafts_common, difference, 'g-', linewidth=2)
+    ax2.axhline(y=0, color='black', linestyle='-', alpha=0.3)
+    ax2.fill_between(drafts_common, 0, difference, where=[d > 0 for d in difference], 
+                      color='green', alpha=0.3, label='100ms better')
+    ax2.fill_between(drafts_common, 0, difference, where=[d <= 0 for d in difference], 
+                      color='red', alpha=0.3, label='10ms better')
+    
+    # Mark regions
+    ax2.axvspan(20, 52, alpha=0.1, color='green')
+    if max(difference) > 0:
+        ax2.text(35, max(difference)*0.8, '100ms advantage\n(better batching)', 
+                ha='center', fontsize=10, 
+                bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
+    
+    ax2.set_xlabel('Number of Draft Models', fontsize=12)
+    ax2.set_ylabel('Throughput Difference (100ms - 10ms)', fontsize=12)
+    ax2.set_title('Performance Advantage: 100ms vs 10ms Batch Window', fontsize=14, fontweight='bold')
+    ax2.grid(True, alpha=0.3)
+    ax2.legend(loc='upper right')
+    ax2.set_xlim(0, 100)
+    
+    plt.tight_layout()
+    
+    # Save plot
+    output_dir = '/home/external/choral-spec-internal/simulator/results'
+    plot_path = os.path.join(output_dir, 'scaling_curve_100ms_comparison.png')
+    plt.savefig(plot_path, dpi=150, bbox_inches='tight')
+    print(f"\nComparison plot saved to: {plot_path}")
+    
+    # Print key metrics
+    print("\n" + "="*70)
+    print("KEY COMPARISON METRICS")
+    print("="*70)
+    
+    # Find the step region metrics
+    for draft_count in [50, 52, 53, 55]:
+        idx_10ms = next((i for i, r in enumerate(results_10ms) if r['num_drafts'] == draft_count), None)
+        idx_100ms = next((i for i, r in enumerate(results_100ms) if r['num_drafts'] == draft_count), None)
+        
+        if idx_10ms is not None and idx_100ms is not None:
+            tp_10ms = results_10ms[idx_10ms]['effective_tps']
+            tp_100ms = results_100ms[idx_100ms]['effective_tps']
+            diff = tp_100ms - tp_10ms
+            print(f"{draft_count:3d} drafts: 10ms={tp_10ms:6.1f} tok/s, 100ms={tp_100ms:6.1f} tok/s, diff={diff:+6.1f}")
+    
+    # Calculate jump for both
+    tp_50_10ms = next((r['effective_tps'] for r in results_10ms if r['num_drafts'] == 50), 0)
+    tp_55_10ms = next((r['effective_tps'] for r in results_10ms if r['num_drafts'] == 55), 0)
+    tp_50_100ms = next((r['effective_tps'] for r in results_100ms if r['num_drafts'] == 50), 0)
+    tp_55_100ms = next((r['effective_tps'] for r in results_100ms if r['num_drafts'] == 55), 0)
+    
+    print(f"\nStep pattern (50→55 drafts):")
+    print(f"  10ms window: {tp_50_10ms:.1f} → {tp_55_10ms:.1f} tok/s (jump of {tp_55_10ms-tp_50_10ms:.1f})")
+    print(f"  100ms window: {tp_50_100ms:.1f} → {tp_55_100ms:.1f} tok/s (change of {tp_55_100ms-tp_50_100ms:.1f})")
+    
+    # Save results for both
+    for results, window in [(results_10ms, '10ms'), (results_100ms, '100ms')]:
+        json_path = os.path.join(output_dir, f'homogeneous_draft_{window}_results.json')
+        with open(json_path, 'w') as f:
+            json.dump(results, f, indent=2)
+        print(f"\n{window} results saved to {json_path}")
+    
+    return plot_path
+
 def main():
     """Run the homogeneous draft scaling experiment."""
     
@@ -261,7 +378,7 @@ def main():
     print("  - Target batch processing (mixed batching):")
     print("    * Decode-only batches: 37ms (4 tokens × 9.25ms/token)")
     print("    * Prefill-containing batches: 50ms (100 tokens × 0.5ms/token)")
-    print("    * Batch window (Δ): 10ms")
+    print("    * Batch window (Δ): 2ms")
     print("    * Max batch size: 8")
     print("  - Network latency: 20ms forward, 20ms response")
     print("  - Acceptance: p=0.85 per token → E[accepted]=2.71/4 tokens (67.7%)")
@@ -275,7 +392,7 @@ def main():
     
     results = []
     for n in draft_counts:
-        tps, metrics = run_experiment(n)
+        tps, metrics = run_experiment(n, batch_window_ms=2.0)  # Use 2ms batch window
         results.append(metrics)
     
     # Print summary
@@ -306,4 +423,11 @@ def main():
 if __name__ == "__main__":
     # Change to script directory
     os.chdir(os.path.dirname(os.path.abspath(__file__)))
-    main()
+    
+    # Check for command line argument
+    if len(sys.argv) > 1 and sys.argv[1] == '--compare':
+        # Run comparison experiment
+        run_batch_window_comparison()
+    else:
+        # Run standard 10ms experiment
+        main()
