@@ -71,7 +71,12 @@ class Config:
     gamma: int = 4                     # tokens per chunk
     
     # Conversation parameters (NEW)
-    answer_length: int = 20           # tokens per answer (fixed for simplicity)
+    answer_length: int = 20           # tokens per answer (can be overridden by distribution)
+    answer_length_mean: float = 400   # mean for normal distribution
+    answer_length_std: float = 100    # std dev for normal distribution
+    answer_length_min: int = 50       # minimum answer length
+    answer_length_max: int = 800      # maximum answer length
+    use_answer_distribution: bool = False  # use normal distribution for answer length
     prompt_length_min: int = 10       # minimum prompt length
     prompt_length_max: int = 200      # maximum prompt length
     prompt_scale_by_capability: bool = True  # scale prompt length by device capability
@@ -488,6 +493,17 @@ class DraftServer:
                 prompt_length = random.randint(self.cfg.prompt_length_min, self.cfg.prompt_length_max)
         return prompt_length
     
+    def _sample_answer_length(self) -> int:
+        """Sample answer length, using normal distribution if configured."""
+        if self.cfg.use_answer_distribution:
+            # Sample from normal distribution
+            length = int(random.gauss(self.cfg.answer_length_mean, self.cfg.answer_length_std))
+            # Clamp to min/max bounds
+            return max(self.cfg.answer_length_min, min(self.cfg.answer_length_max, length))
+        else:
+            # Use fixed length
+            return self.cfg.answer_length
+    
     def _generate_blocking(self):
         """Blocking mode: generate full conversations with multiple speculation rounds"""
         if self.cfg.verbose:
@@ -506,6 +522,9 @@ class DraftServer:
             # Sample prompt length for this conversation
             prompt_length = self._sample_prompt_length()
             
+            # Sample answer length for this conversation
+            answer_length = self._sample_answer_length()
+            
             # Select target for this entire conversation
             target_id, conn = self._select_target()
             
@@ -515,7 +534,7 @@ class DraftServer:
             
             if self.cfg.debug:
                 print(f"[{self.env.now:.1f}ms] Draft {self.id}: Starting conversation #{conversation_count} "
-                      f"(prompt={prompt_length} tokens, answer={self.cfg.answer_length} tokens) with target {target_id}", flush=True)
+                      f"(prompt={prompt_length} tokens, answer={answer_length} tokens) with target {target_id}", flush=True)
             
             # Phase 1: Send prefill request to target
             if self.cfg.debug:
@@ -559,7 +578,7 @@ class DraftServer:
                 print(f"[{self.env.now:.1f}ms] Draft {self.id}: Prefill completed for {prompt_length} tokens", flush=True)
             
             # Phase 2: Generate answer with multiple speculation rounds
-            rounds_needed = (self.cfg.answer_length + self.gamma - 1) // self.gamma  # ceiling division
+            rounds_needed = (answer_length + self.gamma - 1) // self.gamma  # ceiling division
             tokens_generated_in_conversation = 0
             tokens_accepted_in_conversation = 0
             
@@ -567,7 +586,7 @@ class DraftServer:
                 round_start = self.env.now
                 
                 # Determine how many tokens to generate in this round
-                tokens_remaining = self.cfg.answer_length - tokens_generated_in_conversation
+                tokens_remaining = answer_length - tokens_generated_in_conversation
                 tokens_this_round = min(self.gamma, tokens_remaining)
                 
                 # Generate draft tokens (takes time on edge device!)
@@ -643,7 +662,7 @@ class DraftServer:
             
             if self.cfg.verbose or self.cfg.debug:
                 print(f"[{self.env.now:.1f}ms] Draft {self.id}: Conversation #{conversation_count} completed - "
-                      f"prompt={prompt_length}, answer={tokens_generated_in_conversation}/{self.cfg.answer_length} tokens, "
+                      f"prompt={prompt_length}, answer={tokens_generated_in_conversation}/{answer_length} tokens, "
                       f"acceptance={conversation_acceptance:.2%}, time={conversation_time:.1f}ms", flush=True)
             
             # Wait before starting next conversation (inter-arrival time)
@@ -895,6 +914,11 @@ def load_config(path: str) -> Config:
         gamma=raw.get("gamma", 4),
         # Conversation parameters - IMPORTANT: read from YAML
         answer_length=raw.get("answer_length", 20),
+        answer_length_mean=raw.get("answer_length_mean", 400),
+        answer_length_std=raw.get("answer_length_std", 100),
+        answer_length_min=raw.get("answer_length_min", 50),
+        answer_length_max=raw.get("answer_length_max", 800),
+        use_answer_distribution=raw.get("use_answer_distribution", False),
         prompt_length_min=raw.get("prompt_length_min", 10),
         prompt_length_max=raw.get("prompt_length_max", 200),
         prompt_scale_by_capability=raw.get("prompt_scale_by_capability", True),
