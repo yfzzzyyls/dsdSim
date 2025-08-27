@@ -1,0 +1,107 @@
+# Heterogeneous 20 targets × 100 drafts configuration
+# Using auto-topology for automatic generation of devices and connections
+
+sim_time_ms: 60000  # 60 seconds
+burn_in_ms: 1000    # 1 second warmup
+verbose: true
+debug: false
+
+execution_mode: blocking
+gamma: 4
+answer_length: 20
+prompt_length_min: 10
+prompt_length_max: 200
+prompt_scale_by_capability: true
+mixed_batching: true
+
+router: wjsq2
+router_params: 
+  d_choices: 2
+
+workload:
+  arrival: poisson
+  rate_rps: 450    # Tune to keep per-target utilization ~70%
+
+auto_topology:
+  targets:
+    count: 20
+    tiers:
+      - name: premium        # H100 / large model (datacenter)
+        ratio: 0.20          # 4 targets
+        model: llama-70b
+        gpu: H100
+        weight: 1.6
+        batch_window_ms: 5.0
+        batch_size: 16       # 70B memory limits
+        prefill_latency_per_token: 0.38
+        decode_latency_per_token: 1.55
+
+      - name: standard       # A100 / mid model (regional DC)
+        ratio: 0.40          # 8 targets
+        model: llama-13b
+        gpu: A100
+        weight: 1.2
+        batch_window_ms: 6.0
+        batch_size: 32
+        prefill_latency_per_token: 0.45
+        decode_latency_per_token: 1.80
+
+      - name: edge           # L4 / small model (edge PoP)
+        ratio: 0.40          # 8 targets
+        model: llama-8b
+        gpu: L4
+        weight: 0.8
+        batch_window_ms: 8.0
+        batch_size: 48
+        prefill_latency_per_token: 0.55
+        decode_latency_per_token: 2.60
+
+  drafts:
+    count: 100
+    # Three speed buckets for γ-token generation latency (ms)
+    gens_ms_per_gamma:
+      - [10, 30]     # datacenter proximity (fast)
+      - [30, 60]     # edge/CDN (medium)
+      - [60, 120]    # user devices (slow)
+    capability_map:
+      0: 2.0  # datacenter drafts have high capability
+      1: 1.0  # edge drafts have medium capability
+      2: 0.6  # user drafts have low capability
+    # Label the buckets for affinity rules
+    draft_bucket_labels: ["datacenter", "edge", "user"]
+
+  connectivity:
+    # Base fanout (can be overridden per tier)
+    fanout_per_draft: 3
+    
+    # Fanout overrides by draft tier
+    fanout_override:
+      datacenter: 20      # Fully connected to all 20 targets
+      edge: 3            # Limited connections
+      user: 2            # Exactly 2 nearby L4s
+    
+    # Affinity rules: which draft tiers can connect to which target tiers
+    affinity_rules:
+      datacenter: [premium, standard, edge]    # Can hit any tier
+      edge:       [standard, edge]             # No premium/H100
+      user:       [edge]                       # L4 only
+    
+    # Network latency ranges by target tier (ms) with ±20% jitter
+    net_ms_ranges:
+      premium:  [5, 15]    # H100 DC links (fast)
+      standard: [18, 28]   # A100 regional (medium)
+      edge:     [15, 45]   # L4 last-mile/PoP (variable)
+    
+    # Acceptance rate matrix: (draft speed bucket → target tier)
+    acceptance_by_tier:
+      0: { premium: 0.86, standard: 0.84, edge: 0.80 }  # datacenter drafts
+      1: { premium: 0.83, standard: 0.80, edge: 0.75 }  # edge drafts
+      2: { premium: 0.78, standard: 0.73, edge: 0.70 }  # user devices
+
+# Expected results:
+# - ~610 connections total (not 2000!)
+#   - Datacenter: 20 drafts × 20 targets = 400 connections
+#   - Edge: 50 drafts × 3 targets = 150 connections  
+#   - User: 30 drafts × 2 targets = 60 connections
+# - Load should balance across tiers based on capacity weights
+# - User drafts should never hit premium H100s (affinity enforcement)

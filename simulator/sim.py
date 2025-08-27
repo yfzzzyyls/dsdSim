@@ -14,6 +14,8 @@ from typing import List, Optional, Dict, Any
 @dataclass
 class TargetParams:
     id: str
+    model: str = ""                   # optional metadata (e.g., "llama-3.1-8b")
+    gpu: str = ""                     # optional metadata (e.g., "A100", "H100", "L4")
     weight: float = 1.0               # capacity weight (relative speed)
     batch_window_ms: float = 6.0      # Delta: wait to form a batch
     batch_size: int = 32              # B: max jobs per batch
@@ -79,6 +81,7 @@ class Config:
     
     router: str = "round_robin"       # "round_robin" | "jsq2" | "wjsq2"
     router_params: Dict[str, Any] = field(default_factory=lambda: {"d_choices": 2})
+    scheduler_config: Dict[str, Any] = field(default_factory=dict)  # Scheduler configuration
     devices: List[Dict[str, Any]] = field(default_factory=list)   # list of dicts with role/params
     connections: List[Dict[str, Any]] = field(default_factory=list)  # draft-target connections
     workload: WorkloadCfg = field(default_factory=WorkloadCfg)
@@ -122,10 +125,13 @@ class TokenMetrics:
 
 class Metrics:
     def __init__(self, verbose: bool = True, burn_in_ms: float = 0.0) -> None:
+        from collections import defaultdict
         self.completed: List[Job] = []
         self.verbose = verbose
         self.burn_in_ms = burn_in_ms
         self.token_metrics = TokenMetrics()  # Add token tracking
+        self.connection_counts = defaultdict(int)     # (draft_id, target_id) -> hits
+        self.tier_utilization = defaultdict(list)     # gpu/model tier -> samples
 
     def add(self, job: Job):
         self.completed.append(job)
@@ -174,6 +180,7 @@ class TargetServer:
         self.env = env
         self.p = params
         self.cfg = cfg or Config()  # Use default config if not provided
+        self.scheduler_config = self.cfg.scheduler_config  # Get scheduler config
         self.metrics = metrics
         self.debug = debug
         self.q = simpy.Store(env)           # FIFO queue of Job
@@ -272,6 +279,11 @@ class TargetServer:
                 t0 = self.env.now
                 serve_count += 1
                 
+                # Scheduler config
+                max_prefills = self.scheduler_config.get("max_prefills_per_batch")
+                prefill_count = 1 if first.job_type == "prefill" else 0
+                deferred_prefills = []  # Prefills to save for next batch
+                
                 if self.env.now > 1020 and self.env.now < 1030:
                     print(f"[{self.env.now:.1f}ms] Target {self.p.id}: Got first job, starting batch collection", flush=True)
                 
@@ -306,13 +318,28 @@ class TargetServer:
                     if get_ev in got:
                         job = got[get_ev]
                         self._enqueued_count -= 1
+                        
+                        # SCHEDULER LOGIC: Decode-first
+                        if max_prefills is not None and job.job_type == "prefill":
+                            if prefill_count >= max_prefills:
+                                deferred_prefills.append(job)
+                                continue  # Skip this prefill for now
+                        
                         batch.append(job)
+                        if job.job_type == "prefill":
+                            prefill_count += 1
                     else:
                         # timeout fired; must cancel the pending get to avoid a dangling consumer
                         # (this is recommended in SimPy's shared-resource patterns)
                         if hasattr(get_ev, 'cancel'):
                             get_ev.cancel()
 
+                # Re-queue deferred prefills at the front
+                for job in reversed(deferred_prefills):
+                    # Put back at front of queue (they'll be processed first next batch)
+                    yield self.q.put(job)
+                    self._enqueued_count += 1
+                
                 # Calculate batch processing time (max of all job latencies)
                 batch_latency = self._calculate_batch_latency(batch)
                 
@@ -390,36 +417,38 @@ class DraftServer:
         return base_ia * self.total_capability / self.p.capability
     
     def _select_target(self) -> tuple[str, ConnectionParams]:
-        """Select a target server using router logic and return its ID and connection params"""
-        # Use the router to select the best target
-        # Create a dummy job for routing decision
-        dummy_job = Job(jid=-1, created_ms=self.env.now, draft_id=self.id)
+        """Select a target among only those this draft can reach (connection-aware).
         
-        # Get the target selection from router (but don't actually enqueue)
-        if hasattr(self.router, '_weighted_sample_k'):
-            # For wJSQ2 router
-            candidates = self.router._weighted_sample_k(self.router.d)
-            target = min(candidates, key=lambda t: t.work_left_score())
-        elif hasattr(self.router, 'targets'):
-            # For round-robin or other routers, just pick based on queue length
-            target = min(self.router.targets, key=lambda t: t.queue_len())
+        THIS is where routing actually happens (not router.route()):
+        1. Filter to reachable targets (allowed_ids from connections)
+        2. Use router's weighted sampler to pick d=2 candidates
+        3. Select the least loaded candidate
+        4. Return target_id and connection params (latencies, acceptance rate)
+        """
+        allowed_ids = set(self.connections.keys())
+        if not allowed_ids:
+            raise ValueError(f"Draft {self.id} has no connections configured")
+
+        # Candidate pool restricted to allowed targets present in the router
+        pool = [t for t in getattr(self.router, 'targets', []) if t.p.id in allowed_ids]
+        if not pool:
+            # Fallback: pick any allowed id if targets not yet attached
+            tid = next(iter(allowed_ids))
+            return tid, self.connections[tid]
+
+        # Prefer capacity-aware weighted JSQ(d) over plain queue length
+        if hasattr(self.router, '_weighted_sample_k_filtered'):
+            candidates = self.router._weighted_sample_k_filtered(getattr(self.router, 'd', 2), allowed_ids)
+            if not candidates:
+                candidates = pool
+        elif hasattr(self.router, 'd') and isinstance(self.router, JSQ2Router):
+            k = min(self.router.d, len(pool))
+            candidates = random.sample(pool, k) if len(pool) > k else pool
         else:
-            # Fallback to random
-            target_ids = list(self.connections.keys())
-            if not target_ids:
-                raise ValueError(f"Draft {self.id} has no connections configured")
-            target_id = random.choice(target_ids)
-            return target_id, self.connections[target_id]
-        
+            candidates = pool
+
+        target = min(candidates, key=lambda t: t.work_left_score())
         target_id = target.p.id
-        if target_id not in self.connections:
-            # If no connection configured for this target, pick first available
-            target_ids = list(self.connections.keys())
-            if target_ids:
-                target_id = target_ids[0]
-            else:
-                raise ValueError(f"Draft {self.id} has no connections configured")
-        
         return target_id, self.connections[target_id]
     
     def _simulate_verification(self, tokens: int, acceptance_rate: float) -> VerifyResult:
@@ -479,6 +508,10 @@ class DraftServer:
             
             # Select target for this entire conversation
             target_id, conn = self._select_target()
+            
+            # Track connection usage in metrics
+            if hasattr(self.metrics, "connection_counts"):
+                self.metrics.connection_counts[(self.id, target_id)] += 1
             
             if self.cfg.debug:
                 print(f"[{self.env.now:.1f}ms] Draft {self.id}: Starting conversation #{conversation_count} "
@@ -631,91 +664,62 @@ class DraftServer:
 
 # ---------- Routers ----------
 
-class BaseRouter:
-    def route(self, job: Job): raise NotImplementedError
+# Router classes act as weighted samplers for DraftServer._select_target()
+# The route() method is NEVER used - drafts call _weighted_sample_k_filtered directly
+# and enqueue jobs themselves to maintain connection-awareness.
 
-class RoundRobinRouter(BaseRouter):
+class RoundRobinRouter:
+    """Simple round-robin router (for completeness, rarely used)."""
     def __init__(self, targets: List[TargetServer]):
         if not targets:
             raise ValueError("Router needs at least one target")
         self.targets = targets
         self._i = 0
-    def route(self, job: Job):
-        tgt = self.targets[self._i % len(self.targets)]
-        self._i += 1
-        tgt.enqueue(job)
 
-class JSQ2Router(BaseRouter):
-    """Unweighted power-of-two choices (classic JSQ(d))."""
+class JSQ2Router:
+    """Unweighted power-of-two choices sampler."""
     def __init__(self, targets: List[TargetServer], d_choices: int = 2):
         if not targets:
             raise ValueError("Router needs at least one target")
         self.targets = targets
         self.d = min(max(1, d_choices), len(targets))
-    
-    def route(self, job: Job):
-        # Sample d random targets
-        if len(self.targets) <= self.d:
-            candidates = self.targets
-        else:
-            candidates = random.sample(self.targets, self.d)
-        # Route to the one with shortest queue
-        tgt = min(candidates, key=lambda t: t.queue_len())
-        tgt.enqueue(job)
 
-class WeightedJSQ2Router(BaseRouter):
-    """Power-of-two choices with capacity-aware sampling (weights)."""
+class WeightedJSQ2Router:
+    """Weighted power-of-two choices sampler (main router used).
+    
+    DraftServer uses this as a weighted sampler via _weighted_sample_k_filtered(),
+    which respects draft-target connectivity constraints.
+    """
     def __init__(self, targets: List[TargetServer], d_choices: int = 2, debug: bool = False):
         if not targets:
             raise ValueError("Router needs at least one target")
         self.targets = targets
         self.d = max(1, d_choices)
         self.debug = debug
-        self.route_count = 0
 
-    def _weighted_sample_k(self, k: int) -> List[TargetServer]:
-        """Weighted sampling without replacement using Efraimidis-Spirakis algorithm"""
-        k = min(k, len(self.targets))
-        weights = [max(0.0, t.p.weight) for t in self.targets]
+    def _weighted_sample_k_filtered(self, k: int, allowed_ids) -> List[TargetServer]:
+        """Weighted sampling without replacement restricted to allowed target IDs.
         
-        # Fallback if all weights are zero
+        This is the MAIN method used by DraftServer._select_target() to ensure
+        connection-aware routing. Only samples from targets the draft can reach.
+        """
+        pool = [t for t in self.targets if t.p.id in allowed_ids]
+        if not pool:
+            return []
+        k = min(k, len(pool))
+        weights = [max(0.0, t.p.weight) for t in pool]
         if sum(weights) == 0:
-            return random.sample(self.targets, k)
-        
-        # Efraimidis-Spirakis: weighted sampling without replacement
-        # Draw k items with keys = u^(1/w_i) where u ~ U(0,1)
-        # Items with higher weights more likely to get larger keys
+            return random.sample(pool, k)
         keyed = []
-        for t, w in zip(self.targets, weights):
-            # If w==0, it will never be chosen (unless all are 0, handled above)
+        for t, w in zip(pool, weights):
             if w == 0:
-                key = 0  # Will sort to the end
+                key = 0
             else:
                 u = random.random()
                 key = u ** (1.0 / w)
             keyed.append((key, t))
-        
-        # Take top-k by key (highest keys = most likely to be selected)
         keyed.sort(reverse=True)
         return [t for _, t in keyed[:k]]
-
-    def route(self, job: Job):
-        self.route_count += 1
-        
-        # Debug for specific time window
-        debug_this = self.debug and self.route_count <= 10
-        if job.created_ms > 1020 and job.created_ms < 1030:
-            print(f"[{job.created_ms:.1f}ms] Router: Starting route for job from {job.draft_id}", flush=True)
-            debug_this = True
-        
-        cands = self._weighted_sample_k(self.d)
-        tgt = min(cands, key=lambda t: t.work_left_score())
-        
-        if debug_this:
-            cand_info = [(t.p.id, f"{t.work_left_score():.1f}") for t in cands]
-            print(f"  Router: job {job.jid} -> {tgt.p.id} (candidates: {cand_info})", flush=True)
-        
-        tgt.enqueue(job)
 
 ROUTERS = {
     "round_robin": RoundRobinRouter,
@@ -725,9 +729,164 @@ ROUTERS = {
 
 # ---------- Config I/O & Runner ----------
 
+def _expand_auto_topology(raw: Dict[str, Any]) -> Dict[str, Any]:
+    """Expand auto_topology shorthand into full devices and connections lists."""
+    import random
+    from collections import defaultdict
+    
+    if not isinstance(raw, dict) or not raw.get("auto_topology"):
+        return raw
+    
+    rng = random.Random(raw.get("seed", 0))
+    spec = raw["auto_topology"]
+    
+    # --- Generate Targets ---
+    t_spec = spec.get("targets", {})
+    t_count = int(t_spec.get("count", 20))
+    tiers = t_spec.get("tiers", [])
+    if not tiers:
+        tiers = [{
+            "name": "default", "ratio": 1.0, "model": "llama-3.1-8b", "gpu": "A100",
+            "weight": 1.0, "batch_window_ms": 6.0, "batch_size": 48,
+            "prefill_latency_per_token": 0.45, "decode_latency_per_token": 1.80
+        }]
+    
+    # Distribute counts per tier
+    remaining = t_count
+    tier_counts = []
+    for i, t in enumerate(tiers):
+        c = t_count - sum(tier_counts) if i == len(tiers)-1 else int(round(t_count * float(t.get("ratio", 0))))
+        c = max(0, c)
+        tier_counts.append(c)
+    
+    devices, target_ids, tier_of = [], [], {}
+    for t, c in zip(tiers, tier_counts):
+        for _ in range(c):
+            tid = f"t{len(target_ids):02d}"
+            target_ids.append(tid)
+            tier_of[tid] = t.get("name", "default")
+            devices.append({
+                "id": tid, "role": "target",
+                "model": t.get("model", ""), "gpu": t.get("gpu", ""),
+                "weight": float(t.get("weight", 1.0)),
+                "batch_window_ms": float(t.get("batch_window_ms", 6.0)),
+                "batch_size": int(t.get("batch_size", 32)),
+                "prefill_latency_per_token": float(t.get("prefill_latency_per_token", 0.5)),
+                "decode_latency_per_token": float(t.get("decode_latency_per_token", 2.5)),
+            })
+    
+    # Build targets_by_tier mapping
+    targets_by_tier = defaultdict(list)
+    for tid, tname in tier_of.items():
+        targets_by_tier[tname].append(tid)
+    all_tiers = list(targets_by_tier.keys())
+    
+    # --- Generate Drafts ---
+    d_spec = spec.get("drafts", {})
+    d_count = int(d_spec.get("count", 100))
+    gens = d_spec.get("gens_ms_per_gamma", [[0,0],[100,160],[240,420]])
+    caps = d_spec.get("capability_map", {0:2.0, 1:1.0, 2:0.6})
+    labels = d_spec.get("draft_bucket_labels", ["datacenter", "edge", "user"])
+    
+    # Store draft gen midpoints for bucket assignment
+    gen_mids = [(a+b)/2.0 for a,b in gens]
+    
+    # Distribute drafts evenly across buckets (33/33/34 for 100 drafts)
+    drafts_per_bucket = d_count // len(gens)
+    
+    for i in range(d_count):
+        # Assign bucket deterministically for even distribution
+        if i < drafts_per_bucket * len(gens):
+            bucket = i // drafts_per_bucket
+        else:
+            bucket = len(gens) - 1  # Put remainder in last bucket
+        
+        lo, hi = gens[bucket]
+        gen_ms = rng.uniform(float(lo), float(hi))
+        devices.append({
+            "id": f"d{i:02d}", "role": "draft",
+            "capability": float(caps.get(bucket, caps.get(str(bucket), 1.0))),
+            "generation_latency_ms": float(gen_ms),
+            "bucket": bucket,  # Store the bucket assignment
+            "burst_factor": 1.0, "reliability": 0.99
+        })
+    
+    # --- Generate Connectivity ---
+    conn_spec = spec.get("connectivity", {})
+    fanout_base = int(conn_spec.get("fanout_per_draft", 3))
+    fanout_override = conn_spec.get("fanout_override", {})
+    affinity = conn_spec.get("affinity_rules", {})
+    net_ranges = conn_spec.get("net_ms_ranges", {})
+    acc_tbl = conn_spec.get("acceptance_by_tier", {})
+    
+    connections = []
+    for i in range(d_count):
+        did = f"d{i:02d}"
+        
+        # Use the stored bucket assignment
+        draft_device = devices[len(target_ids)+i]
+        bidx = draft_device.get("bucket", 0)  # Use stored bucket
+        label = labels[bidx] if bidx < len(labels) else str(bidx)
+        
+        # Get allowed targets from affinity rules
+        allowed_tiers = affinity.get(label, all_tiers)
+        candidates = []
+        for t in allowed_tiers:
+            candidates.extend(targets_by_tier.get(t, []))
+        
+        # Determine fanout
+        fanout = int(fanout_override.get(label, fanout_base))
+        
+        # Special case for user drafts - stable "nearest" L4s
+        if label == "user" and len(targets_by_tier.get("edge", [])) >= 2:
+            l4s = targets_by_tier.get("edge", [])
+            base = abs(hash(did)) % len(l4s)
+            chosen = [l4s[base], l4s[(base+1) % len(l4s)]]
+        else:
+            # Randomize candidate selection to avoid bias
+            rng.shuffle(candidates)
+            # FIXED: Always limit to exactly fanout connections
+            chosen = candidates[:fanout]
+        
+        # Create connections with per-edge properties
+        for tid in chosen:
+            t_tier = tier_of[tid]
+            
+            # Network latencies based on tier
+            fr = net_ranges.get(t_tier, [20, 40])
+            fwd = rng.uniform(float(fr[0]), float(fr[1]))
+            rsp = rng.uniform(float(fr[0]), float(fr[1]))
+            
+            # Acceptance rate based on draft bucket and target tier
+            row = acc_tbl.get(str(bidx), acc_tbl.get(bidx, {}))
+            base_acc = row.get(t_tier, 0.75)
+            acc = max(0.5, min(0.95, base_acc + rng.uniform(-0.03, 0.03)))
+            
+            connections.append({
+                "draft": did, "target": tid,
+                "forward_latency_ms": float(fwd),
+                "response_latency_ms": float(rsp),
+                "acceptance_rate": float(acc)
+            })
+    
+    # Update raw config with generated devices and connections
+    raw = dict(raw)
+    raw["devices"] = devices
+    raw["connections"] = connections
+    
+    # Add topology statistics for debugging
+    if raw.get("verbose", False):
+        print(f"Auto-topology generated: {len(devices)} devices ({t_count} targets, {d_count} drafts)")
+        print(f"                        {len(connections)} connections (avg {len(connections)/d_count:.1f} per draft)")
+        for tier_name, count in zip([t["name"] for t in tiers], tier_counts):
+            print(f"  Target tier '{tier_name}': {count} devices")
+    
+    return raw
+
 def load_config(path: str) -> Config:
     with open(path, "r") as f:
         raw = yaml.safe_load(f) or {}  # safe_load is the secure choice for untrusted YAML
+    raw = _expand_auto_topology(raw)  # Expand auto-topology if present
     wl = WorkloadCfg(**(raw.get("workload", {}) or {}))
     cfg = Config(
         sim_time_ms=raw.get("sim_time_ms", 10_000),
@@ -742,6 +901,7 @@ def load_config(path: str) -> Config:
         mixed_batching=raw.get("mixed_batching", True),
         router=raw.get("router", "round_robin"),
         router_params=raw.get("router_params", {"d_choices": 2}),
+        scheduler_config=raw.get("scheduler", {}),  # Parse scheduler config
         devices=raw.get("devices", []),
         connections=raw.get("connections", []),
         workload=wl,
@@ -786,6 +946,8 @@ def build(env: simpy.Environment, cfg: Config):
             
             params = TargetParams(
                 id=d["id"],
+                model=str(d.get("model", "")),
+                gpu=str(d.get("gpu", "")),
                 weight=float(d.get("weight", 1.0)),
                 batch_window_ms=float(d.get("batch_window_ms", 6.0)),
                 batch_size=int(d.get("batch_size", 32)),
@@ -955,6 +1117,12 @@ def get_target_metrics(targets: List[TargetServer], sim_time_ms: float) -> Dict[
             "avg_queue_len": avg_queue,
             "p95_queue_len": p95_queue,
         }
+        
+        # Track tier utilization if available
+        tier = getattr(t.p, "gpu", "") or getattr(t.p, "model", "") or t.p.id
+        if hasattr(targets[0].metrics, "tier_utilization"):
+            targets[0].metrics.tier_utilization[tier].append(utilization)
+    
     return results
 
 def get_draft_metrics(drafts: List[DraftServer]) -> Dict[str, Dict[str, Any]]:
@@ -981,7 +1149,7 @@ def get_draft_metrics(drafts: List[DraftServer]) -> Dict[str, Dict[str, Any]]:
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--config", "-c", default="config.yaml")
+    ap.add_argument("--config", "-c", default="configs/config.yaml")
     args = ap.parse_args()
     cfg = load_config(args.config)
     
@@ -1059,6 +1227,43 @@ def main():
         print("\n" + "="*60)
         print(f"🚀 FINAL RESULT: {metrics.token_metrics.get_effective_tokens_per_second():.1f} tokens per second")
         print("="*60)
+    
+    # Output JSON metrics for analysis
+    import json
+    import statistics
+    print("\n===METRICS_JSON===")
+    metrics_json = {
+        "scheduler": cfg.scheduler_config.get("type", "baseline"),
+        "seed": cfg.seed,
+        "load_rps": cfg.workload.rate_rps,
+        "avg_latency_ms": summary.get("avg_ms", 0),
+        "p50_latency_ms": summary.get("p50_ms", 0),
+        "p95_latency_ms": summary.get("p95_ms", 0),
+        "p99_latency_ms": summary.get("p99_ms", 0),
+        "throughput_jobs_s": summary.get("throughput_jobs_s", 0),
+        "acceptance_rate": metrics.token_metrics.get_acceptance_rate() if hasattr(metrics, 'token_metrics') else 0,
+        "effective_tok_s": metrics.token_metrics.get_effective_tokens_per_second() if hasattr(metrics, 'token_metrics') else 0,
+    }
+    
+    # Add batch composition if available
+    if targets and len(targets) > 0:
+        all_batch_sizes = []
+        prefill_counts = []
+        decode_counts = []
+        for t in targets:
+            if hasattr(t, 'batch_history'):
+                for batch in t.batch_history:
+                    all_batch_sizes.append(len(batch))
+                    prefill_counts.append(sum(1 for j in batch if j.job_type == "prefill"))
+                    decode_counts.append(sum(1 for j in batch if j.job_type == "decode"))
+        
+        if all_batch_sizes:
+            metrics_json["avg_batch_size"] = statistics.mean(all_batch_sizes)
+            metrics_json["avg_prefills_per_batch"] = statistics.mean(prefill_counts) if prefill_counts else 0
+            metrics_json["avg_decodes_per_batch"] = statistics.mean(decode_counts) if decode_counts else 0
+    
+    print(json.dumps(metrics_json, indent=2))
+    print("===END_METRICS_JSON===")
 
 if __name__ == "__main__":
     main()
