@@ -30,9 +30,9 @@ scheduler:
   two_lane: false                    # Enable two-lane scheduling
   prefill_share: 0.25               # Share of time for prefills (if two_lane=true)
 
-router: wjsq2
+router: semi_clairvoyant    # Options: random, round_robin, jsq2, wjsq2, jiq, semi_clairvoyant
 router_params: 
-  d_choices: 2
+  d_choices: 2   # For jsq2/wjsq2: number of targets to sample
 
 workload:
   arrival: poisson

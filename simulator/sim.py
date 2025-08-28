@@ -3,6 +3,7 @@
 
 import argparse, random, simpy, yaml, math
 import time
+from collections import deque
 
 # Print SimPy version for debugging
 print(f"SimPy version: {simpy.__version__}", flush=True)
@@ -104,6 +105,8 @@ class Job:
     started_ms: Optional[float] = None
     finished_ms: Optional[float] = None
     completion_event: Optional[Any] = None  # SimPy event signaled when job completes
+    rtt_start_ms: Optional[float] = None  # When RTT measurement starts (before generation)
+    rtt_end_ms: Optional[float] = None    # When RTT measurement ends (after response received)
 
 @dataclass
 class TokenMetrics:
@@ -149,16 +152,32 @@ class Metrics:
         filtered = [j for j in self.completed if j.created_ms >= self.burn_in_ms]
         if not filtered:
             return {}
+        
+        # Target-side latency (queue + processing)
         lat = [j.finished_ms - j.created_ms for j in filtered]
         lat.sort()
+        
+        # Full RTT latency (generation + network + queue + processing + network)
+        rtt_jobs = [j for j in filtered if j.rtt_start_ms is not None and j.rtt_end_ms is not None]
+        rtt = [j.rtt_end_ms - j.rtt_start_ms for j in rtt_jobs] if rtt_jobs else []
+        rtt.sort()
+        
         def pct(p):
             i = int(round(p * (len(lat) - 1)))
             return lat[max(0, min(i, len(lat)-1))]
+        
+        def pct_rtt(p):
+            if not rtt:
+                return 0
+            i = int(round(p * (len(rtt) - 1)))
+            return rtt[max(0, min(i, len(rtt)-1))]
+        
         # Correct span calculation using min/max of filtered jobs
         start = min(j.created_ms for j in filtered)
         end = max(j.finished_ms for j in filtered)
         span = end - start + 1e-9
-        return {
+        
+        result = {
             "count": len(lat),
             "throughput_jobs_s": 1000.0 * len(lat) / span,
             "avg_ms": sum(lat)/len(lat) if lat else 0,
@@ -166,6 +185,16 @@ class Metrics:
             "p95_ms": pct(0.95) if lat else 0, 
             "p99_ms": pct(0.99) if lat else 0,
         }
+        
+        # Add RTT metrics if available
+        if rtt:
+            result["rtt_avg_ms"] = sum(rtt)/len(rtt)
+            result["rtt_p50_ms"] = pct_rtt(0.50)
+            result["rtt_p95_ms"] = pct_rtt(0.95)
+            result["rtt_p99_ms"] = pct_rtt(0.99)
+            result["rtt_count"] = len(rtt)
+        
+        return result
 
 # ---------- Helper Functions ----------
 
@@ -181,13 +210,14 @@ def get_typical_verify_ms(target_config: dict, gamma: int = 4) -> float:
 
 class TargetServer:
     """Continuous-batching-style target: collect for Delta or until B, then serve in fixed time."""
-    def __init__(self, env: simpy.Environment, params: TargetParams, metrics: Metrics, cfg: Config = None, debug: bool = False):
+    def __init__(self, env: simpy.Environment, params: TargetParams, metrics: Metrics, cfg: Config = None, debug: bool = False, router=None):
         self.env = env
         self.p = params
         self.cfg = cfg or Config()  # Use default config if not provided
         self.scheduler_config = self.cfg.scheduler_config  # Get scheduler config
         self.metrics = metrics
         self.debug = debug
+        self.router = router  # Reference to router for JIQ notifications
         self.q = simpy.Store(env)           # FIFO queue of Job
         
         # CRITICAL FIX: Add Resource to enforce single-server processing
@@ -280,6 +310,11 @@ class TargetServer:
                 
                 first = yield self.q.get()              # wait for first job
                 self._enqueued_count -= 1
+                
+                # JIQ: Mark as busy when we get first job
+                if self.router and hasattr(self.router, 'mark_busy'):
+                    self.router.mark_busy(self.p.id)
+                
                 batch = [first]
                 t0 = self.env.now
                 serve_count += 1
@@ -383,6 +418,11 @@ class TargetServer:
                     if j.completion_event and not j.completion_event.triggered:
                         j.completion_event.succeed()
                 
+                # JIQ: Mark as idle if queue is empty after processing
+                if self.router and hasattr(self.router, 'mark_idle'):
+                    if self._enqueued_count == 0:
+                        self.router.mark_idle(self.p.id)
+                
                 # Server resource automatically released at end of with block
 
 class DraftServer:
@@ -441,17 +481,49 @@ class DraftServer:
             tid = next(iter(allowed_ids))
             return tid, self.connections[tid]
 
-        # Prefer capacity-aware weighted JSQ(d) over plain queue length
-        if hasattr(self.router, '_weighted_sample_k_filtered'):
+        # Handle different router types
+        if hasattr(self.router, 'random_select_filtered'):
+            # Random router - no load awareness
+            target = self.router.random_select_filtered(allowed_ids)
+            if not target:
+                target = pool[0]
+            target_id = target.p.id
+            return target_id, self.connections[target_id]
+        elif hasattr(self.router, 'round_robin_select_filtered'):
+            # Round-robin router - cycles through targets
+            target = self.router.round_robin_select_filtered(self.id, allowed_ids)
+            if not target:
+                target = pool[0]
+            target_id = target.p.id
+            return target_id, self.connections[target_id]
+        elif hasattr(self.router, 'jiq_select_filtered'):
+            # JIQ router - selects idle targets from FIFO queue
+            target = self.router.jiq_select_filtered(allowed_ids)
+            if not target:
+                target = pool[0]
+            target_id = target.p.id
+            return target_id, self.connections[target_id]
+        elif hasattr(self.router, 'semi_clairvoyant_select_filtered'):
+            # Semi-Clairvoyant router - fairness based on progress
+            target = self.router.semi_clairvoyant_select_filtered(self.id, allowed_ids)
+            if not target:
+                target = pool[0]
+            target_id = target.p.id
+            return target_id, self.connections[target_id]
+        elif hasattr(self.router, '_weighted_sample_k_filtered'):
+            # Weighted JSQ(d) router
             candidates = self.router._weighted_sample_k_filtered(getattr(self.router, 'd', 2), allowed_ids)
             if not candidates:
                 candidates = pool
         elif hasattr(self.router, 'd') and isinstance(self.router, JSQ2Router):
+            # Unweighted JSQ(d) router
             k = min(self.router.d, len(pool))
             candidates = random.sample(pool, k) if len(pool) > k else pool
         else:
+            # Default: use all available
             candidates = pool
 
+        # For non-random routers, select least loaded from candidates
         target = min(candidates, key=lambda t: t.work_left_score())
         target_id = target.p.id
         return target_id, self.connections[target_id]
@@ -540,6 +612,9 @@ class DraftServer:
             if self.cfg.debug:
                 print(f"[{self.env.now:.1f}ms] Draft {self.id}: Sending prefill request ({prompt_length} tokens) to target {target_id}", flush=True)
             
+            # Track RTT start for prefill
+            prefill_rtt_start = self.env.now
+            
             # Create prefill job with completion event
             prefill_completion = self.env.event()
             prefill_job = Job(
@@ -548,7 +623,8 @@ class DraftServer:
                 draft_id=self.id,
                 job_type="prefill",
                 token_count=prompt_length,
-                completion_event=prefill_completion
+                completion_event=prefill_completion,
+                rtt_start_ms=prefill_rtt_start
             )
             self.chunks_sent += 1
             
@@ -574,6 +650,9 @@ class DraftServer:
             # Wait for response to travel back
             yield self.env.timeout(conn.response_latency_ms)
             
+            # Mark RTT end for prefill
+            prefill_job.rtt_end_ms = self.env.now
+            
             if self.cfg.debug:
                 print(f"[{self.env.now:.1f}ms] Draft {self.id}: Prefill completed for {prompt_length} tokens", flush=True)
             
@@ -581,6 +660,10 @@ class DraftServer:
             rounds_needed = (answer_length + self.gamma - 1) // self.gamma  # ceiling division
             tokens_generated_in_conversation = 0
             tokens_accepted_in_conversation = 0
+            
+            # Initialize progress for Semi-Clairvoyant router
+            if hasattr(self.router, 'update_progress'):
+                self.router.update_progress(self.id, 0, 0, answer_length)
             
             for round_num in range(rounds_needed):
                 round_start = self.env.now
@@ -609,7 +692,8 @@ class DraftServer:
                     draft_id=self.id,
                     job_type="decode",
                     token_count=tokens_this_round,
-                    completion_event=decode_completion
+                    completion_event=decode_completion,
+                    rtt_start_ms=round_start  # Track RTT from start of generation
                 )
                 
                 # Send chunk to target (forward latency)
@@ -636,11 +720,19 @@ class DraftServer:
                 # Wait for response to travel back
                 yield self.env.timeout(conn.response_latency_ms)
                 
+                # Mark RTT end after response received
+                job.rtt_end_ms = self.env.now
+                
                 # Simulate verification result
                 result = self._simulate_verification(tokens_this_round, conn.acceptance_rate)
                 self.total_tokens_accepted += result.accepted_tokens
                 self.total_tokens_rejected += result.rejected_tokens
                 tokens_accepted_in_conversation += result.accepted_tokens
+                
+                # Update progress for Semi-Clairvoyant router with actual acceptance
+                if hasattr(self.router, 'update_progress'):
+                    self.router.update_progress(self.id, tokens_generated_in_conversation, 
+                                               tokens_accepted_in_conversation, answer_length)
                 
                 # Update global token metrics (only count after burn-in)
                 if self.env.now >= self.cfg.burn_in_ms:
@@ -687,13 +779,168 @@ class DraftServer:
 # The route() method is NEVER used - drafts call _weighted_sample_k_filtered directly
 # and enqueue jobs themselves to maintain connection-awareness.
 
-class RoundRobinRouter:
-    """Simple round-robin router (for completeness, rarely used)."""
+class RandomRouter:
+    """Pure random selection - no load awareness."""
     def __init__(self, targets: List[TargetServer]):
         if not targets:
             raise ValueError("Router needs at least one target")
         self.targets = targets
-        self._i = 0
+    
+    def random_select_filtered(self, allowed_ids) -> TargetServer:
+        """Randomly select one target from allowed set."""
+        pool = [t for t in self.targets if t.p.id in allowed_ids]
+        if not pool:
+            return None
+        return random.choice(pool)
+
+class RoundRobinRouter:
+    """Round-robin router with per-draft counters for connection-aware routing."""
+    def __init__(self, targets: List[TargetServer]):
+        if not targets:
+            raise ValueError("Router needs at least one target")
+        self.targets = targets
+        self._counters = {}  # Per-draft counters for independent round-robin
+    
+    def round_robin_select_filtered(self, draft_id: str, allowed_ids) -> TargetServer:
+        """Round-robin selection from allowed targets, maintaining per-draft state."""
+        pool = [t for t in self.targets if t.p.id in allowed_ids]
+        if not pool:
+            return None
+        
+        # Initialize counter for this draft if needed
+        if draft_id not in self._counters:
+            self._counters[draft_id] = 0
+        
+        # Select target based on counter
+        idx = self._counters[draft_id] % len(pool)
+        target = pool[idx]
+        
+        # Increment counter for next time
+        self._counters[draft_id] += 1
+        
+        return target
+
+class JIQRouter:
+    """Join-Idle-Queue router with FIFO idle queue."""
+    def __init__(self, targets: List[TargetServer]):
+        if not targets:
+            raise ValueError("Router needs at least one target")
+        self.targets = targets
+        self.idle_queue = deque()  # FIFO queue of idle target IDs
+        self.idle_set = set()  # For fast membership check
+        
+    def mark_idle(self, target_id: str):
+        """Called by target when it becomes idle."""
+        if target_id not in self.idle_set:
+            self.idle_queue.append(target_id)
+            self.idle_set.add(target_id)
+    
+    def mark_busy(self, target_id: str):
+        """Called by target when it becomes busy."""
+        # Just remove from set, leave in queue (will be skipped)
+        self.idle_set.discard(target_id)
+    
+    def jiq_select_filtered(self, allowed_ids) -> TargetServer:
+        """Select idle target from allowed set, or random if none idle."""
+        # Try to find idle target in allowed set
+        while self.idle_queue:
+            # Pop from FIFO queue
+            idle_id = self.idle_queue[0]
+            
+            # Check if still idle and allowed
+            if idle_id in self.idle_set and idle_id in allowed_ids:
+                # Found valid idle target
+                self.idle_queue.popleft()
+                self.idle_set.remove(idle_id)
+                
+                # Find the target server object
+                for t in self.targets:
+                    if t.p.id == idle_id:
+                        return t
+            else:
+                # Not valid anymore, remove and continue
+                self.idle_queue.popleft()
+                if idle_id in self.idle_set:
+                    self.idle_set.remove(idle_id)
+        
+        # No idle targets available, fallback to random
+        pool = [t for t in self.targets if t.p.id in allowed_ids]
+        if pool:
+            return random.choice(pool)
+        return None
+
+class SemiClairvoyantRouter:
+    """Semi-Clairvoyant router based on request progress (attained/remaining service).
+    
+    Implements fairness-based scheduling to prevent starvation by prioritizing
+    requests with least relative progress. Adapted from the paper:
+    "Semi-Clairvoyant Scheduling for Speculative Parallelism" 
+    
+    Uses acceptance rate to accurately estimate actual progress:
+    Priority = tokens_accepted / answer_length
+    Routes to target with lowest average priority (least progress).
+    """
+    def __init__(self, targets: List[TargetServer]):
+        if not targets:
+            raise ValueError("Router needs at least one target")
+        self.targets = targets
+        self.request_progress = {}  # draft_id -> {tokens_generated, tokens_accepted, answer_length}
+    
+    def update_progress(self, draft_id: str, tokens_generated: int, tokens_accepted: int, answer_length: int):
+        """Update progress tracking for a draft's conversation.
+        Now tracks both generated and accepted tokens for accurate progress."""
+        self.request_progress[draft_id] = {
+            'tokens_generated': tokens_generated,
+            'tokens_accepted': tokens_accepted,
+            'answer_length': answer_length
+        }
+    
+    def calculate_priority(self, draft_id: str) -> float:
+        """Calculate priority based on ACTUAL progress (accepted tokens).
+        Lower priority = less progress = should be prioritized."""
+        if draft_id not in self.request_progress:
+            return 0.5  # Default priority for unknown requests
+        
+        progress = self.request_progress[draft_id]
+        tokens_accepted = progress.get('tokens_accepted', 0)
+        answer_length = progress['answer_length']
+        
+        if tokens_accepted >= answer_length:  # Request complete
+            return 1.0  # Lowest priority (done)
+        
+        if answer_length == 0:
+            return 0.0  # Highest priority (just starting)
+        
+        # Priority = actual progress / total needed
+        return tokens_accepted / answer_length
+    
+    def semi_clairvoyant_select_filtered(self, draft_id: str, allowed_ids) -> TargetServer:
+        """Select target with least-progress requests (fairness-based)."""
+        pool = [t for t in self.targets if t.p.id in allowed_ids]
+        if not pool:
+            return None
+        
+        # Calculate score for each target based on queue and our priority
+        # Lower score = better choice
+        best_target = None
+        best_score = float('inf')
+        
+        for target in pool:
+            # Use queue length as proxy for target load
+            queue_len = target.queue_len()
+            
+            # Our request's priority (0=new, 1=complete)
+            our_priority = self.calculate_priority(draft_id)
+            
+            # Fairness score: prioritize less loaded targets for low-progress requests
+            # High-progress requests (priority near 1) get deprioritized
+            score = queue_len * (2 - our_priority)  # Amplify effect for low progress
+            
+            if score < best_score:
+                best_score = score
+                best_target = target
+        
+        return best_target if best_target else pool[0]
 
 class JSQ2Router:
     """Unweighted power-of-two choices sampler."""
@@ -741,9 +988,12 @@ class WeightedJSQ2Router:
         return [t for _, t in keyed[:k]]
 
 ROUTERS = {
+    "random": RandomRouter,
     "round_robin": RoundRobinRouter,
     "jsq2": JSQ2Router,
     "wjsq2": WeightedJSQ2Router,
+    "jiq": JIQRouter,
+    "semi_clairvoyant": SemiClairvoyantRouter,
 }
 
 # ---------- Config I/O & Runner ----------
@@ -991,6 +1241,10 @@ def build(env: simpy.Environment, cfg: Config):
         router = RouterCls(targets, d_choices=int(cfg.router_params.get("d_choices", 2)))
     else:
         router = RouterCls(targets)
+    
+    # Set router reference on targets for JIQ notifications
+    for target in targets:
+        target.router = router
 
     # Validate we have at least one target and one draft
     if not targets:
@@ -1264,6 +1518,10 @@ def main():
         "p50_latency_ms": summary.get("p50_ms", 0),
         "p95_latency_ms": summary.get("p95_ms", 0),
         "p99_latency_ms": summary.get("p99_ms", 0),
+        "rtt_avg_ms": summary.get("rtt_avg_ms", 0),
+        "rtt_p50_ms": summary.get("rtt_p50_ms", 0),
+        "rtt_p95_ms": summary.get("rtt_p95_ms", 0),
+        "rtt_p99_ms": summary.get("rtt_p99_ms", 0),
         "throughput_jobs_s": summary.get("throughput_jobs_s", 0),
         "acceptance_rate": metrics.token_metrics.get_acceptance_rate() if hasattr(metrics, 'token_metrics') else 0,
         "effective_tok_s": metrics.token_metrics.get_effective_tokens_per_second() if hasattr(metrics, 'token_metrics') else 0,
