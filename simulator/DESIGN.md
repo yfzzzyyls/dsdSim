@@ -200,6 +200,26 @@ This document lays out the core components and specifies the auxiliary design fi
    - Generate scenario report (JSON + plots).
    - Emit run manifest (seed, versions, acceptance snapshot) for reproducibility audits.
 
+### 3.3 Event Granularity & Dynamic Adaptation
+
+#### Event Granularity (Iteration-Level vs Request-Level)
+
+- Events are predominantly **iteration-level**, representing single decoding steps (one token), prefill segments, or verification phases rather than whole-request lifetimes.
+- This granularity lets the `Scheduler` finish requests as soon as their final iterations complete, preventing head-of-line blocking inside batches, echoing ORCA’s iteration-oriented design [oai_citation:0‡USENIX](https://www.usenix.org/conference/osdi22/presentation/yu?utm_source=chatgpt.com).
+- Iteration events capture evolving context length, microbatch composition, and device assignments, enabling accurate TTFT/TPOT accounting and queueing delay modeling per token.
+- The simulator may adjust batching, admission, and speculation choices between successive iterations by observing up-to-date system state.
+
+#### Planner Tick Behavior (Dynamic Configuration Adaptation)
+
+- `Planner Tick` events fire on a fixed cadence or when triggers (queue backlog, utilization swings, acceptance degradation) are detected.
+- Each tick, the `Scheduler & Planner` gathers fresh telemetry from cooperating modules:
+  - `Queueing Model` — queue depths, wait times, drop/deferral statistics.
+  - `Device Registry` & parallelism controls — replica utilization, KV/memory headroom.
+  - `Acceptance Estimator` — realized acceptance ratios across drafter tiers and `k` settings.
+  - `Network Model` — observed link latency/bandwidth if distributed execution is active.
+- Candidate configurations span pool sizing (draft vs verify vs fused), tensor/pipeline parallelism, batch/microbatch limits, and speculation knobs (fanout `k`, drafter tier, verification policy).
+- For each candidate, the `Planner` combines recent measurements with LUT projections to forecast TTFT, TPOT, throughput, goodput, tail latency, and resource costs, discarding options that violate scenario constraints.
+- The configuration that best fits the declared optimization targets is applied through the `Scheduler`, `Mode Selector`, and `Parallelism Controller`. In-flight iterations continue under the previous settings; newly scheduled work adopts the updated plan, a strategy aligned with DistServe’s adaptive planning insights [oai_citation:1‡USENIX](https://www.usenix.org/conference/osdi22/presentation/yu?utm_source=chatgpt.com) [oai_citation:2‡USENIX](https://www.usenix.org/system/files/osdi24-zhong-yinmin.pdf?utm_source=chatgpt.com).
 ## 4. Scenario Schema (YAML/JSON)
 
 We define the scenario schema here; `SCENARIO.md` will document it with full examples. High-level structure:
