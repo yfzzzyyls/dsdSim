@@ -4,6 +4,7 @@
 import argparse, random, simpy, yaml, math
 import time
 from collections import deque, defaultdict
+from types import MappingProxyType
 
 # Print SimPy version for debugging
 print(f"SimPy version: {simpy.__version__}", flush=True)
@@ -284,8 +285,11 @@ class TargetServer:
         return self._enqueued_count
 
     def _calculate_batch_latency(self, batch: List[Job]) -> float:
-        """Calculate batch processing time as max of all job latencies.
-        Each job's latency depends on its type and token count."""
+        """Calculate batch processing time with optional VIDUR support."""
+        provider_latency = self._estimate_batch_latency_from_provider(batch)
+        if provider_latency is not None and provider_latency > 0:
+            return provider_latency
+
         max_latency = 0.0
         for job in batch:
             est = self._estimate_job_latency(job)
@@ -326,7 +330,79 @@ class TargetServer:
         )
         metrics = provider.get_metrics(request)
         return metrics.latency_ms if metrics else 0.0
-    
+
+    def _estimate_batch_latency_from_provider(self, batch: List[Job]) -> Optional[float]:
+        provider = getattr(self, "performance", None)
+        if provider is None or not batch:
+            return None
+        phase_groups = {
+            "prefill": [job for job in batch if job.job_type == "prefill"],
+            "decode": [job for job in batch if job.job_type != "prefill"],
+        }
+        latencies = []
+        for phase_name, jobs in phase_groups.items():
+            if not jobs:
+                continue
+            request = self._make_phase_request(phase_name, jobs)
+            if request is None:
+                continue
+            metrics = provider.get_metrics(request)
+            if metrics is None:
+                continue
+            latencies.append(max(0.0, metrics.latency_ms))
+        if latencies:
+            return max(latencies)
+        return None
+
+    def _make_phase_request(self, phase: str, jobs: Sequence[Job]) -> Optional[PhaseRequest]:
+        if not jobs:
+            return None
+        batch_size = len(jobs)
+        token_counts = [max(1, int(j.token_count or 0)) for j in jobs]
+        context_lengths = [max(0, int(j.context_len or 0)) for j in jobs]
+        avg_tokens = sum(token_counts) / batch_size if batch_size else 0.0
+        avg_context = sum(context_lengths) / batch_size if batch_size else 0.0
+        max_tokens = max(token_counts) if token_counts else 0
+        max_context = max(context_lengths) if context_lengths else 0
+
+        seq_length = int(round(avg_tokens if phase == "prefill" else avg_context))
+        if seq_length <= 0:
+            seq_length = max_tokens if phase == "prefill" else max_context
+        seq_length = max(1, seq_length)
+
+        ctx_length = int(round(avg_context)) if avg_context > 0 else max_context
+        ctx_length = max(0, ctx_length)
+
+        prompt_tokens = int(round(avg_tokens)) if phase == "prefill" else None
+
+        metadata = MappingProxyType({
+            "phase": phase,
+            "batch_size": batch_size,
+            "avg_tokens": avg_tokens,
+            "avg_context": avg_context,
+            "max_tokens": max_tokens,
+            "max_context": max_context,
+        })
+
+        return PhaseRequest(
+            phase=phase,
+            model=self.p.model,
+            hardware=self.p.gpu,
+            batch_size=batch_size,
+            microbatch_size=min(batch_size, self.p.batch_size),
+            fanout=self.cfg.gamma if phase != "prefill" else 1,
+            sequence_length=seq_length,
+            tokens_to_generate=max_tokens if phase != "prefill" else 0,
+            context_length=ctx_length,
+            target_id=self.p.id,
+            draft_id=jobs[0].draft_id if jobs and jobs[0].draft_id else None,
+            prompt_tokens=prompt_tokens,
+            context_tokens=ctx_length if ctx_length > 0 else None,
+            tokens_per_request=tuple(token_counts),
+            context_per_request=tuple(context_lengths),
+            extra_metadata=metadata,
+        )
+
     def work_left_score(self) -> float:
         # Better ETA-based scoring
         B = max(1, self.p.batch_size)
