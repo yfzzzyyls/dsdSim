@@ -3,12 +3,16 @@
 
 import argparse, random, simpy, yaml, math
 import time
-from collections import deque
+from collections import deque, defaultdict
 
 # Print SimPy version for debugging
 print(f"SimPy version: {simpy.__version__}", flush=True)
 from dataclasses import dataclass, field, asdict
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Sequence
+
+from performance import PhaseRequest, PerformanceModelConfig, create_performance_provider
+from trace.trace_loader import iter_trace_records
+from trace.types import TraceRecord, TraceParseError
 
 # ---------- Config & Types ----------
 
@@ -90,6 +94,9 @@ class Config:
     scheduler_config: Dict[str, Any] = field(default_factory=dict)  # Scheduler configuration
     devices: List[Dict[str, Any]] = field(default_factory=list)   # list of dicts with role/params
     connections: List[Dict[str, Any]] = field(default_factory=list)  # draft-target connections
+    trace_path: Optional[str] = None
+    trace_defaults: Dict[str, Any] = field(default_factory=dict)
+    performance_model: PerformanceModelConfig = field(default_factory=PerformanceModelConfig)
     workload: WorkloadCfg = field(default_factory=WorkloadCfg)
     burn_in_ms: float = 0.0           # Ignore first X ms for stats
     verbose: bool = True               # Print progress updates
@@ -107,6 +114,8 @@ class Job:
     completion_event: Optional[Any] = None  # SimPy event signaled when job completes
     rtt_start_ms: Optional[float] = None  # When RTT measurement starts (before generation)
     rtt_end_ms: Optional[float] = None    # When RTT measurement ends (after response received)
+    request_id: Optional[str] = None
+    context_len: int = 0
 
 @dataclass
 class TokenMetrics:
@@ -119,11 +128,9 @@ class TokenMetrics:
     
     def get_effective_tokens_per_second(self) -> float:
         """Calculate the ONE metric that matters."""
-        if self.end_time_ms == 0 or self.start_time_ms == 0:
+        if self.end_time_ms <= self.start_time_ms:
             return 0
         duration_s = (self.end_time_ms - self.start_time_ms) / 1000.0
-        if duration_s <= 0:
-            return 0
         return self.total_accepted_tokens / duration_s
     
     def get_acceptance_rate(self) -> float:
@@ -206,11 +213,34 @@ def get_typical_verify_ms(target_config: dict, gamma: int = 4) -> float:
     decode_per_token = target_config.get('decode_latency_per_token', 9.25)
     return gamma * decode_per_token
 
+
+class TraceSchedule:
+    """Distribute trace records across drafts for replay."""
+
+    def __init__(self, records: Sequence[TraceRecord], known_drafts: Sequence[str]):
+        self._by_draft: Dict[str, List[TraceRecord]] = defaultdict(list)
+        self.max_arrival_ms = 0.0
+        known = set(known_drafts)
+        for record in records:
+            draft_id = record.draft_id
+            if draft_id is None:
+                raise TraceParseError("trace playback requires draft_id for each record")
+            if draft_id not in known:
+                raise TraceParseError(f"trace references unknown draft_id '{draft_id}'")
+            self._by_draft[draft_id].append(record)
+            self.max_arrival_ms = max(self.max_arrival_ms, record.arrival_ms)
+        for recs in self._by_draft.values():
+            recs.sort(key=lambda r: r.arrival_ms)
+
+    def for_draft(self, draft_id: str) -> Sequence[TraceRecord]:
+        return list(self._by_draft.get(draft_id, []))
+
 # ---------- Servers ----------
 
 class TargetServer:
     """Continuous-batching-style target: collect for Delta or until B, then serve in fixed time."""
-    def __init__(self, env: simpy.Environment, params: TargetParams, metrics: Metrics, cfg: Config = None, debug: bool = False, router=None):
+    def __init__(self, env: simpy.Environment, params: TargetParams, metrics: Metrics,
+                 performance_provider, cfg: Config = None, debug: bool = False, router=None):
         self.env = env
         self.p = params
         self.cfg = cfg or Config()  # Use default config if not provided
@@ -219,6 +249,7 @@ class TargetServer:
         self.debug = debug
         self.router = router  # Reference to router for JIQ notifications
         self.q = simpy.Store(env)           # FIFO queue of Job
+        self.performance = performance_provider
         
         # CRITICAL FIX: Add Resource to enforce single-server processing
         # This ensures batch collection and processing cannot overlap
@@ -255,20 +286,46 @@ class TargetServer:
     def _calculate_batch_latency(self, batch: List[Job]) -> float:
         """Calculate batch processing time as max of all job latencies.
         Each job's latency depends on its type and token count."""
+        max_latency = 0.0
+        for job in batch:
+            est = self._estimate_job_latency(job)
+            max_latency = max(max_latency, est)
+        if max_latency > 0:
+            return max_latency
+
         if not self.cfg.mixed_batching:
-            # Use uniform latency if not mixing
             return self.p.verify_latency_ms
-        
-        max_latency = 0
+
+        max_latency = 0.0
         for job in batch:
             if job.job_type == "prefill":
-                # Prefill latency = tokens * per-token latency
                 latency = job.token_count * self.p.prefill_latency_per_token
             else:
-                # Decode latency = tokens * per-token latency  
                 latency = job.token_count * self.p.decode_latency_per_token
             max_latency = max(max_latency, latency)
         return max_latency
+
+    def _estimate_job_latency(self, job: Job) -> float:
+        provider = getattr(self, "performance", None)
+        if provider is None:
+            return 0.0
+        phase = "prefill" if job.job_type == "prefill" else "verify"
+        request = PhaseRequest(
+            phase=phase,
+            model=self.p.model,
+            hardware=self.p.gpu,
+            batch_size=1,
+            microbatch_size=1,
+            fanout=max(1, self.cfg.gamma if job.job_type != "prefill" else 1),
+            sequence_length=job.context_len or job.token_count,
+            tokens_to_generate=job.token_count if job.job_type != "prefill" else 0,
+            context_length=job.context_len,
+            request_id=job.request_id,
+            target_id=self.p.id,
+            draft_id=job.draft_id,
+        )
+        metrics = provider.get_metrics(request)
+        return metrics.latency_ms if metrics else 0.0
     
     def work_left_score(self) -> float:
         # Better ETA-based scoring
@@ -427,8 +484,10 @@ class TargetServer:
 
 class DraftServer:
     """Simulates draft model generating chunks and waiting for verification (blocking mode)."""
-    def __init__(self, env: simpy.Environment, params: DraftParams, cfg: Config, 
-                 router, connections: Dict[str, ConnectionParams], total_capability: float = 1.0, metrics: Metrics = None):
+    def __init__(self, env: simpy.Environment, params: DraftParams, cfg: Config,
+                 router, connections: Dict[str, ConnectionParams], total_capability: float = 1.0,
+                 metrics: Metrics = None, trace_records: Optional[Sequence[TraceRecord]] = None,
+                 performance_provider=None):
         self.env = env
         self.p = params
         self.id = params.id
@@ -438,7 +497,11 @@ class DraftServer:
         self.total_capability = total_capability
         self.gamma = cfg.gamma  # tokens per chunk
         self.metrics = metrics  # Reference to global metrics
-        
+        self.performance = performance_provider
+        self._trace_records = list(trace_records) if trace_records else None
+        self._trace_index = 0
+        self._trace_mode = self._trace_records is not None
+
         # Metrics
         self.chunks_sent = 0
         self.total_tokens_generated = 0
@@ -582,40 +645,53 @@ class DraftServer:
             my_share = self.p.capability / self.total_capability
             my_rate = self.cfg.workload.rate_rps * my_share
             gen_info = f", gen_latency={self.p.generation_latency_ms:.0f}ms" if self.p.generation_latency_ms > 0 else ""
-            print(f"[{self.env.now:.1f}ms] Draft {self.id} starting blocking mode (gamma={self.gamma}, rate={my_rate:.1f} req/s{gen_info})", flush=True)
-        
+            mode = "trace replay" if self._trace_mode else "blocking mode"
+            print(
+                f"[{self.env.now:.1f}ms] Draft {self.id} starting {mode} (gamma={self.gamma}, rate={my_rate:.1f} req/s{gen_info})",
+                flush=True,
+            )
+
         conversation_count = 0
-        
+
         while self.env.now < self.cfg.sim_time_ms:
-            # Start a new conversation
+            if self._trace_mode:
+                records = self._trace_records or []
+                if self._trace_index >= len(records):
+                    break
+                record = records[self._trace_index]
+                self._trace_index += 1
+                if record.draft_id and record.draft_id != self.id:
+                    continue  # Skip mismatched records
+                arrival = max(0.0, record.arrival_ms)
+                wait = arrival - self.env.now
+                if wait > 0:
+                    yield self.env.timeout(wait)
+                conversation_start = self.env.now
+                prompt_length = max(1, record.prompt_tokens)
+                answer_length = max(1, record.target_tokens)
+                request_id = record.request_id
+            else:
+                conversation_start = self.env.now
+                prompt_length = self._sample_prompt_length()
+                answer_length = self._sample_answer_length()
+                request_id = None
+
             conversation_count += 1
-            conversation_start = self.env.now
-            
-            # Sample prompt length for this conversation
-            prompt_length = self._sample_prompt_length()
-            
-            # Sample answer length for this conversation
-            answer_length = self._sample_answer_length()
-            
-            # Select target for this entire conversation
+
             target_id, conn = self._select_target()
-            
-            # Track connection usage in metrics
+
             if hasattr(self.metrics, "connection_counts"):
                 self.metrics.connection_counts[(self.id, target_id)] += 1
-            
+
             if self.cfg.debug:
-                print(f"[{self.env.now:.1f}ms] Draft {self.id}: Starting conversation #{conversation_count} "
-                      f"(prompt={prompt_length} tokens, answer={answer_length} tokens) with target {target_id}", flush=True)
-            
-            # Phase 1: Send prefill request to target
-            if self.cfg.debug:
-                print(f"[{self.env.now:.1f}ms] Draft {self.id}: Sending prefill request ({prompt_length} tokens) to target {target_id}", flush=True)
-            
-            # Track RTT start for prefill
+                label = f" req_id={request_id}" if request_id else ""
+                print(
+                    f"[{self.env.now:.1f}ms] Draft {self.id}: Starting conversation #{conversation_count}"
+                    f" (prompt={prompt_length} tokens, answer={answer_length} tokens) with target {target_id}{label}",
+                    flush=True,
+                )
+
             prefill_rtt_start = self.env.now
-            
-            # Create prefill job with completion event
             prefill_completion = self.env.event()
             prefill_job = Job(
                 jid=self.chunks_sent,
@@ -624,7 +700,9 @@ class DraftServer:
                 job_type="prefill",
                 token_count=prompt_length,
                 completion_event=prefill_completion,
-                rtt_start_ms=prefill_rtt_start
+                rtt_start_ms=prefill_rtt_start,
+                request_id=request_id,
+                context_len=prompt_length,
             )
             self.chunks_sent += 1
             
@@ -693,7 +771,9 @@ class DraftServer:
                     job_type="decode",
                     token_count=tokens_this_round,
                     completion_event=decode_completion,
-                    rtt_start_ms=round_start  # Track RTT from start of generation
+                    rtt_start_ms=round_start,  # Track RTT from start of generation
+                    request_id=request_id,
+                    context_len=prompt_length + tokens_generated_in_conversation,
                 )
                 
                 # Send chunk to target (forward latency)
@@ -757,10 +837,10 @@ class DraftServer:
                       f"prompt={prompt_length}, answer={tokens_generated_in_conversation}/{answer_length} tokens, "
                       f"acceptance={conversation_acceptance:.2%}, time={conversation_time:.1f}ms", flush=True)
             
-            # Wait before starting next conversation (inter-arrival time)
-            ia = self._ia()
-            yield self.env.timeout(ia)
-        
+            if not self._trace_mode:
+                ia = self._ia()
+                yield self.env.timeout(ia)
+
         # Final statistics
         if self.chunks_sent > 0:
             acceptance_rate = self.total_tokens_accepted / self.total_tokens_generated
@@ -1157,6 +1237,7 @@ def load_config(path: str) -> Config:
         raw = yaml.safe_load(f) or {}  # safe_load is the secure choice for untrusted YAML
     raw = _expand_auto_topology(raw)  # Expand auto-topology if present
     wl = WorkloadCfg(**(raw.get("workload", {}) or {}))
+    pm = PerformanceModelConfig(**(raw.get("performance_model", {}) or {}))
     cfg = Config(
         sim_time_ms=raw.get("sim_time_ms", 10_000),
         seed=raw.get("seed", 0),
@@ -1178,6 +1259,9 @@ def load_config(path: str) -> Config:
         scheduler_config=raw.get("scheduler", {}),  # Parse scheduler config
         devices=raw.get("devices", []),
         connections=raw.get("connections", []),
+        trace_path=raw.get("trace_path"),
+        trace_defaults=dict(raw.get("trace_defaults", {}) or {}),
+        performance_model=pm,
         workload=wl,
         burn_in_ms=raw.get("burn_in_ms", 0.0),
         verbose=raw.get("verbose", True),
@@ -1200,6 +1284,8 @@ def build(env: simpy.Environment, cfg: Config):
     metrics = Metrics(verbose=cfg.verbose, burn_in_ms=cfg.burn_in_ms)
     targets: List[TargetServer] = []
     drafts: List[DraftServer] = []
+    performance_provider = create_performance_provider(cfg.performance_model)
+    trace_schedule: Optional[TraceSchedule] = None
 
     # Require devices to be specified in config
     if not cfg.devices:
@@ -1229,10 +1315,39 @@ def build(env: simpy.Environment, cfg: Config):
                 prefill_latency_per_token=float(d.get("prefill_latency_per_token", 0.5)),
                 decode_latency_per_token=float(d.get("decode_latency_per_token", 2.5)),
             )
-            targets.append(TargetServer(env, params, metrics, cfg=cfg, debug=cfg.debug))
+            target = TargetServer(
+                env,
+                params,
+                metrics,
+                performance_provider,
+                cfg=cfg,
+                debug=cfg.debug,
+            )
+            targets.append(target)
+            performance_provider.register_target(
+                target_id=params.id,
+                model=params.model,
+                hardware=params.gpu,
+                prefill_per_token_ms=params.prefill_latency_per_token,
+                decode_per_token_ms=params.decode_latency_per_token,
+            )
         elif role == "draft":
             # Store draft configs for later processing
             draft_configs.append(d)
+
+    if cfg.trace_path:
+        records = list(iter_trace_records(cfg.trace_path, defaults=cfg.trace_defaults))
+        draft_ids = [d.get("id") for d in draft_configs]
+        if not all(isinstance(x, str) for x in draft_ids):
+            raise ValueError("All draft devices must have an 'id' when replaying traces")
+        trace_schedule = TraceSchedule(records, [x for x in draft_ids if isinstance(x, str)])
+        if trace_schedule.max_arrival_ms > cfg.sim_time_ms:
+            cfg.sim_time_ms = max(cfg.sim_time_ms, trace_schedule.max_arrival_ms + 5_000)
+        if cfg.verbose:
+            print(
+                f"Loaded trace with {len(records)} records (max arrival {trace_schedule.max_arrival_ms:.1f}ms)",
+                flush=True,
+            )
 
     RouterCls = ROUTERS.get(cfg.router, RoundRobinRouter)
     if RouterCls == WeightedJSQ2Router:
@@ -1291,22 +1406,43 @@ def build(env: simpy.Environment, cfg: Config):
         if not draft_connections:
             print(f"Warning: Draft {d['id']} has no connections configured", flush=True)
         
-        drafts.append(DraftServer(env, params, cfg, router, draft_connections, total_capability, metrics))
+        trace_records = trace_schedule.for_draft(d["id"]) if trace_schedule else None
+        drafts.append(
+            DraftServer(
+                env,
+                params,
+                cfg,
+                router,
+                draft_connections,
+                total_capability,
+                metrics,
+                trace_records=trace_records,
+                performance_provider=performance_provider,
+            )
+        )
 
     # Start heartbeat monitor
     if cfg.verbose:
         env.process(heartbeat_monitor(env, metrics, targets, cfg))
     
-    return metrics, targets, drafts
+    return metrics, targets, drafts, performance_provider
 
 def run(cfg: Config):
     env = simpy.Environment()
     result = build(env, cfg)
-    if isinstance(result, tuple) and len(result) == 3:
-        metrics, targets, drafts = result
-    elif isinstance(result, tuple) and len(result) == 2:
-        metrics, targets = result
-        drafts = []
+    perf_provider = None
+    if isinstance(result, tuple):
+        if len(result) == 4:
+            metrics, targets, drafts, perf_provider = result
+        elif len(result) == 3:
+            metrics, targets, drafts = result
+        elif len(result) == 2:
+            metrics, targets = result
+            drafts = []
+        else:
+            metrics = result
+            targets = []
+            drafts = []
     else:
         metrics = result
         targets = []
@@ -1369,6 +1505,12 @@ def run(cfg: Config):
     
     # Finalize token metrics
     metrics.token_metrics.end_time_ms = env.now
+    if perf_provider is not None:
+        try:
+            perf_provider.flush()
+        except Exception as exc:  # pragma: no cover - flushing should not break the run
+            if cfg.verbose:
+                print(f"Warning: failed to flush performance provider cache: {exc}", flush=True)
     
     if cfg.verbose:
         print(f"\nSimulation complete in {elapsed_real_time:.2f}s real time")

@@ -1,0 +1,10 @@
+{"arrival_ms": 0, "draft_id": "d00", "prompt_tokens": 80, "target_tokens": 160}
+{"arrival_ms": 10, "draft_id": "d01", "prompt_tokens": 64, "target_tokens": 128}
+{"arrival_ms": 20, "draft_id": "d02", "prompt_tokens": 96, "target_tokens": 192}
+{"arrival_ms": 30, "draft_id": "d03", "prompt_tokens": 72, "target_tokens": 160}
+{"arrival_ms": 40, "draft_id": "d04", "prompt_tokens": 48, "target_tokens": 96}
+{"arrival_ms": 50, "draft_id": "d05", "prompt_tokens": 88, "target_tokens": 176}
+{"arrival_ms": 60, "draft_id": "d06", "prompt_tokens": 56, "target_tokens": 120}
+{"arrival_ms": 70, "draft_id": "d07", "prompt_tokens": 64, "target_tokens": 144}
+{"arrival_ms": 80, "draft_id": "d08", "prompt_tokens": 90, "target_tokens": 200}
+{"arrival_ms": 90, "draft_id": "d09", "prompt_tokens": 70, "target_tokens": 150}
