@@ -1,115 +1,159 @@
-# BASELINE CONFIGURATION FOR SCHEDULER EXPERIMENTS
-# This config serves as the baseline for all scheduler comparisons
-# To run experiments, modify the 'scheduler' section below
+# Next-generation baseline configuration for heterogeneous speculative decoding experiments.
+# - 100 target servers spanning four capability tiers
+# - 300 drafts grouped in four capability buckets with distinct generation latencies
+# - Rich connectivity matrix capturing affinity, fanout limits, and network jitter
+# - Designed to exercise VIDUR lookups and future acceptance predictors
 
-sim_time_ms: 60000  # 60 seconds
-burn_in_ms: 1000    # 1 second warmup
+sim_time_ms: 90000                 # 90 seconds wall-clock to capture steady-state behaviour
+burn_in_ms: 5000                   # Ignore first 5s while queues warm up
+seed: 31415                        # Deterministic reproducibility
 verbose: true
 debug: false
-seed: 73            # Change for multiple runs: 42, 123, 456
 
-execution_mode: blocking
-gamma: 4
-answer_length: 200  # Fallback if distribution is disabled
-use_answer_distribution: true  # Enable normal distribution for answer length
-answer_length_mean: 400       # Mean of ~400 tokens
-answer_length_std: 100        # Standard deviation
-answer_length_min: 50         # Minimum answer length
-answer_length_max: 800        # Maximum answer length
-prompt_length_min: 10
-prompt_length_max: 200
+execution_mode: speculative        # Enable speculative draft/verify flow
+gamma: 4                            # Draft chunk size (tokens per speculation round)
+
+# Conversation mix — used when generating synthetic traces or running without a replay file.
+answer_length_mean: 540
+answer_length_std: 160
+answer_length_min: 120
+answer_length_max: 1024
+use_answer_distribution: true
+prompt_length_min: 48
+prompt_length_max: 640
 prompt_scale_by_capability: true
-mixed_batching: true
+mixed_batching: true               # Allow prefill/decode co-resident in a batch
 
-# SCHEDULER CONFIGURATION - Change this for experiments
+router: semi_clairvoyant
+router_params:
+  d_choices: 4                     # Used by JSQ-family routers; ignored by semi-clairvoyant
+
 scheduler:
-  type: baseline                    # Options: baseline, decode_first, two_lane, etc.
-  max_prefills_per_batch: null      # null=unlimited, 0=decode-only, 1=one prefill
-  prefill_chunk_tokens: 0           # 0=no chunking, 32/64=chunk size
-  adaptive_window: false             # Enable adaptive batch window
-  two_lane: false                    # Enable two-lane scheduling
-  prefill_share: 0.25               # Share of time for prefills (if two_lane=true)
+  type: decode_first               # Baseline with decode-first bias for mixed batches
+  max_prefills_per_batch: 2        # Allow limited prefills alongside decodes
+  adaptive_window: true            # Dynamically widen/narrow batch window via observed latency
+  prefill_chunk_tokens: 128        # Chunk long prompts to reduce head-of-line blocking
+  two_lane: true                   # Two-lane scheduling with separate queues
+  prefill_share: 0.35              # Reserve 35% server time for prefills when two_lane=true
 
-router: semi_clairvoyant    # Options: random, round_robin, jsq2, wjsq2, jiq, semi_clairvoyant
-router_params: 
-  d_choices: 2   # For jsq2/wjsq2: number of targets to sample
+performance_model:
+  type: vidur
+  vidur:
+    table_path: data/vidur/lut_cluster_v1.parquet   # Placeholder; supply real LUT bundle
+    default_latency_ms: 42.0
+    neighbors: 5
+    prefer_exact: false
+    bootstrap_defaults: true
+
+# Optional trace replay (comment out to run synthetic workload). Defaults are merged into entries.
+trace_path: null
+trace_defaults:
+  slo_class: standard
+  mode_hint: auto
 
 workload:
   arrival: poisson
-  rate_rps: 450    # Tune to keep per-target utilization ~70%
+  rate_rps: 220.0                   # High-rate workload to exercise resource contention
 
 auto_topology:
   targets:
-    count: 20
+    count: 100
     tiers:
-      - name: premium        # H100 / large model (datacenter)
-        ratio: 0.20          # 4 targets
+      - name: apex
+        ratio: 0.20                  # 20 H100/H200-class racks
         model: llama-70b
         gpu: H100
-        weight: 1.6
-        batch_window_ms: 5.0
-        batch_size: 16       # 70B memory limits
-        prefill_latency_per_token: 0.38
-        decode_latency_per_token: 1.55
-
-      - name: standard       # A100 / mid model (regional DC)
-        ratio: 0.40          # 8 targets
-        model: llama-13b
+        weight: 1.5
+        batch_window_ms: 3.5
+        batch_size: 40
+        prefill_latency_per_token: 0.26
+        decode_latency_per_token: 0.94
+        energy_per_token_mj: 0.018
+      - name: core
+        ratio: 0.30                  # 30 A100-class racks
+        model: llama-34b
         gpu: A100
-        weight: 1.2
-        batch_window_ms: 6.0
-        batch_size: 32
-        prefill_latency_per_token: 0.45
-        decode_latency_per_token: 1.80
-
-      - name: edge           # L4 / small model (edge PoP)
-        ratio: 0.40          # 8 targets
-        model: llama-8b
-        gpu: L4
-        weight: 0.8
-        batch_window_ms: 8.0
+        weight: 1.15
+        batch_window_ms: 4.5
         batch_size: 48
-        prefill_latency_per_token: 0.55
-        decode_latency_per_token: 2.60
+        prefill_latency_per_token: 0.38
+        decode_latency_per_token: 1.25
+        energy_per_token_mj: 0.022
+      - name: regional
+        ratio: 0.30                  # 30 L40-class regional POPs
+        model: llama-13b
+        gpu: L40
+        weight: 0.85
+        batch_window_ms: 6.0
+        batch_size: 56
+        prefill_latency_per_token: 0.68
+        decode_latency_per_token: 2.05
+        energy_per_token_mj: 0.031
+      - name: edge
+        ratio: 0.20                  # 20 A10-class edge deployments
+        model: llama-7b
+        gpu: A10
+        weight: 0.55
+        batch_window_ms: 7.5
+        batch_size: 64
+        prefill_latency_per_token: 0.92
+        decode_latency_per_token: 2.85
+        energy_per_token_mj: 0.044
 
   drafts:
-    count: 100
-    # Three speed buckets for γ-token generation latency (ms)
+    count: 300
     gens_ms_per_gamma:
-      - [10, 30]     # datacenter proximity (fast)
-      - [30, 60]     # edge/CDN (medium)
-      - [60, 120]    # user devices (slow)
+      - [5, 14]                     # Bucket 0: datacenter-resident drafts
+      - [15, 36]                    # Bucket 1: regional GPU pods
+      - [40, 86]                    # Bucket 2: enterprise / high-end laptops
+      - [90, 210]                   # Bucket 3: consumer mobile/edge
     capability_map:
-      0: 2.0  # datacenter drafts have high capability
-      1: 1.0  # edge drafts have medium capability
-      2: 0.6  # user drafts have low capability
-    # Label the buckets for affinity rules
-    draft_bucket_labels: ["datacenter", "edge", "user"]
+      0: 3.4
+      1: 2.1
+      2: 1.2
+      3: 0.65
+    draft_bucket_labels: [dc_fast, regional_gpu, enterprise, mobile]
+    reliability:
+      dc_fast: 0.995
+      regional_gpu: 0.985
+      enterprise: 0.970
+      mobile: 0.940
 
   connectivity:
-    # Base fanout (can be overridden per tier)
-    fanout_per_draft: 3
-    
-    # Fanout overrides by draft tier
+    fanout_per_draft: 5
     fanout_override:
-      datacenter: 20      # Fully connected to all 20 targets
-      edge: 3            # Limited connections
-      user: 2            # Exactly 2 nearby L4s
-    
-    # Affinity rules: which draft tiers can connect to which target tiers
+      enterprise: 4
+      mobile: 3
     affinity_rules:
-      datacenter: [premium, standard, edge]    # Can hit any tier
-      edge:       [standard, edge]             # No premium/H100
-      user:       [edge]                       # L4 only
-    
-    # Network latency ranges by target tier (ms) with ±20% jitter
+      dc_fast: [apex, core]
+      regional_gpu: [apex, core, regional]
+      enterprise: [core, regional]
+      mobile: [regional, edge]
     net_ms_ranges:
-      premium:  [5, 15]    # H100 DC links (fast)
-      standard: [18, 28]   # A100 regional (medium)
-      edge:     [15, 45]   # L4 last-mile/PoP (variable)
-    
-    # Acceptance rate matrix: (draft speed bucket → target tier)
+      apex: [1.5, 4.0]
+      core: [4.0, 9.0]
+      regional: [12.0, 28.0]
+      edge: [24.0, 55.0]
     acceptance_by_tier:
-      0: { premium: 0.86, standard: 0.84, edge: 0.80 }  # datacenter drafts
-      1: { premium: 0.83, standard: 0.80, edge: 0.75 }  # edge drafts
-      2: { premium: 0.78, standard: 0.73, edge: 0.70 }  # user devices
+      "dc_fast":    {apex: 0.93, core: 0.91}
+      "regional_gpu": {apex: 0.90, core: 0.88, regional: 0.82}
+      "enterprise":  {core: 0.82, regional: 0.76}
+      "mobile":      {regional: 0.69, edge: 0.61}
+    link_jitter_pct: 0.20            # Uniform ±20% jitter applied to sampled latencies
+    drop_rate:
+      enterprise: 0.005
+      mobile: 0.012
+
+# Additional knobs for synthetic trace generation (used by simulator/trace/generate_trace.py)
+synthetic_trace_defaults:
+  request_prefix: simreq
+  attach_device_tier: true
+  slo_budget_ms:
+    premium: 1800
+    standard: 2400
+    relaxed: 3200
+
+# Acceptance predictor placeholder configuration (future integration point).
+acceptance_model:
+  type: fallback                     # When implemented, switch to "vidur_lut" or "specpp"
+  fallback_rate: 0.78                # Used until the acceptance estimator is wired in
