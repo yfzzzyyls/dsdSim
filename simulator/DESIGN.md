@@ -158,6 +158,11 @@ This document lays out the core components and specifies the auxiliary design fi
 | Planner Tick Event | Event Engine, Planner, Scheduler, LUT Manager, Mode Selector |
 | Logging / Finalization | Metrics Reporter, Reproducibility Log, Queueing Model, Device Registry, Acceptance Estimator |
 
+## TODO
+- Replace the FIFO event queues with a priority queue abstraction to capture SLO-aware arrivals, preemption, and cancellation heuristics.
+- Model GPU resource pools explicitly (streaming multiprocessors, HBM, KV bandwidth) so batching and VIDUR-driven latencies respect resource contention instead of a single-server approximation.
+- Revisit the SimPy kernel choice (PriorityResource, ProcessPool, or an internal dispatcher) once VIDUR integration stabilises to support multi-server targets and GPU sharing semantics.
+
 ### 3.2 Event-Driven Loop (Implementation Notes)
 
 1. **Initialization**
