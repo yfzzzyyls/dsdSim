@@ -1,0 +1,35 @@
+experiment:
+  name: scheduler_search
+  description: "Small sweep over routing and batching knobs on the disaggregated topology."
+  runs:
+    - name: random_fifo
+      config: ../../configs/explorer/baseline.yaml
+      overrides:
+        router: random
+    - name: round_robin_fifo
+      config: ../../configs/explorer/baseline.yaml
+      overrides:
+        router: round_robin
+    - name: wjsq2_delay50us
+      config: ../../configs/explorer/baseline.yaml
+      overrides:
+        router: wjsq2
+        router_params:
+          d_choices: 2
+        scheduler:
+          decode:
+            max_wait_ms: 0.05
+          prefill:
+            max_wait_ms: 0.05
+    - name: wjsq2_delay100us_chunked
+      config: ../../configs/explorer/baseline.yaml
+      overrides:
+        router: wjsq2
+        router_params:
+          d_choices: 2
+        scheduler:
+          decode:
+            max_wait_ms: 0.10
+          prefill:
+            max_wait_ms: 0.10
+            chunk_tokens: 64

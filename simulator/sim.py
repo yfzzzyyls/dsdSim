@@ -1,15 +1,16 @@
 # sim.py v1 minimal distributed speculative-decoding simulator
 # deps: pip install simpy pyyaml
 
-import argparse, random, simpy, yaml, math
+import argparse, random, simpy, yaml, math, json
 import time
 from collections import deque, defaultdict
 from types import MappingProxyType
+from pathlib import Path
 
 # Print SimPy version for debugging
 print(f"SimPy version: {simpy.__version__}", flush=True)
 from dataclasses import dataclass, field, asdict
-from typing import List, Optional, Dict, Any, Sequence
+from typing import List, Optional, Dict, Any, Sequence, Iterable, Tuple, Mapping
 
 from performance import PhaseRequest, PerformanceModelConfig, create_performance_provider
 from trace.trace_loader import iter_trace_records
@@ -28,6 +29,8 @@ class TargetParams:
     verify_latency_ms: float = 8.0    # fixed service time per batch (legacy, for non-mixed mode)
     prefill_latency_per_token: float = 0.5  # ms per token for prefill requests
     decode_latency_per_token: float = 2.5   # ms per token for decode requests
+    cluster: str = "default"
+    kv_capacity_tokens: Optional[int] = None
 
 @dataclass
 class DraftParams:
@@ -36,6 +39,7 @@ class DraftParams:
     generation_latency_ms: float = 0.0  # time to generate gamma tokens (0 = instant)
     burst_factor: float = 1.0         # short-term burst multiplier
     reliability: float = 0.99         # connection reliability (0-1)
+    cluster: str = "default"
 
 @dataclass
 class ConnectionParams:
@@ -44,6 +48,7 @@ class ConnectionParams:
     forward_latency_ms: float         # draft -> target latency
     response_latency_ms: float        # target -> draft latency
     acceptance_rate: float            # probability each token is accepted
+    cluster: str = "default"
 
 @dataclass
 class DraftChunk:
@@ -68,6 +73,14 @@ class WorkloadCfg:
     arrival: str = "deterministic"    # "deterministic" | "poisson"
     interarrival_ms: float = 12.0     # used if deterministic
     rate_rps: float = 100.0           # used if poisson: mean rate
+
+@dataclass
+class ThinkTimeConfig:
+    enabled: bool = True
+    distribution: str = "workload"  # workload | exponential | lognormal | constant
+    mean_ms: float = 2000.0
+    cv: float = 0.5                   # coefficient of variation for lognormal
+    min_ms: float = 0.0
 
 @dataclass
 class Config:
@@ -95,10 +108,15 @@ class Config:
     scheduler_config: Dict[str, Any] = field(default_factory=dict)  # Scheduler configuration
     devices: List[Dict[str, Any]] = field(default_factory=list)   # list of dicts with role/params
     connections: List[Dict[str, Any]] = field(default_factory=list)  # draft-target connections
+    cluster_router: Dict[str, str] = field(default_factory=dict)
+    cluster_router_params: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    global_router: Optional[str] = None
+    global_router_params: Dict[str, Any] = field(default_factory=dict)
     trace_path: Optional[str] = None
     trace_defaults: Dict[str, Any] = field(default_factory=dict)
     performance_model: PerformanceModelConfig = field(default_factory=PerformanceModelConfig)
     workload: WorkloadCfg = field(default_factory=WorkloadCfg)
+    think_time: ThinkTimeConfig = field(default_factory=ThinkTimeConfig)
     burn_in_ms: float = 0.0           # Ignore first X ms for stats
     verbose: bool = True               # Print progress updates
     debug: bool = False                # Print detailed batch formation
@@ -117,6 +135,32 @@ class Job:
     rtt_end_ms: Optional[float] = None    # When RTT measurement ends (after response received)
     request_id: Optional[str] = None
     context_len: int = 0
+    target_id: Optional[str] = None
+    priority_class: str = "standard"
+    priority: int = 100
+    kv_tokens: int = 0
+    phase: str = "decode"
+    chunk_index: int = 0
+    chunk_count: int = 1
+    chunk_barrier: Optional["ChunkBarrier"] = None
+    parallelism_plan: Dict[str, Any] = field(default_factory=dict)
+    retry_count: int = 0
+
+
+class ChunkBarrier:
+    """Barrier that triggers a final event after a set number of chunk completions."""
+
+    def __init__(self, env: simpy.Environment, chunk_count: int, final_event: Optional[Any]) -> None:
+        self.env = env
+        self.remaining = max(0, chunk_count)
+        self.final_event = final_event
+
+    def notify(self) -> None:
+        if self.remaining <= 0:
+            return
+        self.remaining -= 1
+        if self.remaining == 0 and self.final_event is not None and not self.final_event.triggered:
+            self.final_event.succeed()
 
 @dataclass
 class TokenMetrics:
@@ -241,9 +285,11 @@ class TraceSchedule:
 class TargetServer:
     """Continuous-batching-style target: collect for Delta or until B, then serve in fixed time."""
     def __init__(self, env: simpy.Environment, params: TargetParams, metrics: Metrics,
-                 performance_provider, cfg: Config = None, debug: bool = False, router=None):
+                 performance_provider, cfg: Config = None, debug: bool = False, router=None,
+                 kv_manager: Optional["KVManager"] = None):
         self.env = env
         self.p = params
+        self.cluster = params.cluster
         self.cfg = cfg or Config()  # Use default config if not provided
         self.scheduler_config = self.cfg.scheduler_config  # Get scheduler config
         self.metrics = metrics
@@ -251,6 +297,8 @@ class TargetServer:
         self.router = router  # Reference to router for JIQ notifications
         self.q = simpy.Store(env)           # FIFO queue of Job
         self.performance = performance_provider
+        self.kv_manager = kv_manager
+        self.kv_capacity_tokens = getattr(params, "kv_capacity_tokens", None)
         
         # CRITICAL FIX: Add Resource to enforce single-server processing
         # This ensures batch collection and processing cannot overlap
@@ -546,10 +594,14 @@ class TargetServer:
                 tdone = self.env.now
                 for j in batch:
                     j.finished_ms = tdone
+                    if self.kv_manager:
+                        self.kv_manager.release(self.p.id, max(0, j.kv_tokens))
                     self.metrics.add(j)
                     # Signal completion to waiting draft
                     if j.completion_event and not j.completion_event.triggered:
                         j.completion_event.succeed()
+                    if j.chunk_barrier is not None:
+                        j.chunk_barrier.notify()
                 
                 # JIQ: Mark as idle if queue is empty after processing
                 if self.router and hasattr(self.router, 'mark_idle'):
@@ -561,15 +613,20 @@ class TargetServer:
 class DraftServer:
     """Simulates draft model generating chunks and waiting for verification (blocking mode)."""
     def __init__(self, env: simpy.Environment, params: DraftParams, cfg: Config,
-                 router, connections: Dict[str, ConnectionParams], total_capability: float = 1.0,
-                 metrics: Metrics = None, trace_records: Optional[Sequence[TraceRecord]] = None,
+                 router, global_router=None, target_lookup: Optional[Dict[str, TargetServer]] = None,
+                 connections: Dict[str, ConnectionParams] = None, total_capability: float = 1.0,
+                 metrics: Metrics = None, scheduler: Optional["Scheduler"] = None,
+                 trace_records: Optional[Sequence[TraceRecord]] = None,
                  performance_provider=None):
         self.env = env
         self.p = params
         self.id = params.id
+        self.cluster = params.cluster
         self.cfg = cfg
         self.router = router
-        self.connections = connections  # Map of target_id -> ConnectionParams
+        self.global_router = global_router
+        self._target_lookup = target_lookup or {}
+        self.connections = connections or {}  # Map of target_id -> ConnectionParams
         self.total_capability = total_capability
         self.gamma = cfg.gamma  # tokens per chunk
         self.metrics = metrics  # Reference to global metrics
@@ -577,6 +634,12 @@ class DraftServer:
         self._trace_records = list(trace_records) if trace_records else None
         self._trace_index = 0
         self._trace_mode = self._trace_records is not None
+        self.scheduler = scheduler
+
+        self._think_enabled = self.cfg.think_time.enabled
+        self._next_available_ms = self.env.now
+        if not self._trace_mode and self._think_enabled:
+            self._next_available_ms = self.env.now + self._sample_think_time()
 
         # Metrics
         self.chunks_sent = 0
@@ -599,7 +662,35 @@ class DraftServer:
         # default deterministic - also capability-weighted
         base_ia = self.cfg.workload.interarrival_ms
         return base_ia * self.total_capability / self.p.capability
-    
+
+    def _sample_think_time(self) -> float:
+        cfg = self.cfg.think_time
+        if not cfg.enabled:
+            return 0.0
+        dist = (cfg.distribution or "workload").lower()
+        if dist == "workload":
+            return max(0.0, self._ia())
+        if dist == "exponential":
+            mean = max(cfg.mean_ms, 1e-6)
+            return max(cfg.min_ms, random.expovariate(1.0 / mean))
+        if dist == "constant":
+            return max(cfg.min_ms, cfg.mean_ms)
+        if dist == "lognormal":
+            mean = max(cfg.mean_ms, 1e-6)
+            cv = max(cfg.cv, 1e-6)
+            sigma = math.sqrt(math.log(1.0 + cv * cv))
+            mu = math.log(mean) - 0.5 * sigma * sigma
+            value = random.lognormvariate(mu, sigma)
+            return max(cfg.min_ms, value)
+        raise ValueError(f"Unsupported think-time distribution: {cfg.distribution}")
+
+    def _schedule_next_arrival(self, reference_ms: float) -> None:
+        if not self._think_enabled:
+            self._next_available_ms = reference_ms
+            return
+        wait = self._sample_think_time()
+        self._next_available_ms = reference_ms + wait
+
     def _select_target(self) -> tuple[str, ConnectionParams]:
         """Select a target among only those this draft can reach (connection-aware).
         
@@ -612,6 +703,14 @@ class DraftServer:
         allowed_ids = set(self.connections.keys())
         if not allowed_ids:
             raise ValueError(f"Draft {self.id} has no connections configured")
+
+        # Try global router first for cross-cluster awareness
+        if self.global_router is not None:
+            global_choice = self.global_router.choose(self.id, allowed_ids)
+            if global_choice is not None:
+                target_id = global_choice.p.id
+                if target_id in self.connections:
+                    return target_id, self.connections[target_id]
 
         # Candidate pool restricted to allowed targets present in the router
         pool = [t for t in getattr(self.router, 'targets', []) if t.p.id in allowed_ids]
@@ -728,25 +827,35 @@ class DraftServer:
             )
 
         conversation_count = 0
+        records = self._trace_records or []
 
         while self.env.now < self.cfg.sim_time_ms:
+            trace_record: Optional[TraceRecord] = None
             if self._trace_mode:
-                records = self._trace_records or []
                 if self._trace_index >= len(records):
                     break
                 record = records[self._trace_index]
                 self._trace_index += 1
                 if record.draft_id and record.draft_id != self.id:
                     continue  # Skip mismatched records
-                arrival = max(0.0, record.arrival_ms)
-                wait = arrival - self.env.now
-                if wait > 0:
-                    yield self.env.timeout(wait)
+                scheduled = max(0.0, record.arrival_ms)
+                if self._think_enabled:
+                    scheduled = max(scheduled, self._next_available_ms)
+                if scheduled > self.env.now:
+                    yield self.env.timeout(scheduled - self.env.now)
+                if self._think_enabled:
+                    self._next_available_ms = self.env.now
                 conversation_start = self.env.now
                 prompt_length = max(1, record.prompt_tokens)
                 answer_length = max(1, record.target_tokens)
                 request_id = record.request_id
+                trace_record = record
             else:
+                if self._think_enabled:
+                    scheduled = max(self._next_available_ms, self.env.now)
+                    if scheduled > self.env.now:
+                        yield self.env.timeout(scheduled - self.env.now)
+                    self._next_available_ms = self.env.now
                 conversation_start = self.env.now
                 prompt_length = self._sample_prompt_length()
                 answer_length = self._sample_answer_length()
@@ -767,6 +876,13 @@ class DraftServer:
                     flush=True,
                 )
 
+            priority_class = trace_record.slo_class if trace_record is not None else None
+            if not priority_class:
+                priority_class = (self.cfg.trace_defaults or {}).get("slo_class")
+            if not priority_class and self.scheduler is not None:
+                priority_class = self.scheduler.default_priority_class
+            priority_class = priority_class or "standard"
+
             prefill_rtt_start = self.env.now
             prefill_completion = self.env.event()
             prefill_job = Job(
@@ -779,65 +895,66 @@ class DraftServer:
                 rtt_start_ms=prefill_rtt_start,
                 request_id=request_id,
                 context_len=prompt_length,
+                target_id=target_id,
+                priority_class=priority_class,
+                phase="prefill",
             )
             self.chunks_sent += 1
-            
+
             # Send prefill request to target
             yield self.env.timeout(conn.forward_latency_ms)
             prefill_job.created_ms = self.env.now
-            
-            # Enqueue prefill job at target
-            target_server = None
-            for target in self.router.targets:
-                if target.p.id == target_id:
-                    target_server = target
-                    target.enqueue(prefill_job)
-                    break
-            
-            if not target_server:
-                print(f"Warning: Target {target_id} not found for draft {self.id}", flush=True)
-                continue
-            
+
+            if self.scheduler is None:
+                target_server = self._target_lookup.get(target_id)
+                if target_server is None:
+                    print(f"Warning: Target {target_id} not found for draft {self.id}", flush=True)
+                    continue
+                target_server.enqueue(prefill_job)
+                wait_event = prefill_completion
+            else:
+                wait_event = self.scheduler.submit_job(prefill_job)
+
             # Wait for actual job completion instead of synthetic sleep
-            yield prefill_completion
-            
+            yield wait_event
+
             # Wait for response to travel back
             yield self.env.timeout(conn.response_latency_ms)
-            
+
             # Mark RTT end for prefill
             prefill_job.rtt_end_ms = self.env.now
-            
+
             if self.cfg.debug:
                 print(f"[{self.env.now:.1f}ms] Draft {self.id}: Prefill completed for {prompt_length} tokens", flush=True)
-            
+
             # Phase 2: Generate answer with multiple speculation rounds
             rounds_needed = (answer_length + self.gamma - 1) // self.gamma  # ceiling division
             tokens_generated_in_conversation = 0
             tokens_accepted_in_conversation = 0
-            
+
             # Initialize progress for Semi-Clairvoyant router
             if hasattr(self.router, 'update_progress'):
                 self.router.update_progress(self.id, 0, 0, answer_length)
-            
+
             for round_num in range(rounds_needed):
                 round_start = self.env.now
-                
+
                 # Determine how many tokens to generate in this round
                 tokens_remaining = answer_length - tokens_generated_in_conversation
                 tokens_this_round = min(self.gamma, tokens_remaining)
-                
+
                 # Generate draft tokens (takes time on edge device!)
                 if self.p.generation_latency_ms > 0:
                     yield self.env.timeout(self.p.generation_latency_ms)
-                
+
                 self.chunks_sent += 1
                 self.total_tokens_generated += tokens_this_round
                 tokens_generated_in_conversation += tokens_this_round
-                
+
                 if self.cfg.debug:
                     print(f"[{self.env.now:.1f}ms] Draft {self.id}: Round {round_num+1}/{rounds_needed} - "
                           f"Generated {tokens_this_round} tokens for target {target_id}", flush=True)
-                
+
                 # Create a decode job with completion event
                 decode_completion = self.env.event()
                 job = Job(
@@ -847,75 +964,79 @@ class DraftServer:
                     job_type="decode",
                     token_count=tokens_this_round,
                     completion_event=decode_completion,
-                    rtt_start_ms=round_start,  # Track RTT from start of generation
+                    rtt_start_ms=round_start,
                     request_id=request_id,
                     context_len=prompt_length + tokens_generated_in_conversation,
+                    target_id=target_id,
+                    priority_class=priority_class,
+                    phase="decode",
                 )
-                
+
                 # Send chunk to target (forward latency)
                 yield self.env.timeout(conn.forward_latency_ms)
-                
+
                 # Job arrives at target after network delay
                 job.created_ms = self.env.now
-                
-                # Find the target server and enqueue the job
-                target_server = None
-                for target in self.router.targets:
-                    if target.p.id == target_id:
-                        target_server = target
-                        target.enqueue(job)
+
+                if self.scheduler is None:
+                    target_server = self._target_lookup.get(target_id)
+                    if target_server is None:
+                        print(f"Warning: Target {target_id} not found for draft {self.id}", flush=True)
                         break
-                
-                if not target_server:
-                    print(f"Warning: Target {target_id} not found for draft {self.id}", flush=True)
-                    break
-                
+                    target_server.enqueue(job)
+                    wait_event = decode_completion
+                else:
+                    wait_event = self.scheduler.submit_job(job)
+
                 # Wait for actual job completion instead of synthetic sleep
-                yield decode_completion
-                
+                yield wait_event
+
                 # Wait for response to travel back
                 yield self.env.timeout(conn.response_latency_ms)
-                
+
                 # Mark RTT end after response received
                 job.rtt_end_ms = self.env.now
-                
+
                 # Simulate verification result
                 result = self._simulate_verification(tokens_this_round, conn.acceptance_rate)
                 self.total_tokens_accepted += result.accepted_tokens
                 self.total_tokens_rejected += result.rejected_tokens
                 tokens_accepted_in_conversation += result.accepted_tokens
-                
+
                 # Update progress for Semi-Clairvoyant router with actual acceptance
                 if hasattr(self.router, 'update_progress'):
-                    self.router.update_progress(self.id, tokens_generated_in_conversation, 
+                    self.router.update_progress(self.id, tokens_generated_in_conversation,
                                                tokens_accepted_in_conversation, answer_length)
-                
+
                 # Update global token metrics (only count after burn-in)
                 if self.env.now >= self.cfg.burn_in_ms:
                     self.metrics.token_metrics.total_generated_tokens += tokens_this_round
                     self.metrics.token_metrics.total_accepted_tokens += result.accepted_tokens
                     self.metrics.token_metrics.total_rejected_tokens += result.rejected_tokens
-                
+
                 # Calculate round-trip time
                 rtt = self.env.now - round_start
                 self.total_round_trip_time += rtt
-                
+
                 if self.cfg.debug:
                     print(f"[{self.env.now:.1f}ms] Draft {self.id}: Round {round_num+1} result: "
                           f"{result.accepted_tokens}/{tokens_this_round} accepted, RTT={rtt:.1f}ms", flush=True)
-            
+
             # Conversation completed
             conversation_time = self.env.now - conversation_start
             conversation_acceptance = tokens_accepted_in_conversation / tokens_generated_in_conversation if tokens_generated_in_conversation > 0 else 0
-            
+
             if self.cfg.verbose or self.cfg.debug:
                 print(f"[{self.env.now:.1f}ms] Draft {self.id}: Conversation #{conversation_count} completed - "
                       f"prompt={prompt_length}, answer={tokens_generated_in_conversation}/{answer_length} tokens, "
                       f"acceptance={conversation_acceptance:.2%}, time={conversation_time:.1f}ms", flush=True)
-            
-            if not self._trace_mode:
+
+            if self._think_enabled:
+                self._schedule_next_arrival(self.env.now)
+            elif not self._trace_mode:
                 ia = self._ia()
-                yield self.env.timeout(ia)
+                if ia > 0:
+                    yield self.env.timeout(ia)
 
         # Final statistics
         if self.chunks_sent > 0:
@@ -924,10 +1045,456 @@ class DraftServer:
         else:
             acceptance_rate = 0
             avg_rtt = 0
-        
+
         print(f"[{self.env.now:.1f}ms] Draft {self.id} finished: chunks={self.chunks_sent}, "
               f"tokens={self.total_tokens_generated}, accepted={self.total_tokens_accepted} ({acceptance_rate:.2%}), "
               f"avg RTT={avg_rtt:.1f}ms", flush=True)
+
+# ---------- Scheduler Core ----------
+
+
+@dataclass
+class PhaseSettings:
+    pool: str = "default"
+    queue_policy: str = "priority"  # "fifo" or "priority"
+    max_batch_requests: int = 32
+    max_batch_tokens: int = 0
+    max_wait_ms: float = 6.0
+    chunk_tokens: int = 0
+    delayed_batch_ms: float = 0.0
+    retry_backoff_ms: float = 1.0
+    max_retries: int = 3
+    parallelism_plan: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(order=True)
+class QueueItem:
+    sort_key: Tuple[float, int]
+    job: Job = field(compare=False)
+
+
+class KVManager:
+    """Track KV utilization per target with optional paging penalties."""
+
+    def __init__(
+        self,
+        capacities: Mapping[str, int],
+        *,
+        default_capacity_tokens: int = 1_000_000,
+        max_utilization_pct: float = 100.0,
+        paging: Optional[Mapping[str, Any]] = None,
+    ) -> None:
+        self.default_capacity_tokens = max(1, int(default_capacity_tokens))
+        self.capacities: Dict[str, int] = {str(k): max(1, int(v)) for k, v in (capacities or {}).items()}
+        self.usage: Dict[str, int] = {target_id: 0 for target_id in self.capacities.keys()}
+        pct = max(0.0, min(float(max_utilization_pct), 100.0))
+        self.max_utilization = pct / 100.0 if pct > 0 else 1.0
+
+        paging = paging or {}
+        self.paging_enabled = bool(paging.get("enabled", False))
+        self.page_size_tokens = max(1, int(paging.get("page_size_tokens", 1024)))
+        self.page_in_penalty_ms = float(paging.get("page_in_penalty_ms", 0.0))
+
+    def register_target(self, target_id: str, capacity_tokens: Optional[int] = None) -> None:
+        tid = str(target_id)
+        if tid not in self.capacities:
+            cap = capacity_tokens if capacity_tokens is not None else self.default_capacity_tokens
+            self.capacities[tid] = max(1, int(cap))
+            self.usage[tid] = 0
+        elif tid not in self.usage:
+            self.usage[tid] = 0
+
+    def reserve(self, target_id: str, tokens: int) -> Tuple[bool, float]:
+        """Attempt to reserve KV space. Returns (success, page_in_delay_ms)."""
+        if tokens <= 0:
+            return True, 0.0
+        tid = str(target_id)
+        if tid not in self.capacities:
+            self.register_target(tid)
+        capacity = self.capacities.get(tid, self.default_capacity_tokens)
+        current = self.usage.get(tid, 0)
+        limit = capacity * self.max_utilization
+        new_total = current + tokens
+        if limit <= 0:
+            limit = capacity
+
+        if new_total <= limit + 1e-6:
+            self.usage[tid] = min(new_total, capacity)
+            return True, 0.0
+
+        if self.paging_enabled:
+            overflow = max(0, new_total - limit)
+            pages = math.ceil(overflow / max(1, self.page_size_tokens))
+            penalty = pages * self.page_in_penalty_ms
+            self.usage[tid] = min(new_total, capacity)
+            return True, penalty
+
+        # Cannot admit, leave usage unchanged
+        return False, 0.0
+
+    def release(self, target_id: str, tokens: int) -> None:
+        if tokens <= 0:
+            return
+        tid = str(target_id)
+        if tid not in self.usage:
+            return
+        self.usage[tid] = max(0, self.usage[tid] - tokens)
+
+
+class PhaseScheduler:
+    """Per-phase scheduler with priority queues, batching, and KV guards."""
+
+    def __init__(
+        self,
+        env: simpy.Environment,
+        name: str,
+        phase: str,
+        settings: PhaseSettings,
+        *,
+        target_lookup: Dict[str, TargetServer],
+        pool_targets: List[TargetServer],
+        kv_manager: Optional[KVManager],
+        global_router,
+        priority_map: Dict[str, int],
+        default_priority_class: str,
+        metrics: Metrics,
+    ) -> None:
+        self.env = env
+        self.name = name
+        self.phase = phase
+        self.settings = settings
+        self.store = simpy.PriorityStore(env)
+        self._seq = 0
+        self.target_lookup = target_lookup
+        self.pool_targets = list(pool_targets) if pool_targets else list(target_lookup.values())
+        if not self.pool_targets:
+            raise ValueError(f"Scheduler pool '{settings.pool}' has no targets")
+        self.pool_map = {t.p.id: t for t in self.pool_targets}
+        self.kv_manager = kv_manager
+        self.global_router = global_router
+        self.priority_map = priority_map
+        self.default_priority_class = default_priority_class
+        self.metrics = metrics
+        self.proc = env.process(self._run())
+
+    def submit(self, job: Job) -> simpy.Event:
+        job.phase = self.phase
+        if not job.parallelism_plan and self.settings.parallelism_plan:
+            job.parallelism_plan = dict(self.settings.parallelism_plan)
+        if not job.priority_class:
+            job.priority_class = self.default_priority_class
+        job.priority = self.priority_map.get(job.priority_class, self.priority_map.get(self.default_priority_class, 100))
+
+        if self.phase == "prefill" and self.settings.chunk_tokens and job.token_count > self.settings.chunk_tokens:
+            self._submit_chunked(job)
+            return job.completion_event
+
+        if job.kv_tokens <= 0:
+            job.kv_tokens = self._estimate_kv_tokens(job)
+        self._enqueue_job(job)
+        return job.completion_event
+
+    def _submit_chunked(self, job: Job) -> None:
+        chunk_size = max(1, self.settings.chunk_tokens)
+        total_chunks = math.ceil(job.token_count / chunk_size)
+        barrier = ChunkBarrier(self.env, total_chunks, job.completion_event)
+        base_tokens = job.token_count
+        for idx in range(total_chunks):
+            if idx == total_chunks - 1:
+                tokens = base_tokens - chunk_size * (total_chunks - 1)
+            else:
+                tokens = chunk_size
+            chunk_completion = self.env.event()
+            chunk_job = Job(
+                jid=job.jid * 1000 + idx,
+                created_ms=job.created_ms,
+                draft_id=job.draft_id,
+                job_type=job.job_type,
+                token_count=tokens,
+                completion_event=chunk_completion,
+                rtt_start_ms=job.rtt_start_ms if idx == 0 else None,
+                request_id=job.request_id,
+                context_len=job.context_len,
+                target_id=job.target_id,
+                priority_class=job.priority_class,
+                priority=job.priority,
+                kv_tokens=tokens,
+                phase=self.phase,
+                chunk_index=idx,
+                chunk_count=total_chunks,
+                chunk_barrier=barrier,
+                parallelism_plan=dict(self.settings.parallelism_plan),
+            )
+            self._enqueue_job(chunk_job)
+
+    def _enqueue_job(self, job: Job) -> None:
+        self._seq += 1
+        if self.settings.queue_policy == "fifo":
+            sort_key: Tuple[float, int] = (float(self._seq),)
+        else:
+            sort_key = (float(job.priority), self._seq)
+        self.store.put(QueueItem(sort_key, job))
+
+    def _run(self):
+        while True:
+            item = yield self.store.get()
+            batch = [item.job]
+            token_total = item.job.token_count
+            deadline = self.env.now + max(0.0, self.settings.max_wait_ms)
+            earliest_dispatch = self.env.now + max(0.0, self.settings.delayed_batch_ms)
+
+            while self._can_add_more(batch, token_total):
+                now = self.env.now
+                remaining_deadline = max(0.0, deadline - now)
+                if remaining_deadline <= 0:
+                    break
+                target_time = deadline
+                if len(batch) == 1 and self.settings.delayed_batch_ms > 0 and earliest_dispatch > now:
+                    target_time = min(target_time, earliest_dispatch)
+                remaining = max(0.0, target_time - now)
+                if remaining <= 0:
+                    break
+                get_ev = self.store.get()
+                timeout_ev = self.env.timeout(remaining)
+                result = yield get_ev | timeout_ev
+                if get_ev in result:
+                    next_job = result[get_ev].job
+                    batch.append(next_job)
+                    token_total += next_job.token_count
+                    if self.settings.max_batch_tokens and token_total >= self.settings.max_batch_tokens:
+                        break
+                else:
+                    break
+
+            yield self.env.process(self._dispatch_batch_proc(batch))
+
+    def _can_add_more(self, batch: List[Job], token_total: int) -> bool:
+        if self.settings.max_batch_requests and len(batch) >= self.settings.max_batch_requests:
+            return False
+        if self.settings.max_batch_tokens and token_total >= self.settings.max_batch_tokens:
+            return False
+        return len(batch) < max(1, self.settings.max_batch_requests)
+
+    def _dispatch_batch_proc(self, batch: List[Job]):
+        groups: Dict[str, List[Job]] = {}
+        for job in batch:
+            target = self._choose_target(job)
+            job.target_id = target.p.id
+            groups.setdefault(target.p.id, []).append(job)
+
+        for target_id, jobs in groups.items():
+            target = self.pool_map.get(target_id) or self.target_lookup.get(target_id)
+            if target is None:
+                continue
+            accepted: List[Job] = []
+            max_penalty = 0.0
+            for job in jobs:
+                if job.kv_tokens <= 0:
+                    job.kv_tokens = self._estimate_kv_tokens(job)
+                if self.kv_manager is None:
+                    accepted.append(job)
+                    continue
+                success, penalty = self.kv_manager.reserve(target_id, job.kv_tokens)
+                if not success:
+                    self._schedule_retry(job)
+                    continue
+                max_penalty = max(max_penalty, penalty)
+                accepted.append(job)
+
+            if not accepted:
+                continue
+
+            if max_penalty > 0:
+                yield self.env.timeout(max_penalty)
+
+            for job in accepted:
+                job.created_ms = self.env.now
+                target.enqueue(job)
+
+    def _schedule_retry(self, job: Job) -> None:
+        if self.settings.max_retries >= 0 and job.retry_count >= self.settings.max_retries:
+            if self.metrics and self.metrics.verbose:
+                print(
+                    f"[{self.env.now:.1f}ms] Scheduler {self.name}: dropping job {job.jid} after retries",
+                    flush=True,
+                )
+            if job.completion_event and not job.completion_event.triggered:
+                job.completion_event.fail(RuntimeError("KV admission rejected job"))
+            return
+
+        job.retry_count += 1
+
+        def _retry_proc():
+            yield self.env.timeout(max(0.0, self.settings.retry_backoff_ms * job.retry_count))
+            self._enqueue_job(job)
+
+        self.env.process(_retry_proc())
+
+    def _choose_target(self, job: Job) -> TargetServer:
+        if job.target_id and job.target_id in self.pool_map:
+            return self.pool_map[job.target_id]
+
+        allowed_ids = list(self.pool_map.keys())
+        chosen = None
+        if self.global_router is not None:
+            chosen = self.global_router.choose(job.draft_id, allowed_ids)
+
+        if chosen is not None:
+            return chosen
+
+        # Fall back to least work-left among pool
+        return min(self.pool_targets, key=lambda t: t.work_left_score())
+
+    def _estimate_kv_tokens(self, job: Job) -> int:
+        if job.phase == "prefill":
+            return max(1, job.token_count)
+        base = max(1, job.token_count)
+        ctx = max(0, job.context_len)
+        return base + ctx
+
+
+class Scheduler:
+    """Top-level scheduler coordinating prefill and decode lanes."""
+
+    def __init__(
+        self,
+        env: simpy.Environment,
+        cfg: Config,
+        *,
+        target_lookup: Dict[str, TargetServer],
+        targets_by_cluster: Dict[str, List[TargetServer]],
+        kv_manager: Optional[KVManager],
+        global_router,
+        metrics: Metrics,
+    ) -> None:
+        self.env = env
+        self.cfg = cfg
+        self.kv_manager = kv_manager
+        self.global_router = global_router
+        self.metrics = metrics
+
+        sched_cfg = dict(cfg.scheduler_config or {})
+        self.priority_map = self._build_priority_map(sched_cfg)
+        self.default_priority_class = sched_cfg.get("default_priority_class", "standard")
+        if self.default_priority_class not in self.priority_map:
+            self.priority_map[self.default_priority_class] = self.priority_map.get("standard", 100)
+
+        pools = self._resolve_pools(sched_cfg, target_lookup, targets_by_cluster)
+
+        prefill_settings = self._phase_settings("prefill", sched_cfg)
+        decode_settings = self._phase_settings("decode", sched_cfg)
+
+        prefill_pool_targets = pools.get(prefill_settings.pool) or pools.get("default")
+        decode_pool_targets = pools.get(decode_settings.pool) or pools.get("default")
+
+        if prefill_pool_targets is None or decode_pool_targets is None:
+            raise ValueError("Scheduler pools are not defined correctly")
+
+        self.prefill_scheduler = PhaseScheduler(
+            env,
+            name="prefill",
+            phase="prefill",
+            settings=prefill_settings,
+            target_lookup=target_lookup,
+            pool_targets=prefill_pool_targets,
+            kv_manager=kv_manager,
+            global_router=global_router,
+            priority_map=self.priority_map,
+            default_priority_class=self.default_priority_class,
+            metrics=metrics,
+        )
+
+        self.decode_scheduler = PhaseScheduler(
+            env,
+            name="decode",
+            phase="decode",
+            settings=decode_settings,
+            target_lookup=target_lookup,
+            pool_targets=decode_pool_targets,
+            kv_manager=kv_manager,
+            global_router=global_router,
+            priority_map=self.priority_map,
+            default_priority_class=self.default_priority_class,
+            metrics=metrics,
+        )
+
+    def submit_job(self, job: Job) -> simpy.Event:
+        if job.job_type == "prefill":
+            return self.prefill_scheduler.submit(job)
+        return self.decode_scheduler.submit(job)
+
+    def priority_for(self, priority_class: Optional[str]) -> int:
+        class_name = priority_class or self.default_priority_class
+        return self.priority_map.get(class_name, self.priority_map.get(self.default_priority_class, 100))
+
+    def _build_priority_map(self, sched_cfg: Dict[str, Any]) -> Dict[str, int]:
+        raw = sched_cfg.get("priority_classes", {}) or {}
+        if not raw:
+            return {"high": 0, "standard": 100, "low": 200}
+        result = {}
+        for key, value in raw.items():
+            try:
+                result[str(key)] = int(value)
+            except (TypeError, ValueError):
+                continue
+        if "standard" not in result:
+            result.setdefault("standard", min(result.values(), default=100) + 100)
+        return result
+
+    def _phase_settings(self, phase: str, sched_cfg: Dict[str, Any]) -> PhaseSettings:
+        phase_cfg = dict(sched_cfg.get(phase, {}) or {})
+        settings = PhaseSettings()
+        settings.pool = phase_cfg.get("pool", "default")
+        settings.queue_policy = phase_cfg.get("queue_policy", "priority")
+        settings.max_batch_requests = int(phase_cfg.get("max_batch_requests", settings.max_batch_requests))
+        settings.max_batch_tokens = int(phase_cfg.get("max_batch_tokens", settings.max_batch_tokens))
+        settings.max_wait_ms = float(phase_cfg.get("max_wait_ms", settings.max_wait_ms))
+        settings.delayed_batch_ms = float(phase_cfg.get("delayed_batch_ms", settings.delayed_batch_ms))
+        settings.retry_backoff_ms = float(phase_cfg.get("retry_backoff_ms", settings.retry_backoff_ms))
+        settings.max_retries = int(phase_cfg.get("max_retries", settings.max_retries))
+        settings.parallelism_plan = dict(phase_cfg.get("parallelism", settings.parallelism_plan) or {})
+        if phase == "prefill":
+            chunk_tokens = phase_cfg.get("chunk_tokens")
+            if chunk_tokens is None:
+                chunk_tokens = self.cfg.scheduler_config.get("prefill_chunk_tokens")
+            if chunk_tokens:
+                settings.chunk_tokens = int(chunk_tokens)
+        return settings
+
+    def _resolve_pools(
+        self,
+        sched_cfg: Dict[str, Any],
+        target_lookup: Dict[str, TargetServer],
+        targets_by_cluster: Dict[str, List[TargetServer]],
+    ) -> Dict[str, List[TargetServer]]:
+        pools_cfg = sched_cfg.get("pools", {}) or {}
+        pools: Dict[str, List[TargetServer]] = {}
+
+        if pools_cfg:
+            for name, spec in pools_cfg.items():
+                targets: List[TargetServer] = []
+                if isinstance(spec, dict):
+                    for tid in spec.get("targets", []) or []:
+                        if tid in target_lookup:
+                            targets.append(target_lookup[tid])
+                    for cluster in spec.get("clusters", []) or []:
+                        targets.extend(targets_by_cluster.get(cluster, []))
+                elif isinstance(spec, list):
+                    for tid in spec:
+                        if tid in target_lookup:
+                            targets.append(target_lookup[tid])
+                elif isinstance(spec, str):
+                    if spec in target_lookup:
+                        targets.append(target_lookup[spec])
+                    elif spec in targets_by_cluster:
+                        targets.extend(targets_by_cluster[spec])
+                if targets:
+                    pools[name] = list(dict.fromkeys(targets))
+
+        if "default" not in pools:
+            pools["default"] = list(target_lookup.values())
+
+        return pools
 
 # ---------- Routers ----------
 
@@ -1143,6 +1710,52 @@ class WeightedJSQ2Router:
         keyed.sort(reverse=True)
         return [t for _, t in keyed[:k]]
 
+class GlobalWeightedRouter:
+    """Global router that chooses targets across clusters based on work-left scores."""
+    def __init__(self, *, cluster_targets: Dict[str, List[TargetServer]],
+                 target_lookup: Dict[str, TargetServer], params: Optional[Dict[str, Any]] = None) -> None:
+        self._cluster_targets = cluster_targets
+        self._target_lookup = target_lookup
+        params = params or {}
+        raw_weights = params.get('cluster_weights', {})
+        default_weight = float(params.get('default_weight', 1.0))
+        self._weights = {cluster: float(raw_weights.get(cluster, default_weight)) for cluster in cluster_targets.keys()}
+        self._default_weight = max(default_weight, 1e-6)
+
+    def choose(self, draft_id: str, allowed_target_ids: Iterable[str]) -> Optional[TargetServer]:
+        allowed = set(allowed_target_ids)
+        if not allowed:
+            return None
+        best_target: Optional[TargetServer] = None
+        best_score = float('inf')
+        for cluster, targets in self._cluster_targets.items():
+            cluster_allowed = [t for t in targets if t.p.id in allowed]
+            if not cluster_allowed:
+                continue
+            weight = max(self._weights.get(cluster, self._default_weight), 1e-6)
+            for target in cluster_allowed:
+                score = target.work_left_score() / weight
+                if score < best_score:
+                    best_score = score
+                    best_target = target
+        if best_target is not None:
+            return best_target
+
+        # Fallback: pick first known target from lookup if cluster filters missed it
+        for target_id in allowed:
+            candidate = self._target_lookup.get(target_id)
+            if candidate is not None:
+                return candidate
+        return None
+
+    def get_target(self, target_id: str) -> Optional[TargetServer]:
+        return self._target_lookup.get(target_id)
+
+
+GLOBAL_ROUTERS = {
+    "weighted_cluster": GlobalWeightedRouter,
+}
+
 ROUTERS = {
     "random": RandomRouter,
     "round_robin": RoundRobinRouter,
@@ -1154,158 +1767,224 @@ ROUTERS = {
 
 # ---------- Config I/O & Runner ----------
 
+
 def _expand_auto_topology(raw: Dict[str, Any]) -> Dict[str, Any]:
     """Expand auto_topology shorthand into full devices and connections lists."""
     import random
     from collections import defaultdict
-    
+
     if not isinstance(raw, dict) or not raw.get("auto_topology"):
         return raw
-    
-    rng = random.Random(raw.get("seed", 0))
+
     spec = raw["auto_topology"]
-    
-    # --- Generate Targets ---
-    t_spec = spec.get("targets", {})
-    t_count = int(t_spec.get("count", 20))
-    tiers = t_spec.get("tiers", [])
-    if not tiers:
-        tiers = [{
-            "name": "default", "ratio": 1.0, "model": "llama-3.1-8b", "gpu": "A100",
-            "weight": 1.0, "batch_window_ms": 6.0, "batch_size": 48,
-            "prefill_latency_per_token": 0.45, "decode_latency_per_token": 1.80
-        }]
-    
-    # Distribute counts per tier
-    remaining = t_count
-    tier_counts = []
-    for i, t in enumerate(tiers):
-        c = t_count - sum(tier_counts) if i == len(tiers)-1 else int(round(t_count * float(t.get("ratio", 0))))
-        c = max(0, c)
-        tier_counts.append(c)
-    
-    devices, target_ids, tier_of = [], [], {}
-    for t, c in zip(tiers, tier_counts):
-        for _ in range(c):
-            tid = f"t{len(target_ids):02d}"
-            target_ids.append(tid)
-            tier_of[tid] = t.get("name", "default")
-            devices.append({
-                "id": tid, "role": "target",
-                "model": t.get("model", ""), "gpu": t.get("gpu", ""),
-                "weight": float(t.get("weight", 1.0)),
-                "batch_window_ms": float(t.get("batch_window_ms", 6.0)),
-                "batch_size": int(t.get("batch_size", 32)),
-                "prefill_latency_per_token": float(t.get("prefill_latency_per_token", 0.5)),
-                "decode_latency_per_token": float(t.get("decode_latency_per_token", 2.5)),
-            })
-    
-    # Build targets_by_tier mapping
-    targets_by_tier = defaultdict(list)
-    for tid, tname in tier_of.items():
-        targets_by_tier[tname].append(tid)
-    all_tiers = list(targets_by_tier.keys())
-    
-    # --- Generate Drafts ---
-    d_spec = spec.get("drafts", {})
-    d_count = int(d_spec.get("count", 100))
-    gens = d_spec.get("gens_ms_per_gamma", [[0,0],[100,160],[240,420]])
-    caps = d_spec.get("capability_map", {0:2.0, 1:1.0, 2:0.6})
-    labels = d_spec.get("draft_bucket_labels", ["datacenter", "edge", "user"])
-    
-    # Store draft gen midpoints for bucket assignment
-    gen_mids = [(a+b)/2.0 for a,b in gens]
-    
-    # Distribute drafts evenly across buckets (33/33/34 for 100 drafts)
-    drafts_per_bucket = d_count // len(gens)
-    
-    for i in range(d_count):
-        # Assign bucket deterministically for even distribution
-        if i < drafts_per_bucket * len(gens):
-            bucket = i // drafts_per_bucket
-        else:
-            bucket = len(gens) - 1  # Put remainder in last bucket
-        
-        lo, hi = gens[bucket]
-        gen_ms = rng.uniform(float(lo), float(hi))
-        devices.append({
-            "id": f"d{i:02d}", "role": "draft",
-            "capability": float(caps.get(bucket, caps.get(str(bucket), 1.0))),
-            "generation_latency_ms": float(gen_ms),
-            "bucket": bucket,  # Store the bucket assignment
-            "burst_factor": 1.0, "reliability": 0.99
-        })
-    
-    # --- Generate Connectivity ---
-    conn_spec = spec.get("connectivity", {})
-    fanout_base = int(conn_spec.get("fanout_per_draft", 3))
-    fanout_override = conn_spec.get("fanout_override", {})
-    affinity = conn_spec.get("affinity_rules", {})
-    net_ranges = conn_spec.get("net_ms_ranges", {})
-    acc_tbl = conn_spec.get("acceptance_by_tier", {})
-    
-    connections = []
-    for i in range(d_count):
-        did = f"d{i:02d}"
-        
-        # Use the stored bucket assignment
-        draft_device = devices[len(target_ids)+i]
-        bidx = draft_device.get("bucket", 0)  # Use stored bucket
-        label = labels[bidx] if bidx < len(labels) else str(bidx)
-        
-        # Get allowed targets from affinity rules
-        allowed_tiers = affinity.get(label, all_tiers)
-        candidates = []
-        for t in allowed_tiers:
-            candidates.extend(targets_by_tier.get(t, []))
-        
-        # Determine fanout
-        fanout = int(fanout_override.get(label, fanout_base))
-        
-        # Special case for user drafts - stable "nearest" L4s
-        if label == "user" and len(targets_by_tier.get("edge", [])) >= 2:
-            l4s = targets_by_tier.get("edge", [])
-            base = abs(hash(did)) % len(l4s)
-            chosen = [l4s[base], l4s[(base+1) % len(l4s)]]
-        else:
-            # Randomize candidate selection to avoid bias
+    rng = random.Random(raw.get("seed", 0))
+
+    def _sanitize_prefix(name: str) -> str:
+        return str(name).replace(" ", "_")
+
+    def _build_cluster(cluster_spec: Dict[str, Any], cluster_name: str):
+        cluster_devices: list[Dict[str, Any]] = []
+        cluster_connections: list[Dict[str, Any]] = []
+        prefix = _sanitize_prefix(cluster_spec.get("id_prefix", cluster_name))
+
+        # --- Targets ---
+        t_spec = cluster_spec.get("targets", {})
+        tiers = list(t_spec.get("tiers", []))
+        inferred_count = int(t_spec.get("count", 0))
+        if not tiers:
+            tiers = [{
+                "name": f"{cluster_name}_default",
+                "ratio": 1.0,
+            }]
+        if inferred_count <= 0:
+            explicit = sum(int(t.get("count", 0)) for t in tiers)
+            inferred_count = explicit if explicit > 0 else sum(1 for _ in tiers)
+        tier_counts = []
+        remaining = inferred_count
+        for idx, tier in enumerate(tiers):
+            if "count" in tier:
+                count = int(tier["count"])
+            elif "ratio" in tier and inferred_count > 0:
+                count = int(round(inferred_count * float(tier.get("ratio", 0.0))))
+            else:
+                count = int(round(inferred_count / len(tiers))) if inferred_count > 0 else 0
+            if idx == len(tiers) - 1:
+                count = remaining
+            count = max(0, min(count, remaining))
+            tier_counts.append(count)
+            remaining -= count
+        if tier_counts and remaining > 0:
+            tier_counts[-1] += remaining
+
+        targets_by_tier: defaultdict[str, list[str]] = defaultdict(list)
+        tier_of: Dict[str, str] = {}
+        target_index = 0
+        for tier, count in zip(tiers, tier_counts):
+            tier_name = str(tier.get("name", f"{cluster_name}_tier"))
+            for _ in range(count):
+                tid = f"{prefix}_t{target_index:02d}"
+                target_index += 1
+                entry: Dict[str, Any] = {
+                    "id": tid,
+                    "role": "target",
+                    "model": tier.get("model", ""),
+                    "gpu": tier.get("gpu", ""),
+                    "weight": float(tier.get("weight", 1.0)),
+                    "batch_window_ms": float(tier.get("batch_window_ms", 6.0)),
+                    "batch_size": int(tier.get("batch_size", 32)),
+                    "prefill_latency_per_token": float(tier.get("prefill_latency_per_token", 0.5)),
+                    "decode_latency_per_token": float(tier.get("decode_latency_per_token", 2.5)),
+                    "cluster": cluster_name,
+                }
+                if "verify_latency_ms" in tier:
+                    entry["verify_latency_ms"] = float(tier["verify_latency_ms"])
+                if "energy_per_token_mj" in tier:
+                    entry["energy_per_token_mj"] = float(tier["energy_per_token_mj"])
+                cluster_devices.append(entry)
+                tier_of[tid] = tier_name
+                targets_by_tier[tier_name].append(tid)
+        all_tiers = list(targets_by_tier.keys())
+
+        # --- Drafts ---
+        d_spec = cluster_spec.get("drafts", {})
+        d_count = int(d_spec.get("count", 0))
+        gens = list(d_spec.get("gens_ms_per_gamma", [[0, 0]])) or [[0, 0]]
+        caps = d_spec.get("capability_map", {})
+        labels = list(d_spec.get("draft_bucket_labels", []))
+        if not labels:
+            labels = [str(i) for i in range(len(gens))]
+        reliability_map = d_spec.get("reliability", {})
+        if d_count <= 0:
+            d_count = len(gens)
+        drafts_per_bucket = d_count // len(gens)
+        draft_entries: list[Dict[str, Any]] = []
+        for i in range(d_count):
+            if i < drafts_per_bucket * len(gens):
+                bucket = i // drafts_per_bucket
+            else:
+                bucket = len(gens) - 1
+            lo, hi = gens[bucket]
+            gen_ms = rng.uniform(float(lo), float(hi))
+            label = labels[bucket] if bucket < len(labels) else str(bucket)
+            capability = float(caps.get(bucket, caps.get(str(bucket), d_spec.get("default_capability", 1.0))))
+            reliability = float(
+                reliability_map.get(label, reliability_map.get(str(bucket), d_spec.get("default_reliability", 0.99)))
+            )
+            did = f"{prefix}_d{i:03d}"
+            entry = {
+                "id": did,
+                "role": "draft",
+                "capability": capability,
+                "generation_latency_ms": float(gen_ms),
+                "bucket": bucket,
+                "label": label,
+                "burst_factor": float(d_spec.get("burst_factor", 1.0)),
+                "reliability": reliability,
+                "cluster": cluster_name,
+            }
+            cluster_devices.append(entry)
+            draft_entries.append(entry)
+
+        # --- Connectivity ---
+        conn_spec = cluster_spec.get("connectivity", {})
+        fanout_base = int(conn_spec.get("fanout_per_draft", 3))
+        fanout_override = conn_spec.get("fanout_override", {})
+        affinity = conn_spec.get("affinity_rules", {})
+        net_ranges = conn_spec.get("net_ms_ranges", {})
+        acc_tbl = conn_spec.get("acceptance_by_tier", {})
+        jitter_pct = float(conn_spec.get("link_jitter_pct", 0.0) or 0.0)
+        drop_tbl = conn_spec.get("drop_rate", {})
+
+        for draft in draft_entries:
+            did = draft["id"]
+            bucket = draft.get("bucket", 0)
+            label = draft.get("label", str(bucket))
+            allowed_tiers = affinity.get(label, all_tiers or list(targets_by_tier.keys()))
+            candidates: list[str] = []
+            for tier in allowed_tiers:
+                candidates.extend(targets_by_tier.get(tier, []))
+            if not candidates:
+                candidates = list(tier_of.keys())
             rng.shuffle(candidates)
-            # FIXED: Always limit to exactly fanout connections
+            fanout = max(1, int(fanout_override.get(label, fanout_base)))
             chosen = candidates[:fanout]
-        
-        # Create connections with per-edge properties
-        for tid in chosen:
-            t_tier = tier_of[tid]
-            
-            # Network latencies based on tier
-            fr = net_ranges.get(t_tier, [20, 40])
-            fwd = rng.uniform(float(fr[0]), float(fr[1]))
-            rsp = rng.uniform(float(fr[0]), float(fr[1]))
-            
-            # Acceptance rate based on draft bucket and target tier
-            row = acc_tbl.get(str(bidx), acc_tbl.get(bidx, {}))
-            base_acc = row.get(t_tier, 0.75)
-            acc = max(0.5, min(0.95, base_acc + rng.uniform(-0.03, 0.03)))
-            
-            connections.append({
-                "draft": did, "target": tid,
-                "forward_latency_ms": float(fwd),
-                "response_latency_ms": float(rsp),
-                "acceptance_rate": float(acc)
-            })
-    
-    # Update raw config with generated devices and connections
+            for tid in chosen:
+                t_tier = tier_of.get(tid)
+                fr = net_ranges.get(t_tier, net_ranges.get(label, [20, 40]))
+                fwd_base = rng.uniform(float(fr[0]), float(fr[1])) if fr else 20.0
+                rsp_base = rng.uniform(float(fr[0]), float(fr[1])) if fr else 20.0
+                if jitter_pct:
+                    jitter = rng.uniform(-jitter_pct, jitter_pct)
+                    fwd = max(0.1, fwd_base * (1.0 + jitter))
+                    jitter = rng.uniform(-jitter_pct, jitter_pct)
+                    rsp = max(0.1, rsp_base * (1.0 + jitter))
+                else:
+                    fwd = fwd_base
+                    rsp = rsp_base
+                row = acc_tbl.get(str(bucket), acc_tbl.get(bucket, {}))
+                base_acc = row.get(t_tier, 0.75)
+                acc = max(0.5, min(0.99, base_acc + rng.uniform(-0.03, 0.03)))
+                connection: Dict[str, Any] = {
+                    "draft": did,
+                    "target": tid,
+                    "forward_latency_ms": float(fwd),
+                    "response_latency_ms": float(rsp),
+                    "acceptance_rate": float(acc),
+                    "cluster": cluster_name,
+                }
+                if jitter_pct:
+                    connection["jitter_pct"] = jitter_pct
+                drop_rate = drop_tbl.get(label, drop_tbl.get(str(bucket), None))
+                if drop_rate is not None:
+                    connection["drop_rate"] = float(drop_rate)
+                cluster_connections.append(connection)
+
+        if raw.get("verbose", False):
+            target_count = sum(1 for dev in cluster_devices if dev['role'] == 'target')
+            draft_count = sum(1 for dev in cluster_devices if dev['role'] == 'draft')
+            avg_connections = len(cluster_connections) / max(1, len(draft_entries))
+            print(
+                f"Cluster '{cluster_name}': {target_count} targets, {draft_count} drafts\n"
+                f"  Connections: {len(cluster_connections)} (avg {avg_connections:.2f} per draft)",
+                flush=True,
+            )
+
+        router_override = cluster_spec.get("router")
+        router_params = dict(cluster_spec.get("router_params", {})) if cluster_spec.get("router_params") else {}
+        return cluster_devices, cluster_connections, router_override, router_params
+
+    if isinstance(spec, dict) and spec.get("clusters"):
+        devices: list[Dict[str, Any]] = []
+        connections: list[Dict[str, Any]] = []
+        cluster_router: Dict[str, str] = {}
+        cluster_router_params: Dict[str, Dict[str, Any]] = {}
+        for idx, cluster_spec in enumerate(spec.get("clusters", [])):
+            cluster_name = str(cluster_spec.get("name", f"cluster_{idx}") or f"cluster_{idx}")
+            cluster_devs, cluster_conns, router_override, router_params = _build_cluster(cluster_spec, cluster_name)
+            devices.extend(cluster_devs)
+            connections.extend(cluster_conns)
+            if router_override:
+                cluster_router[cluster_name] = router_override
+            if router_params:
+                cluster_router_params[cluster_name] = router_params
+        raw = dict(raw)
+        raw["devices"] = devices
+        raw["connections"] = connections
+        if cluster_router:
+            raw["cluster_router"] = cluster_router
+        if cluster_router_params:
+            raw["cluster_router_params"] = cluster_router_params
+        return raw
+
+    # Legacy single-cluster behaviour
+    devices, connections, router_override, router_params = _build_cluster(spec, "default")
     raw = dict(raw)
     raw["devices"] = devices
     raw["connections"] = connections
-    
-    # Add topology statistics for debugging
-    if raw.get("verbose", False):
-        print(f"Auto-topology generated: {len(devices)} devices ({t_count} targets, {d_count} drafts)")
-        print(f"                        {len(connections)} connections (avg {len(connections)/d_count:.1f} per draft)")
-        for tier_name, count in zip([t["name"] for t in tiers], tier_counts):
-            print(f"  Target tier '{tier_name}': {count} devices")
-    
+    if router_override:
+        raw.setdefault("cluster_router", {})["default"] = router_override
+    if router_params:
+        raw.setdefault("cluster_router_params", {})["default"] = router_params
     return raw
 
 def load_config(path: str) -> Config:
@@ -1335,10 +2014,15 @@ def load_config(path: str) -> Config:
         scheduler_config=raw.get("scheduler", {}),  # Parse scheduler config
         devices=raw.get("devices", []),
         connections=raw.get("connections", []),
+        cluster_router=dict(raw.get("cluster_router", {}) or {}),
+        cluster_router_params={k: dict(v) for k, v in (raw.get("cluster_router_params", {}) or {}).items()},
+        global_router=raw.get("global_router"),
+        global_router_params=dict(raw.get("global_router_params", {}) or {}),
         trace_path=raw.get("trace_path"),
         trace_defaults=dict(raw.get("trace_defaults", {}) or {}),
         performance_model=pm,
         workload=wl,
+        think_time=ThinkTimeConfig(**(raw.get("think_time", {}) or {})),
         burn_in_ms=raw.get("burn_in_ms", 0.0),
         verbose=raw.get("verbose", True),
         debug=raw.get("debug", False),
@@ -1360,8 +2044,21 @@ def build(env: simpy.Environment, cfg: Config):
     metrics = Metrics(verbose=cfg.verbose, burn_in_ms=cfg.burn_in_ms)
     targets: List[TargetServer] = []
     drafts: List[DraftServer] = []
+    targets_by_cluster: Dict[str, List[TargetServer]] = defaultdict(list)
+    target_cluster_map: Dict[str, str] = {}
+    draft_cluster_map: Dict[str, str] = {}
+    target_lookup: Dict[str, TargetServer] = {}
+    target_router_map: Dict[str, object] = {}
     performance_provider = create_performance_provider(cfg.performance_model)
     trace_schedule: Optional[TraceSchedule] = None
+    scheduler_cfg = dict(cfg.scheduler_config or {})
+    kv_cfg = dict(scheduler_cfg.get("kv", {}) or {})
+    kv_manager = KVManager(
+        capacities=kv_cfg.get("capacity_tokens", {}) or {},
+        default_capacity_tokens=kv_cfg.get("default_capacity_tokens", 1_000_000),
+        max_utilization_pct=kv_cfg.get("max_utilization_pct", 100.0),
+        paging=kv_cfg.get("paging"),
+    )
 
     # Require devices to be specified in config
     if not cfg.devices:
@@ -1380,6 +2077,7 @@ def build(env: simpy.Environment, cfg: Config):
                 # Use decode latency as typical case (most batches are decode-only)
                 verify_ms = cfg.gamma * float(d.get("decode_latency_per_token", 9.25))
             
+            cluster_name = str(d.get("cluster", "default"))
             params = TargetParams(
                 id=d["id"],
                 model=str(d.get("model", "")),
@@ -1390,6 +2088,7 @@ def build(env: simpy.Environment, cfg: Config):
                 verify_latency_ms=verify_ms,
                 prefill_latency_per_token=float(d.get("prefill_latency_per_token", 0.5)),
                 decode_latency_per_token=float(d.get("decode_latency_per_token", 2.5)),
+                cluster=cluster_name,
             )
             target = TargetServer(
                 env,
@@ -1398,8 +2097,14 @@ def build(env: simpy.Environment, cfg: Config):
                 performance_provider,
                 cfg=cfg,
                 debug=cfg.debug,
+                router=None,
+                kv_manager=kv_manager,
             )
             targets.append(target)
+            targets_by_cluster[cluster_name].append(target)
+            target_lookup[params.id] = target
+            target_cluster_map[params.id] = cluster_name
+            kv_manager.register_target(params.id, params.kv_capacity_tokens)
             performance_provider.register_target(
                 target_id=params.id,
                 model=params.model,
@@ -1409,7 +2114,10 @@ def build(env: simpy.Environment, cfg: Config):
             )
         elif role == "draft":
             # Store draft configs for later processing
+            d.setdefault("cluster", "default")
             draft_configs.append(d)
+            if d.get("id"):
+                draft_cluster_map[str(d["id"])] = str(d.get("cluster", "default"))
 
     if cfg.trace_path:
         records = list(iter_trace_records(cfg.trace_path, defaults=cfg.trace_defaults))
@@ -1425,17 +2133,58 @@ def build(env: simpy.Environment, cfg: Config):
                 flush=True,
             )
 
-    RouterCls = ROUTERS.get(cfg.router, RoundRobinRouter)
-    if RouterCls == WeightedJSQ2Router:
-        router = RouterCls(targets, d_choices=int(cfg.router_params.get("d_choices", 2)), debug=cfg.debug)
-    elif RouterCls == JSQ2Router:
-        router = RouterCls(targets, d_choices=int(cfg.router_params.get("d_choices", 2)))
-    else:
-        router = RouterCls(targets)
-    
-    # Set router reference on targets for JIQ notifications
-    for target in targets:
-        target.router = router
+    router_instances: Dict[str, object] = {}
+    for cluster_name, cluster_targets in targets_by_cluster.items():
+        router_name = cfg.cluster_router.get(cluster_name, cfg.router)
+        RouterCls = ROUTERS.get(router_name, RoundRobinRouter)
+        params = dict(cfg.router_params or {})
+        params.update(cfg.cluster_router_params.get(cluster_name, {}) or {})
+        if RouterCls == WeightedJSQ2Router:
+            router = RouterCls(cluster_targets, d_choices=int(params.get("d_choices", 2)), debug=cfg.debug)
+        elif RouterCls == JSQ2Router:
+            router = RouterCls(cluster_targets, d_choices=int(params.get("d_choices", 2)))
+        else:
+            router = RouterCls(cluster_targets)
+        router_instances[cluster_name] = router
+        for target in cluster_targets:
+            target.router = router
+            target_router_map[target.p.id] = router
+
+    if not router_instances and targets:
+        router_name = cfg.cluster_router.get("default", cfg.router)
+        RouterCls = ROUTERS.get(router_name, RoundRobinRouter)
+        params = dict(cfg.router_params or {})
+        params.update(cfg.cluster_router_params.get("default", {}) or {})
+        if RouterCls == WeightedJSQ2Router:
+            router = RouterCls(targets, d_choices=int(params.get("d_choices", 2)), debug=cfg.debug)
+        elif RouterCls == JSQ2Router:
+            router = RouterCls(targets, d_choices=int(params.get("d_choices", 2)))
+        else:
+            router = RouterCls(targets)
+        router_instances["default"] = router
+        for target in targets:
+            target.router = router
+            target_router_map[target.p.id] = router
+
+    global_router = None
+    global_router_name = (cfg.global_router or "weighted_cluster") if cfg.global_router is not None else "weighted_cluster"
+    if str(global_router_name).lower() not in {"none", "disabled", "off"}:
+        GlobalRouterCls = GLOBAL_ROUTERS.get(global_router_name, GlobalWeightedRouter)
+        global_router = GlobalRouterCls(
+            cluster_targets=targets_by_cluster,
+            target_lookup=target_lookup,
+            params=cfg.global_router_params,
+        )
+
+    scheduler = Scheduler(
+        env,
+        cfg,
+        target_lookup=target_lookup,
+        targets_by_cluster=targets_by_cluster,
+        kv_manager=kv_manager,
+        global_router=global_router,
+        metrics=metrics,
+    )
 
     # Validate we have at least one target and one draft
     if not targets:
@@ -1458,44 +2207,58 @@ def build(env: simpy.Environment, cfg: Config):
             
         if draft_id not in connection_map:
             connection_map[draft_id] = {}
-            
+
+        conn_cluster = str(conn_cfg.get("cluster", target_cluster_map.get(target_id, draft_cluster_map.get(draft_id, "default"))))
         connection_map[draft_id][target_id] = ConnectionParams(
             draft_id=draft_id,
             target_id=target_id,
             forward_latency_ms=float(conn_cfg.get("forward_latency_ms", 20.0)),
             response_latency_ms=float(conn_cfg.get("response_latency_ms", 20.0)),
             acceptance_rate=float(conn_cfg.get("acceptance_rate", 0.8)),
+            cluster=conn_cluster,
         )
     
     # Create draft servers with connections
+
     for d in draft_configs:
+        cluster_name = draft_cluster_map.get(d.get("id"), str(d.get("cluster", "default")))
         params = DraftParams(
             id=d["id"],
             capability=float(d.get("capability", 1.0)),
             generation_latency_ms=float(d.get("generation_latency_ms", 0.0)),
             burst_factor=float(d.get("burst_factor", 1.0)),
             reliability=float(d.get("reliability", 0.99)),
+            cluster=cluster_name,
         )
-        
-        # Get connections for this draft
-        draft_connections = connection_map.get(d["id"], {})
+
+        draft_connections_all = connection_map.get(d["id"], {})
+        draft_connections = {tid: conn for tid, conn in draft_connections_all.items() if conn.cluster == cluster_name}
+        if not draft_connections:
+            draft_connections = draft_connections_all
         if not draft_connections:
             print(f"Warning: Draft {d['id']} has no connections configured", flush=True)
-        
+        draft_router = router_instances.get(cluster_name) or router_instances.get("default")
+        if draft_router is None:
+            raise ValueError(f"No router available for cluster '{cluster_name}' (draft {d['id']})")
+
         trace_records = trace_schedule.for_draft(d["id"]) if trace_schedule else None
         drafts.append(
             DraftServer(
-                env,
-                params,
-                cfg,
-                router,
-                draft_connections,
-                total_capability,
-                metrics,
+                env=env,
+                params=params,
+                cfg=cfg,
+                router=draft_router,
+                global_router=global_router,
+                target_lookup=target_lookup,
+                connections=draft_connections,
+                total_capability=total_capability,
+                metrics=metrics,
+                scheduler=scheduler,
                 trace_records=trace_records,
                 performance_provider=performance_provider,
             )
         )
+
 
     # Start heartbeat monitor
     if cfg.verbose:
@@ -1625,17 +2388,21 @@ def get_draft_metrics(drafts: List[DraftServer]) -> Dict[str, Dict[str, Any]]:
     """Extract per-draft metrics for speculative decoding."""
     results = {}
     for d in drafts:
-        if d.chunks_sent > 0:
-            acceptance_rate = d.total_tokens_accepted / d.total_tokens_generated
+        generated = max(0, d.total_tokens_generated)
+        if d.chunks_sent > 0 and generated > 0:
+            acceptance_rate = d.total_tokens_accepted / generated
+            avg_rtt = d.total_round_trip_time / d.chunks_sent
+        elif d.chunks_sent > 0:
+            acceptance_rate = 0.0
             avg_rtt = d.total_round_trip_time / d.chunks_sent
         else:
-            acceptance_rate = 0
-            avg_rtt = 0
+            acceptance_rate = 0.0
+            avg_rtt = 0.0
             
         results[d.p.id] = {
             "capability": d.p.capability,
             "chunks_sent": d.chunks_sent,
-            "tokens_generated": d.total_tokens_generated,
+            "tokens_generated": generated,
             "tokens_accepted": d.total_tokens_accepted,
             "tokens_rejected": d.total_tokens_rejected,
             "acceptance_rate": acceptance_rate,
@@ -1643,26 +2410,57 @@ def get_draft_metrics(drafts: List[DraftServer]) -> Dict[str, Dict[str, Any]]:
         }
     return results
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--config", "-c", default="configs/config.yaml")
-    args = ap.parse_args()
-    cfg = load_config(args.config)
-    
-    result = run(cfg)
+def _unpack_run_result(result):
     if isinstance(result, tuple) and len(result) == 3:
-        metrics, targets, drafts = result
-    elif isinstance(result, tuple) and len(result) == 2:
+        return result
+    if isinstance(result, tuple) and len(result) == 2:
         metrics, targets = result
-        drafts = []
-    else:
-        metrics = result
-        targets = []
-        drafts = []
-    
-    # Get the summary from metrics
-    summary = metrics.summary() if hasattr(metrics, 'summary') else {}
-    
+        return metrics, targets, []
+    return result, [], []
+
+
+def _collect_metrics_json(cfg: Config, metrics, summary: Dict[str, float], targets: List[TargetServer]) -> Dict[str, float]:
+    import statistics
+
+    metrics_json = {
+        "scheduler": cfg.scheduler_config.get("type", "baseline"),
+        "seed": cfg.seed,
+        "load_rps": cfg.workload.rate_rps,
+        "avg_latency_ms": summary.get("avg_ms", 0),
+        "p50_latency_ms": summary.get("p50_ms", 0),
+        "p95_latency_ms": summary.get("p95_ms", 0),
+        "p99_latency_ms": summary.get("p99_ms", 0),
+        "rtt_avg_ms": summary.get("rtt_avg_ms", 0),
+        "rtt_p50_ms": summary.get("rtt_p50_ms", 0),
+        "rtt_p95_ms": summary.get("rtt_p95_ms", 0),
+        "rtt_p99_ms": summary.get("rtt_p99_ms", 0),
+        "throughput_jobs_s": summary.get("throughput_jobs_s", 0),
+        "acceptance_rate": metrics.token_metrics.get_acceptance_rate() if hasattr(metrics, 'token_metrics') else 0,
+        "effective_tok_s": metrics.token_metrics.get_effective_tokens_per_second() if hasattr(metrics, 'token_metrics') else 0,
+    }
+
+    if targets:
+        all_batch_sizes = []
+        prefill_counts = []
+        decode_counts = []
+        for t in targets:
+            if hasattr(t, 'batch_history'):
+                for batch in t.batch_history:
+                    all_batch_sizes.append(len(batch))
+                    prefill_counts.append(sum(1 for j in batch if j.job_type == "prefill"))
+                    decode_counts.append(sum(1 for j in batch if j.job_type == "decode"))
+
+        if all_batch_sizes:
+            metrics_json["avg_batch_size"] = statistics.mean(all_batch_sizes)
+            if prefill_counts:
+                metrics_json["avg_prefills_per_batch"] = statistics.mean(prefill_counts)
+            if decode_counts:
+                metrics_json["avg_decodes_per_batch"] = statistics.mean(decode_counts)
+
+    return metrics_json
+
+
+def _print_report(cfg: Config, metrics, summary: Dict[str, float], targets: List[TargetServer], drafts: List[DraftServer], metrics_json: Dict[str, float]) -> None:
     # Print results
     print("\n" + "="*60)
     print("SIMULATION RESULTS")
@@ -1725,45 +2523,107 @@ def main():
         print("="*60)
     
     # Output JSON metrics for analysis
-    import json
-    import statistics
     print("\n===METRICS_JSON===")
-    metrics_json = {
-        "scheduler": cfg.scheduler_config.get("type", "baseline"),
-        "seed": cfg.seed,
-        "load_rps": cfg.workload.rate_rps,
-        "avg_latency_ms": summary.get("avg_ms", 0),
-        "p50_latency_ms": summary.get("p50_ms", 0),
-        "p95_latency_ms": summary.get("p95_ms", 0),
-        "p99_latency_ms": summary.get("p99_ms", 0),
-        "rtt_avg_ms": summary.get("rtt_avg_ms", 0),
-        "rtt_p50_ms": summary.get("rtt_p50_ms", 0),
-        "rtt_p95_ms": summary.get("rtt_p95_ms", 0),
-        "rtt_p99_ms": summary.get("rtt_p99_ms", 0),
-        "throughput_jobs_s": summary.get("throughput_jobs_s", 0),
-        "acceptance_rate": metrics.token_metrics.get_acceptance_rate() if hasattr(metrics, 'token_metrics') else 0,
-        "effective_tok_s": metrics.token_metrics.get_effective_tokens_per_second() if hasattr(metrics, 'token_metrics') else 0,
-    }
-    
-    # Add batch composition if available
-    if targets and len(targets) > 0:
-        all_batch_sizes = []
-        prefill_counts = []
-        decode_counts = []
-        for t in targets:
-            if hasattr(t, 'batch_history'):
-                for batch in t.batch_history:
-                    all_batch_sizes.append(len(batch))
-                    prefill_counts.append(sum(1 for j in batch if j.job_type == "prefill"))
-                    decode_counts.append(sum(1 for j in batch if j.job_type == "decode"))
-        
-        if all_batch_sizes:
-            metrics_json["avg_batch_size"] = statistics.mean(all_batch_sizes)
-            metrics_json["avg_prefills_per_batch"] = statistics.mean(prefill_counts) if prefill_counts else 0
-            metrics_json["avg_decodes_per_batch"] = statistics.mean(decode_counts) if decode_counts else 0
-    
     print(json.dumps(metrics_json, indent=2))
     print("===END_METRICS_JSON===")
+
+
+def simulate_config(config_path: str, *, emit_output: bool = True) -> Dict[str, float]:
+    cfg = load_config(config_path)
+    result = run(cfg)
+    metrics, targets, drafts = _unpack_run_result(result)
+    summary = metrics.summary() if hasattr(metrics, 'summary') else {}
+    metrics_json = _collect_metrics_json(cfg, metrics, summary, targets)
+    if emit_output:
+        _print_report(cfg, metrics, summary, targets, drafts, metrics_json)
+    return metrics_json
+
+
+def _maybe_plot(results: List[tuple[str, Dict[str, float]]], output_path: Path) -> Path:
+    try:
+        import matplotlib.pyplot as plt
+    except ImportError as exc:
+        raise RuntimeError("matplotlib is required for --plot") from exc
+
+    labels = [label for label, _ in results]
+    avg_latencies = [metrics.get("avg_latency_ms", 0.0) for _, metrics in results]
+    rtt_latencies = [metrics.get("rtt_avg_ms", 0.0) for _, metrics in results]
+
+    x = range(len(labels))
+    bar_width = 0.35
+
+    plt.figure(figsize=(6, 4))
+    plt.bar([i - bar_width / 2 for i in x], avg_latencies, width=bar_width, label="Target avg latency (ms)")
+    plt.bar([i + bar_width / 2 for i in x], rtt_latencies, width=bar_width, label="Conversation RTT avg (ms)")
+    plt.ylabel("Latency (ms)")
+    plt.xticks(list(x), labels, rotation=15)
+    plt.title("Average Latency Comparison")
+    plt.legend()
+    plt.tight_layout()
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    plt.savefig(output_path, dpi=150)
+    plt.close()
+    return output_path
+
+
+def main():
+    repo_root = Path(__file__).resolve().parent
+
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--config", "-c", default="configs/config.yaml")
+    ap.add_argument("--label", help="Optional label for the primary config when plotting.")
+    ap.add_argument(
+        "--compare",
+        action="append",
+        default=[],
+        help="Additional configs to compare, formatted as label=path/to/config.yaml",
+    )
+    ap.add_argument(
+        "--plot",
+        nargs="?",
+        const="AUTO",
+        help="Generate latency comparison plot (optionally provide output path).",
+    )
+    ap.add_argument(
+        "--metrics-json",
+        help="Optional path to write aggregated metrics JSON when using --plot or --compare.",
+    )
+
+    args = ap.parse_args()
+
+    config_entries: List[tuple[str, Path]] = []
+    primary_path = Path(args.config)
+    primary_label = args.label or primary_path.stem
+    config_entries.append((primary_label, primary_path))
+
+    for entry in args.compare:
+        if "=" not in entry:
+            ap.error(f"Invalid --compare entry '{entry}'. Expected label=path format.")
+        label, path = entry.split("=", 1)
+        config_entries.append((label, Path(path).resolve()))
+
+    if args.plot and len(config_entries) == 1 and not args.compare:
+        default_compare = repo_root / "explorer" / "output" / "baseline_vs_disagg" / "disagg_baseline" / "configs" / "disagg_baseline.yaml"
+        if default_compare.exists():
+            config_entries.append(("disagg_baseline", default_compare))
+
+    aggregated: List[tuple[str, Dict[str, float]]] = []
+    for idx, (label, path) in enumerate(config_entries):
+        emit = not args.plot or idx == 0
+        metrics_json = simulate_config(str(path), emit_output=emit)
+        aggregated.append((label, metrics_json))
+
+    if args.metrics_json:
+        metrics_path = Path(args.metrics_json)
+        metrics_path.parent.mkdir(parents=True, exist_ok=True)
+        with metrics_path.open("w", encoding="utf-8") as fh:
+            json.dump({label: metrics for label, metrics in aggregated}, fh, indent=2)
+
+    if args.plot:
+        output_path = Path(args.plot if args.plot != "AUTO" else repo_root / "scripts_output" / "latency_comparison.png")
+        plot_path = _maybe_plot(aggregated, output_path.resolve())
+        print(f"Plot saved to {plot_path}")
 
 if __name__ == "__main__":
     main()

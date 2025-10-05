@@ -1,51 +1,56 @@
-# Next-generation baseline configuration for heterogeneous speculative decoding experiments.
-# - 100 target servers spanning four capability tiers
-# - 300 drafts grouped in four capability buckets with distinct generation latencies
-# - Rich connectivity matrix capturing affinity, fanout limits, and network jitter
-# - Designed to exercise VIDUR lookups and future acceptance predictors
+# Multi-cluster baseline configuration for advanced speculative decoding experiments.
+# - 30 targets organized into three clusters (10/5/15)
+# - 300 drafts split evenly across clusters with distinct capability buckets
+# - Per-cluster routers and connectivity rules to exercise hierarchical scheduling
 
-sim_time_ms: 90000                 # 90 seconds wall-clock to capture steady-state behaviour
-burn_in_ms: 5000                   # Ignore first 5s while queues warm up
-seed: 31415                        # Deterministic reproducibility
+sim_time_ms: 90000
+burn_in_ms: 5000
+seed: 31415
 verbose: true
 debug: false
 
-execution_mode: speculative        # Enable speculative draft/verify flow
-gamma: 4                            # Draft chunk size (tokens per speculation round)
+execution_mode: speculative
+gamma: 4
 
-# Conversation mix — used when generating synthetic traces or running without a replay file.
-answer_length_mean: 540
-answer_length_std: 160
-answer_length_min: 120
-answer_length_max: 1024
+# Conversation mix (used when generating synthetic traces)
+answer_length_mean: 520
+answer_length_std: 150
+answer_length_min: 128
+answer_length_max: 960
 use_answer_distribution: true
-prompt_length_min: 48
-prompt_length_max: 640
+prompt_length_min: 40
+prompt_length_max: 512
 prompt_scale_by_capability: true
-mixed_batching: true               # Allow prefill/decode co-resident in a batch
+mixed_batching: true
 
-router: semi_clairvoyant
+think_time:
+  enabled: true
+  distribution: lognormal
+  mean_ms: 1800
+  cv: 0.6
+  min_ms: 250
+
+router: wjsq2
 router_params:
-  d_choices: 4                     # Used by JSQ-family routers; ignored by semi-clairvoyant
+  d_choices: 3
 
 scheduler:
-  type: decode_first               # Baseline with decode-first bias for mixed batches
-  max_prefills_per_batch: 2        # Allow limited prefills alongside decodes
-  adaptive_window: true            # Dynamically widen/narrow batch window via observed latency
-  prefill_chunk_tokens: 128        # Chunk long prompts to reduce head-of-line blocking
-  two_lane: true                   # Two-lane scheduling with separate queues
-  prefill_share: 0.35              # Reserve 35% server time for prefills when two_lane=true
+  type: decode_first
+  max_prefills_per_batch: 2
+  adaptive_window: true
+  prefill_chunk_tokens: 96
+  two_lane: true
+  prefill_share: 0.30
 
 performance_model:
   type: vidur
   vidur:
-    table_path: data/vidur/lut_cluster_v1.parquet   # Placeholder; supply real LUT bundle
-    default_latency_ms: 42.0
+    table_path: data/vidur/lut_cluster_v1.parquet
+    default_latency_ms: 38.0
     neighbors: 5
     prefer_exact: false
     bootstrap_defaults: true
 
-# Optional trace replay (comment out to run synthetic workload). Defaults are merged into entries.
 trace_path: null
 trace_defaults:
   slo_class: standard
@@ -53,107 +58,209 @@ trace_defaults:
 
 workload:
   arrival: poisson
-  rate_rps: 220.0                   # High-rate workload to exercise resource contention
+  rate_rps: 160.0
 
 auto_topology:
-  targets:
-    count: 100
-    tiers:
-      - name: apex
-        ratio: 0.20                  # 20 H100/H200-class racks
-        model: llama-70b
-        gpu: H100
-        weight: 1.5
-        batch_window_ms: 3.5
-        batch_size: 40
-        prefill_latency_per_token: 0.26
-        decode_latency_per_token: 0.94
-        energy_per_token_mj: 0.018
-      - name: core
-        ratio: 0.30                  # 30 A100-class racks
-        model: llama-34b
-        gpu: A100
-        weight: 1.15
-        batch_window_ms: 4.5
-        batch_size: 48
-        prefill_latency_per_token: 0.38
-        decode_latency_per_token: 1.25
-        energy_per_token_mj: 0.022
-      - name: regional
-        ratio: 0.30                  # 30 L40-class regional POPs
-        model: llama-13b
-        gpu: L40
-        weight: 0.85
-        batch_window_ms: 6.0
-        batch_size: 56
-        prefill_latency_per_token: 0.68
-        decode_latency_per_token: 2.05
-        energy_per_token_mj: 0.031
-      - name: edge
-        ratio: 0.20                  # 20 A10-class edge deployments
-        model: llama-7b
-        gpu: A10
-        weight: 0.55
-        batch_window_ms: 7.5
-        batch_size: 64
-        prefill_latency_per_token: 0.92
-        decode_latency_per_token: 2.85
-        energy_per_token_mj: 0.044
+  clusters:
+    - name: cluster_a
+      router: semi_clairvoyant
+      targets:
+        count: 10
+        tiers:
+          - name: a_apex
+            count: 4
+            model: llama-70b
+            gpu: H100
+            weight: 1.6
+            batch_window_ms: 3.5
+            batch_size: 28
+            prefill_latency_per_token: 0.24
+            decode_latency_per_token: 0.88
+          - name: a_core
+            count: 6
+            model: llama-34b
+            gpu: A100
+            weight: 1.25
+            batch_window_ms: 4.5
+            batch_size: 36
+            prefill_latency_per_token: 0.36
+            decode_latency_per_token: 1.18
+      drafts:
+        count: 100
+        gens_ms_per_gamma:
+          - [4, 10]
+          - [12, 28]
+          - [32, 64]
+          - [72, 150]
+        capability_map:
+          0: 3.8
+          1: 2.6
+          2: 1.5
+          3: 0.9
+        draft_bucket_labels: [dc_ultra, dc_high, dc_mid, dc_edge]
+        reliability:
+          dc_ultra: 0.997
+          dc_high: 0.992
+          dc_mid: 0.983
+          dc_edge: 0.970
+      connectivity:
+        fanout_per_draft: 5
+        fanout_override:
+          dc_mid: 4
+          dc_edge: 3
+        affinity_rules:
+          dc_ultra: [a_apex]
+          dc_high: [a_apex, a_core]
+          dc_mid: [a_core]
+          dc_edge: [a_core]
+        net_ms_ranges:
+          a_apex: [1.5, 3.5]
+          a_core: [3.0, 6.5]
+        acceptance_by_tier:
+          "0": {a_apex: 0.95}
+          "1": {a_apex: 0.93, a_core: 0.90}
+          "2": {a_core: 0.86}
+          "3": {a_core: 0.80}
+        link_jitter_pct: 0.12
+        drop_rate:
+          dc_edge: 0.004
 
-  drafts:
-    count: 300
-    gens_ms_per_gamma:
-      - [5, 14]                     # Bucket 0: datacenter-resident drafts
-      - [15, 36]                    # Bucket 1: regional GPU pods
-      - [40, 86]                    # Bucket 2: enterprise / high-end laptops
-      - [90, 210]                   # Bucket 3: consumer mobile/edge
-    capability_map:
-      0: 3.4
-      1: 2.1
-      2: 1.2
-      3: 0.65
-    draft_bucket_labels: [dc_fast, regional_gpu, enterprise, mobile]
-    reliability:
-      dc_fast: 0.995
-      regional_gpu: 0.985
-      enterprise: 0.970
-      mobile: 0.940
+    - name: cluster_b
+      router: wjsq2
+      router_params:
+        d_choices: 2
+      targets:
+        count: 5
+        tiers:
+          - name: b_regional
+            count: 3
+            model: llama-13b
+            gpu: L40
+            weight: 0.9
+            batch_window_ms: 5.5
+            batch_size: 32
+            prefill_latency_per_token: 0.62
+            decode_latency_per_token: 1.95
+          - name: b_edge
+            count: 2
+            model: llama-7b
+            gpu: A10
+            weight: 0.65
+            batch_window_ms: 7.0
+            batch_size: 40
+            prefill_latency_per_token: 0.90
+            decode_latency_per_token: 2.70
+      drafts:
+        count: 100
+        gens_ms_per_gamma:
+          - [15, 32]
+          - [38, 80]
+          - [90, 160]
+        capability_map:
+          0: 2.2
+          1: 1.2
+          2: 0.7
+        draft_bucket_labels: [rg_gpu, rg_enterprise, rg_mobile]
+        reliability:
+          rg_gpu: 0.985
+          rg_enterprise: 0.970
+          rg_mobile: 0.945
+      connectivity:
+        fanout_per_draft: 4
+        fanout_override:
+          rg_mobile: 3
+        affinity_rules:
+          rg_gpu: [b_regional]
+          rg_enterprise: [b_regional, b_edge]
+          rg_mobile: [b_edge]
+        net_ms_ranges:
+          b_regional: [10.0, 22.0]
+          b_edge: [20.0, 45.0]
+        acceptance_by_tier:
+          "0": {b_regional: 0.88}
+          "1": {b_regional: 0.82, b_edge: 0.75}
+          "2": {b_edge: 0.66}
+        link_jitter_pct: 0.18
+        drop_rate:
+          rg_mobile: 0.010
 
-  connectivity:
-    fanout_per_draft: 5
-    fanout_override:
-      enterprise: 4
-      mobile: 3
-    affinity_rules:
-      dc_fast: [apex, core]
-      regional_gpu: [apex, core, regional]
-      enterprise: [core, regional]
-      mobile: [regional, edge]
-    net_ms_ranges:
-      apex: [1.5, 4.0]
-      core: [4.0, 9.0]
-      regional: [12.0, 28.0]
-      edge: [24.0, 55.0]
-    acceptance_by_tier:
-      "dc_fast":    {apex: 0.93, core: 0.91}
-      "regional_gpu": {apex: 0.90, core: 0.88, regional: 0.82}
-      "enterprise":  {core: 0.82, regional: 0.76}
-      "mobile":      {regional: 0.69, edge: 0.61}
-    link_jitter_pct: 0.20            # Uniform ±20% jitter applied to sampled latencies
-    drop_rate:
-      enterprise: 0.005
-      mobile: 0.012
+    - name: cluster_c
+      router: jiq
+      targets:
+        count: 15
+        tiers:
+          - name: c_hub
+            count: 5
+            model: llama-34b
+            gpu: A100
+            weight: 1.1
+            batch_window_ms: 4.8
+            batch_size: 40
+            prefill_latency_per_token: 0.40
+            decode_latency_per_token: 1.32
+          - name: c_regional
+            count: 6
+            model: llama-13b
+            gpu: L4
+            weight: 0.85
+            batch_window_ms: 6.2
+            batch_size: 44
+            prefill_latency_per_token: 0.74
+            decode_latency_per_token: 2.20
+          - name: c_edge
+            count: 4
+            model: llama-7b
+            gpu: T4
+            weight: 0.55
+            batch_window_ms: 8.5
+            batch_size: 48
+            prefill_latency_per_token: 1.05
+            decode_latency_per_token: 3.10
+      drafts:
+        count: 100
+        gens_ms_per_gamma:
+          - [20, 42]
+          - [48, 110]
+          - [120, 220]
+        capability_map:
+          0: 1.9
+          1: 1.0
+          2: 0.55
+        draft_bucket_labels: [metro, suburban, remote]
+        reliability:
+          metro: 0.980
+          suburban: 0.955
+          remote: 0.925
+      connectivity:
+        fanout_per_draft: 4
+        fanout_override:
+          remote: 2
+        affinity_rules:
+          metro: [c_hub]
+          suburban: [c_hub, c_regional]
+          remote: [c_regional, c_edge]
+        net_ms_ranges:
+          c_hub: [6.0, 14.0]
+          c_regional: [16.0, 32.0]
+          c_edge: [28.0, 60.0]
+        acceptance_by_tier:
+          "0": {c_hub: 0.89}
+          "1": {c_hub: 0.84, c_regional: 0.78}
+          "2": {c_regional: 0.70, c_edge: 0.60}
+        link_jitter_pct: 0.22
+        drop_rate:
+          remote: 0.015
 
-# Additional knobs for synthetic trace generation (used by simulator/trace/generate_trace.py)
+# Synthetic trace helper defaults (used by simulator/trace/generate_trace.py)
 synthetic_trace_defaults:
   request_prefix: simreq
   attach_device_tier: true
   slo_budget_ms:
-    premium: 1800
-    standard: 2400
-    relaxed: 3200
+    premium: 2000
+    standard: 2600
+    relaxed: 3600
+  include_cluster_label: true
 
-# Acceptance predictor placeholder configuration (future integration point).
 acceptance_model:
-  type: fallback                     # When implemented, switch to "vidur_lut" or "specpp"
-  fallback_rate: 0.78                # Used until the acceptance estimator is wired in
+  type: fallback
+  fallback_rate: 0.76

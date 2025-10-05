@@ -1,0 +1,24 @@
+experiment:
+  name: capacity_search
+  description: "Scale offered load on the tuned scheduler to find the capacity knee."
+  runs:
+    - name: rate_4rps
+      config: ../../configs/explorer/baseline.yaml
+      overrides:
+        workload:
+          rate_rps: 4.0
+    - name: rate_6rps
+      config: ../../configs/explorer/baseline.yaml
+      overrides:
+        workload:
+          rate_rps: 6.0
+    - name: rate_8rps
+      config: ../../configs/explorer/baseline.yaml
+      overrides:
+        workload:
+          rate_rps: 8.0
+    - name: rate_10rps
+      config: ../../configs/explorer/baseline.yaml
+      overrides:
+        workload:
+          rate_rps: 10.0

@@ -3,14 +3,26 @@
 
 from __future__ import annotations
 
+import os
+import sys
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+if SCRIPT_DIR in sys.path:
+    sys.path.remove(SCRIPT_DIR)
+ROOT = os.path.dirname(SCRIPT_DIR)
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
+
+from pathlib import Path
 import argparse
 import gzip
 import json
-import sys
-from pathlib import Path
 from typing import Dict, Iterable
 
-ROOT = Path(__file__).resolve().parent.parent
+SCRIPT_DIR = Path(__file__).resolve().parent
+if str(SCRIPT_DIR) in sys.path:
+    sys.path.remove(str(SCRIPT_DIR))
+ROOT = SCRIPT_DIR.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 

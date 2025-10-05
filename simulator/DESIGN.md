@@ -159,6 +159,23 @@ This document lays out the core components and specifies the auxiliary design fi
 | Logging / Finalization | Metrics Reporter, Reproducibility Log, Queueing Model, Device Registry, Acceptance Estimator |
 
 ## TODO
+
+### Multi-Cluster Routing & Per-Cluster Routers
+
+- **Rationale**: Many large-scale deployments operate multiple independent clusters (core DC, regional, edge), each with device-specific routers. We extend the auto-topology to synthesise cluster-aware targets/drafts, and the runtime instantiates one router per cluster.
+  - Config additions: `auto_topology.clusters[]`, `cluster_router`, `cluster_router_params`, per-device `cluster` labels.
+  - Build flow: group targets by cluster, create dedicated router instances (`semi_clairvoyant`, `wjsq2`, `jiq`, etc.), and wire drafts to the router associated with their cluster. Connections inherit the cluster context so drafts only see allowed targets.
+  - Benefits: isolates routing policies and load balancing per cluster, allows hybrid topologies (e.g. Sarathi on core, wJSQ on edge), and mirrors realistic multi-region deployments.
+
+### Per-Draft Closed-Loop Think Time
+
+- **Problem**: Open-loop traces can overdrive drafts because arrivals ignore service latency.
+- **Solution**: Introduced `think_time` config (log-normal/exponential/constant/workload), tracked per draft. After a request completes the draft schedules its next arrival at `t_done + think_time`.
+  - Trace replay: actual arrival is `max(trace_arrival, next_available_ms)` so recorded timestamps act as lower bounds.
+  - Synthetic mode: when `think_time.enabled=true`, drafts sample from the configured distribution instead of `workload.interarrival`.
+  - Staging: new helper methods `_sample_think_time` and `_schedule_next_arrival` in `DraftServer`, plus `_next_available_ms` fields.
+- **Impact**: More realistic client pacing and enables interactive response-time analysis; turning off the flag reverts to open-loop behaviour for stress tests.
+
 - Replace the FIFO event queues with a priority queue abstraction to capture SLO-aware arrivals, preemption, and cancellation heuristics.
 - Model GPU resource pools explicitly (streaming multiprocessors, HBM, KV bandwidth) so batching and VIDUR-driven latencies respect resource contention instead of a single-server approximation.
 - Revisit the SimPy kernel choice (PriorityResource, ProcessPool, or an internal dispatcher) once VIDUR integration stabilises to support multi-server targets and GPU sharing semantics.
@@ -511,6 +528,62 @@ reproducibility:
 Validators lock these fields into run metadata, enabling regression comparison across commits and CI.
 
 ## 6. Scheduling & Planner Design
+
+### Scheduler Configuration Knobs and Trade-offs
+
+
+### Scheduler Explorer Modes
+
+#### Mode A – Fixed Hardware, Sweep Policies
+- **Inputs**: draft/target capacities (per cluster), router/pool assignments, batching knobs, speculation parameters (`k`, stop rule `h`), KV utilization rules, per-phase parallelism (TP/PP/CP/MoE, collective algorithm).
+- **Objective**: maximize SLO-goodput subject to TTFT/TPOT tail constraints (p95/p99) and optional cost/GPU-hour bounds.
+- **Search**: grid/random/Bayesian sweeps with early pruning (queueing bounds, micro-sims), leveraging parallel experiment execution (Multiverse-style) to accelerate runs.
+- **Outputs**: top-k policy bundles per hardware point plus Pareto curves (goodput vs TTFT/TPOT tails vs cost) for comparing co-location vs disaggregation, chunk sizes, paging, etc.
+
+#### Mode B – Fixed Policy, Find Max Stable Load
+- **Inputs**: selected scheduler/policy, hardware topology, workload generator (open-loop trace scaling or closed-loop session generator with think time).
+- **Method**: scale offered load (QPS multiplier or active sessions) via binary search; warm-up, measure steady-state queues and SLO metrics.
+- **Stability criteria**: declare instability when queues diverge or TTFT/TPOT tails exceed thresholds; otherwise continue.
+- **Outputs**: capacity card summarising max SLO-goodput, throughput/latency curve, pool utilization, and interference (prefill vs decode).
+
+#### Explorer Plumbing
+- Experiment spec describing policy sweeps or load ramps.
+- Runner with warm-up + measurement windows, metrics collector, and early pruner for failing configs.
+- Aggregator producing tables/plots (Pareto frontiers, capacity cards) for reporting.
+
+
+- **Queue Topology**
+  - Maintain separate iteration queues for prefill and decode; each queue may target a dedicated GPU pool (disaggregated) or share devices (co-located).
+  - Queue policies (FIFO, EDF/least-slack-first, age-based) exposed via `scheduler.prefill.queue_policy` and `scheduler.decode.queue_policy`.
+  - Support multiple SLO classes: `scheduler.priority_classes[*]` defines weights, max wait, slack thresholds.
+
+- **Pool Assignment (Co-locate vs Disaggregate)**
+  - `scheduler.prefill.pool` and `scheduler.decode.pool` reference cluster names defined in `auto_topology.clusters`. Flip these to compare co-location versus DistServe-style disaggregation.
+
+- **Batch Formation**
+  - Continuous batching for decode (`scheduler.decode.continuous=true`), with controls for `max_batch_tokens`, `max_batch_requests`, and `max_wait_us`.
+  - Chunked prefill (`scheduler.prefill.chunk_tokens`) and selective batching (`scheduler.decode.selective_ops`) to avoid prompt-induced stalls and respect shape-aware batching.
+
+- **Delay Budget & Admission Timing**
+  - `max_wait_us` per phase/SLO bucket bounds batching delay; scheduler chooses eligible jobs each tick based on arrival ≤ now, KV headroom, SLO slack, and shape bucket.
+  - Config knobs live under `scheduler.decode.selection` / `scheduler.prefill.selection`.
+
+- **KV & Memory Rules**
+  - `scheduler.kv.max_utilization_pct` enforces KV headroom. Optional paging (`scheduler.kv.paging`) declares page size, page-in penalty, and eviction policy for vLLM-style demand paging.
+
+- **Parallelism Plans & Collectives**
+  - Phase-specific parallelism (`scheduler.prefill.parallelism`, `scheduler.decode.parallelism`) describe TP/PP/CP/MoE degrees and collective algorithm (`ring`, `tree`, `multishot`). Planner can swap plans dynamically.
+
+- **Preemption & Fairness**
+  - Soft preemption between iterations (`scheduler.decode.preemption.enabled`, `slack_threshold_ms`) plus age/EDF weighting (`scheduler.decode.age_weight`) to keep tails in check.
+
+- **Router ↔ Scheduler Feedback**
+  - Router performs global target selection; per-GPU scheduler applies the above knobs. Optional feedback (`scheduler.router_feedback`) exports queue depth/slack/acceptance for router load balancing.
+
+- **Objective Controls**
+  - `scheduler.objective` chooses throughput-centric, latency-centric, or balanced goals; telemetry logs TTFT/TPOT/throughput so experiments (e.g., co-located vs disaggregated, chunk sizes, paging toggles) can be compared.
+
+These knobs mirror the mechanisms used in ORCA, Sarathi-Serve, DistServe, Triton, vLLM, and LLMServingSim, letting us toggle features without code changes.
 
 ### 6.1 Draft Scheduler
 

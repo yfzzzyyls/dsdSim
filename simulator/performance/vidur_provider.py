@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
+import math
 import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Optional, Sequence, Tuple
+from typing import Any, Dict, Optional, Sequence, Tuple
 
 from .base import PhaseMetrics, PhaseRequest, PerformanceProvider
 
@@ -55,6 +57,124 @@ class VidurProviderConfig:
     oracle: Optional[object] = None  # Expected to implement ILatencyOracle
 
 
+class SyntheticVidurOracle:
+    """Heuristic fallback when no VIDUR assets are available."""
+
+    def __init__(self, default_latency_ms: float = 50.0) -> None:
+        self._default_latency_ms = max(1.0, float(default_latency_ms))
+
+    def predict(self, request: PhaseRequest, target_info: Optional[Dict[str, Any]] = None) -> PhaseMetrics:
+        model = _infer_model_name(request, target_info)
+        hardware = _infer_hardware_name(request, target_info)
+        model_scale = _infer_model_scale(model)
+        hw_factor = _hardware_speed_factor(hardware)
+        batch_factor = 1.0 + max(0, request.batch_size - 1) * 0.12
+        microbatch_factor = 1.0 + max(0, request.microbatch_size - 1) * 0.05
+        fanout_factor = 1.0 + max(0, request.fanout - 1) * 0.08
+
+        if request.phase == "prefill":
+            tokens = max(
+                request.sequence_length,
+                request.context_length,
+                request.prompt_tokens or 0,
+                1,
+            )
+            per_token_ms = 0.32 * (model_scale / 70.0)
+            context_factor = 1.0 + (request.sequence_length / 4096.0) * 0.18
+            latency_ms = 8.0 + tokens * per_token_ms * hw_factor * batch_factor * context_factor
+            kv_delta = tokens * model_scale * 0.004
+        else:
+            tokens = max(request.tokens_to_generate, 1)
+            per_token_ms = 0.95 * (model_scale / 70.0)
+            context_len = max(request.context_length, request.context_tokens or 0, 1)
+            context_factor = 1.0 + (context_len / 4096.0) * 0.12
+            latency_ms = (
+                4.5
+                + tokens * per_token_ms * hw_factor * batch_factor * microbatch_factor * fanout_factor * context_factor
+            )
+            kv_delta = tokens * model_scale * 0.0025
+
+        latency_ms = max(latency_ms, self._default_latency_ms * 0.25)
+        jitter = _stable_jitter(
+            request.phase,
+            model,
+            hardware,
+            request.batch_size,
+            request.sequence_length,
+            request.tokens_to_generate,
+            request.context_length,
+        )
+        latency_ms *= jitter
+        latency_p95 = latency_ms * 1.18
+        energy_mj = tokens * model_scale * hw_factor * 0.0009
+        return PhaseMetrics(
+            latency_ms=latency_ms,
+            latency_p95_ms=latency_p95,
+            energy_mj=energy_mj,
+            kv_delta_mb=max(kv_delta, 0.0),
+        )
+
+
+def _infer_model_name(request: PhaseRequest, target_info: Optional[Dict[str, Any]]) -> str:
+    if request.model:
+        return str(request.model)
+    if target_info and target_info.get("model"):
+        return str(target_info["model"])
+    return "generic-13b"
+
+
+def _infer_hardware_name(request: PhaseRequest, target_info: Optional[Dict[str, Any]]) -> str:
+    if request.hardware:
+        return str(request.hardware)
+    if target_info and target_info.get("hardware"):
+        return str(target_info["hardware"])
+    return "A100"
+
+
+def _infer_model_scale(model_name: str) -> float:
+    lowered = model_name.lower()
+    if "70" in lowered:
+        return 70.0
+    if "65" in lowered:
+        return 65.0
+    if "40" in lowered:
+        return 40.0
+    if "34" in lowered or "33" in lowered:
+        return 34.0
+    if "30" in lowered:
+        return 30.0
+    if "13" in lowered or "12" in lowered:
+        return 13.0
+    if "7" in lowered or "8" in lowered:
+        return 7.0
+    if "3" in lowered:
+        return 3.0
+    return 13.0
+
+
+def _hardware_speed_factor(hardware: str) -> float:
+    table = {
+        "H100": 0.55,
+        "H200": 0.5,
+        "A100": 0.9,
+        "A800": 1.05,
+        "V100": 1.2,
+        "L40": 1.1,
+        "L4": 1.45,
+        "A10": 1.35,
+        "T4": 1.8,
+        "RTX4090": 0.85,
+    }
+    return table.get(hardware.upper(), table.get(hardware, 1.0))
+
+
+def _stable_jitter(*values: Any) -> float:
+    data = "|".join(str(v) for v in values).encode("utf-8")
+    digest = hashlib.blake2b(data, digest_size=8).digest()
+    jitter_raw = int.from_bytes(digest, "big") / float(2**64 - 1)
+    return 0.9 + jitter_raw * 0.2
+
+
 class VidurPerformanceProvider(PerformanceProvider):
     def __init__(self, config: VidurProviderConfig) -> None:
         self._config = config
@@ -65,13 +185,19 @@ class VidurPerformanceProvider(PerformanceProvider):
 
         oracle = config.oracle
         if oracle is None and _VidurOracle is not None and (config.table_path or config.bootstrap_defaults):
-            oracle = _VidurOracle(
-                table_path=str(config.table_path) if config.table_path else None,
-                default_latency_ms=config.default_latency_ms,
-                neighbors=max(1, config.neighbors),
-                prefer_exact=config.prefer_exact,
-                bootstrap_defaults=config.bootstrap_defaults,
-            )
+            try:
+                oracle = _VidurOracle(
+                    table_path=str(config.table_path) if config.table_path else None,
+                    default_latency_ms=config.default_latency_ms,
+                    neighbors=max(1, config.neighbors),
+                    prefer_exact=config.prefer_exact,
+                    bootstrap_defaults=config.bootstrap_defaults,
+                )
+            except FileNotFoundError:
+                oracle = None
+
+        if oracle is None:
+            oracle = SyntheticVidurOracle(default_latency_ms=config.default_latency_ms)
         self._oracle = oracle
 
     def register_target(self, *, target_id: str, model: str, hardware: str,
@@ -131,6 +257,10 @@ class VidurPerformanceProvider(PerformanceProvider):
     # ------------------------------------------------------------------
 
     def _invoke_vidur(self, request: PhaseRequest) -> Optional[PhaseMetrics]:
+        if isinstance(self._oracle, SyntheticVidurOracle):
+            target_info = self._targets.get(request.target_id or "")
+            return self._oracle.predict(request, target_info)  # type: ignore[arg-type]
+
         if self._oracle is not None:
             metrics = self._call_vidur_oracle(request)
             if metrics is not None:
@@ -305,4 +435,3 @@ def _expand_sequence(values: Optional[Sequence[int]], size: int, default: int) -
     if len(seq) < size:
         seq.extend([seq[-1]] * (size - len(seq)))
     return tuple(seq[:size])
-
