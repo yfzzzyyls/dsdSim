@@ -1065,6 +1065,9 @@ class PhaseSettings:
     retry_backoff_ms: float = 1.0
     max_retries: int = 3
     parallelism_plan: Dict[str, Any] = field(default_factory=dict)
+    dynamic_policy: Dict[str, Any] = field(default_factory=dict)
+    max_queue_depth: int = 0
+    backpressure_wait_ms: float = 0.1
 
 
 @dataclass(order=True)
@@ -1175,6 +1178,8 @@ class PhaseScheduler:
         self.priority_map = priority_map
         self.default_priority_class = default_priority_class
         self.metrics = metrics
+        self.dynamic_policy = dict(settings.dynamic_policy or {})
+        self._pending_enqueues = 0
         self.proc = env.process(self._run())
 
     def submit(self, job: Job) -> simpy.Event:
@@ -1233,17 +1238,26 @@ class PhaseScheduler:
             sort_key: Tuple[float, int] = (float(self._seq),)
         else:
             sort_key = (float(job.priority), self._seq)
-        self.store.put(QueueItem(sort_key, job))
+        item = QueueItem(sort_key, job)
+
+        if self.settings.max_queue_depth and self.settings.max_queue_depth > 0:
+            if len(self.store.items) + self._pending_enqueues >= self.settings.max_queue_depth:
+                self._schedule_backpressure(item)
+                return
+
+        self.store.put(item)
 
     def _run(self):
         while True:
             item = yield self.store.get()
             batch = [item.job]
             token_total = item.job.token_count
-            deadline = self.env.now + max(0.0, self.settings.max_wait_ms)
-            earliest_dispatch = self.env.now + max(0.0, self.settings.delayed_batch_ms)
 
-            while self._can_add_more(batch, token_total):
+            max_wait_ms, max_batch_requests, delay_ms = self._dynamic_batch_params(len(self.store.items))
+            deadline = self.env.now + max(0.0, max_wait_ms)
+            earliest_dispatch = self.env.now + max(0.0, delay_ms)
+
+            while self._can_add_more(batch, token_total, max_batch_requests):
                 now = self.env.now
                 remaining_deadline = max(0.0, deadline - now)
                 if remaining_deadline <= 0:
@@ -1268,12 +1282,63 @@ class PhaseScheduler:
 
             yield self.env.process(self._dispatch_batch_proc(batch))
 
-    def _can_add_more(self, batch: List[Job], token_total: int) -> bool:
-        if self.settings.max_batch_requests and len(batch) >= self.settings.max_batch_requests:
+    def _dynamic_batch_params(self, queue_depth: int) -> Tuple[float, int, float]:
+        dyn = self.dynamic_policy
+        if not dyn or not dyn.get("enabled", False):
+            return self.settings.max_wait_ms, self.settings.max_batch_requests, self.settings.delayed_batch_ms
+
+        low_depth = max(0, int(dyn.get("low_queue_depth", 0)))
+        high_depth = max(low_depth + 1, int(dyn.get("high_queue_depth", low_depth + 1)))
+
+        def _lerp(low_val: float, high_val: float) -> float:
+            if queue_depth <= low_depth:
+                return low_val
+            if queue_depth >= high_depth:
+                return high_val
+            span = high_depth - low_depth
+            alpha = (queue_depth - low_depth) / span
+            return low_val + alpha * (high_val - low_val)
+
+        low_wait = float(dyn.get("low_wait_ms", self.settings.max_wait_ms))
+        high_wait = float(dyn.get("high_wait_ms", self.settings.max_wait_ms))
+        effective_wait = _lerp(low_wait, high_wait)
+
+        low_batch = int(dyn.get("low_batch_requests", self.settings.max_batch_requests or 1))
+        high_batch = int(dyn.get("high_batch_requests", self.settings.max_batch_requests or low_batch))
+        effective_batch = int(round(_lerp(low_batch, high_batch)))
+        if effective_batch <= 0:
+            effective_batch = self.settings.max_batch_requests
+
+        low_delay = float(dyn.get("low_delay_ms", self.settings.delayed_batch_ms))
+        high_delay = float(dyn.get("high_delay_ms", self.settings.delayed_batch_ms))
+        effective_delay = _lerp(low_delay, high_delay)
+
+        return effective_wait, effective_batch, effective_delay
+
+    def _can_add_more(self, batch: List[Job], token_total: int, max_batch_requests: int) -> bool:
+        batch_limit = max_batch_requests if max_batch_requests and max_batch_requests > 0 else self.settings.max_batch_requests
+        if batch_limit and len(batch) >= batch_limit:
             return False
         if self.settings.max_batch_tokens and token_total >= self.settings.max_batch_tokens:
             return False
-        return len(batch) < max(1, self.settings.max_batch_requests)
+        limit = batch_limit if batch_limit and batch_limit > 0 else max(1, self.settings.max_batch_requests or 1)
+        return len(batch) < max(1, limit)
+
+    def _schedule_backpressure(self, item: QueueItem) -> None:
+        self._pending_enqueues += 1
+
+        def _deferred_enqueue():
+            while True:
+                depth = len(self.store.items)
+                limit = self.settings.max_queue_depth
+                if not limit or depth < limit:
+                    break
+                wait = max(0.0, self.settings.backpressure_wait_ms)
+                yield self.env.timeout(wait)
+            self._pending_enqueues -= 1
+            self.store.put(item)
+
+        self.env.process(_deferred_enqueue())
 
     def _dispatch_batch_proc(self, batch: List[Job]):
         groups: Dict[str, List[Job]] = {}
@@ -1453,6 +1518,9 @@ class Scheduler:
         settings.retry_backoff_ms = float(phase_cfg.get("retry_backoff_ms", settings.retry_backoff_ms))
         settings.max_retries = int(phase_cfg.get("max_retries", settings.max_retries))
         settings.parallelism_plan = dict(phase_cfg.get("parallelism", settings.parallelism_plan) or {})
+        settings.dynamic_policy = dict(phase_cfg.get("dynamic_policy", settings.dynamic_policy) or {})
+        settings.max_queue_depth = int(phase_cfg.get("max_queue_depth", settings.max_queue_depth))
+        settings.backpressure_wait_ms = float(phase_cfg.get("backpressure_wait_ms", settings.backpressure_wait_ms))
         if phase == "prefill":
             chunk_tokens = phase_cfg.get("chunk_tokens")
             if chunk_tokens is None:
