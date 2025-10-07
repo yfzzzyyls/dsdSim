@@ -13,6 +13,7 @@ from dataclasses import dataclass, field, asdict
 from typing import List, Optional, Dict, Any, Sequence, Iterable, Tuple, Mapping
 
 from performance import PhaseRequest, PerformanceModelConfig, create_performance_provider
+from network.topology import build_latency_lookup, NetworkModelError
 from trace.trace_loader import iter_trace_records
 from trace.types import TraceRecord, TraceParseError
 
@@ -1886,6 +1887,7 @@ def _expand_auto_topology(raw: Dict[str, Any]) -> Dict[str, Any]:
 
         targets_by_tier: defaultdict[str, list[str]] = defaultdict(list)
         tier_of: Dict[str, str] = {}
+        target_entries: list[Dict[str, Any]] = []
         target_index = 0
         for tier, count in zip(tiers, tier_counts):
             tier_name = str(tier.get("name", f"{cluster_name}_tier"))
@@ -1909,6 +1911,7 @@ def _expand_auto_topology(raw: Dict[str, Any]) -> Dict[str, Any]:
                 if "energy_per_token_mj" in tier:
                     entry["energy_per_token_mj"] = float(tier["energy_per_token_mj"])
                 cluster_devices.append(entry)
+                target_entries.append(entry)
                 tier_of[tid] = tier_name
                 targets_by_tier[tier_name].append(tid)
         all_tiers = list(targets_by_tier.keys())
@@ -1962,6 +1965,20 @@ def _expand_auto_topology(raw: Dict[str, Any]) -> Dict[str, Any]:
         acc_tbl = conn_spec.get("acceptance_by_tier", {})
         jitter_pct = float(conn_spec.get("link_jitter_pct", 0.0) or 0.0)
         drop_tbl = conn_spec.get("drop_rate", {})
+        network_model_spec = conn_spec.get("network_model") or None
+        latency_lookup = None
+        if network_model_spec:
+            try:
+                latency_lookup = build_latency_lookup(
+                    drafts=draft_entries,
+                    targets=target_entries,
+                    spec=network_model_spec,
+                )
+            except NetworkModelError as exc:
+                raise ValueError(
+                    f"Cluster '{cluster_name}' network_model error: {exc}"
+                ) from exc
+            jitter_pct = float(network_model_spec.get("jitter_pct", jitter_pct))
 
         for draft in draft_entries:
             did = draft["id"]
@@ -1978,9 +1995,19 @@ def _expand_auto_topology(raw: Dict[str, Any]) -> Dict[str, Any]:
             chosen = candidates[:fanout]
             for tid in chosen:
                 t_tier = tier_of.get(tid)
-                fr = net_ranges.get(t_tier, net_ranges.get(label, [20, 40]))
-                fwd_base = rng.uniform(float(fr[0]), float(fr[1])) if fr else 20.0
-                rsp_base = rng.uniform(float(fr[0]), float(fr[1])) if fr else 20.0
+                fwd_base = rsp_base = None
+                if latency_lookup is not None:
+                    base_latency = latency_lookup.get((did, tid))
+                    if base_latency is None:
+                        base_latency = latency_lookup.get((tid, did))
+                    if base_latency is not None:
+                        fwd_base = rsp_base = float(base_latency)
+
+                if fwd_base is None or rsp_base is None:
+                    fr = net_ranges.get(t_tier, net_ranges.get(label, [20, 40]))
+                    fwd_base = rng.uniform(float(fr[0]), float(fr[1])) if fr else 20.0
+                    rsp_base = rng.uniform(float(fr[0]), float(fr[1])) if fr else 20.0
+
                 if jitter_pct:
                     jitter = rng.uniform(-jitter_pct, jitter_pct)
                     fwd = max(0.1, fwd_base * (1.0 + jitter))
@@ -2179,6 +2206,7 @@ def build(env: simpy.Environment, cfg: Config):
                 hardware=params.gpu,
                 prefill_per_token_ms=params.prefill_latency_per_token,
                 decode_per_token_ms=params.decode_latency_per_token,
+                metadata=d,
             )
         elif role == "draft":
             # Store draft configs for later processing

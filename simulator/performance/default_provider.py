@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Optional
+from typing import Dict, Optional, Mapping
 
 from .base import PhaseMetrics, PhaseRequest, PerformanceProvider
 
@@ -22,8 +22,16 @@ class DefaultPerformanceProvider(PerformanceProvider):
     def __init__(self) -> None:
         self._targets: Dict[str, _TargetProfile] = {}
 
-    def register_target(self, *, target_id: str, model: str, hardware: str,
-                        prefill_per_token_ms: float, decode_per_token_ms: float) -> None:
+    def register_target(
+        self,
+        *,
+        target_id: str,
+        model: str,
+        hardware: str,
+        prefill_per_token_ms: float,
+        decode_per_token_ms: float,
+        metadata: Optional[Mapping[str, object]] = None,
+    ) -> None:
         self._targets[target_id] = _TargetProfile(
             model=model or None,
             hardware=hardware or None,

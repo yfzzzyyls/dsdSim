@@ -28,6 +28,8 @@ def create_performance_provider(config: PerformanceModelConfig) -> PerformancePr
             neighbors=_optional_int(config.vidur.get("neighbors"), 3),
             prefer_exact=_optional_bool(config.vidur.get("prefer_exact"), True),
             bootstrap_defaults=_optional_bool(config.vidur.get("bootstrap_defaults"), True),
+            realtime_enabled=_optional_bool(config.vidur.get("realtime_enabled"), False),
+            realtime_cache_dir=_optional_path(config.vidur.get("realtime_cache_dir")),
         )
         return VidurPerformanceProvider(vidur_cfg)
     return DefaultPerformanceProvider()

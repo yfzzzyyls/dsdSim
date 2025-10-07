@@ -6,12 +6,14 @@ import hashlib
 import json
 import math
 import subprocess
+import logging
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Optional, Sequence, Tuple
+from typing import Any, Dict, Optional, Sequence, Tuple, Mapping
 
 from .base import PhaseMetrics, PhaseRequest, PerformanceProvider
+from .vidur_realtime import VidurRealtimeRunner
 
 def _append_vidur_repo_to_path() -> None:
     base_dir = Path(__file__).resolve().parents[1]
@@ -22,6 +24,8 @@ def _append_vidur_repo_to_path() -> None:
             sys.path.insert(0, path_str)
 
 _append_vidur_repo_to_path()
+
+logger = logging.getLogger(__name__)
 
 try:  # pragma: no cover - optional dependency
     import vidur  # type: ignore
@@ -55,6 +59,8 @@ class VidurProviderConfig:
     prefer_exact: bool = True
     bootstrap_defaults: bool = True
     oracle: Optional[object] = None  # Expected to implement ILatencyOracle
+    realtime_enabled: bool = False
+    realtime_cache_dir: Optional[Path] = None
 
 
 class SyntheticVidurOracle:
@@ -180,6 +186,11 @@ class VidurPerformanceProvider(PerformanceProvider):
         self._config = config
         self._cache: Dict[Tuple, PhaseMetrics] = {}
         self._targets: Dict[str, Dict[str, object]] = {}
+        self._realtime_runner: Optional[VidurRealtimeRunner] = (
+            VidurRealtimeRunner(dtype=config.default_dtype, cache_root=config.realtime_cache_dir)
+            if config.realtime_enabled
+            else None
+        )
         if config.cache_path:
             config.cache_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -200,14 +211,28 @@ class VidurPerformanceProvider(PerformanceProvider):
             oracle = SyntheticVidurOracle(default_latency_ms=config.default_latency_ms)
         self._oracle = oracle
 
-    def register_target(self, *, target_id: str, model: str, hardware: str,
-                        prefill_per_token_ms: float, decode_per_token_ms: float) -> None:
-        self._targets[target_id] = {
+    def register_target(
+        self,
+        *,
+        target_id: str,
+        model: str,
+        hardware: str,
+        prefill_per_token_ms: float,
+        decode_per_token_ms: float,
+        metadata: Optional[Mapping[str, Any]] = None,
+    ) -> None:
+        record: Dict[str, Any] = {
             "model": model,
             "hardware": hardware,
             "prefill_per_token_ms": prefill_per_token_ms,
             "decode_per_token_ms": decode_per_token_ms,
         }
+        if metadata:
+            record["metadata"] = dict(metadata)
+            vidur_profile = metadata.get("vidur") or metadata.get("vidur_profile")
+            if vidur_profile:
+                record["vidur_profile"] = dict(vidur_profile)
+        self._targets[target_id] = record
 
     def get_metrics(self, request: PhaseRequest) -> Optional[PhaseMetrics]:
         key = (
@@ -224,6 +249,7 @@ class VidurPerformanceProvider(PerformanceProvider):
             tuple(request.context_per_request) if request.context_per_request is not None else None,
             request.prompt_tokens,
             request.context_tokens,
+            request.target_id,
         )
         if key in self._cache:
             return self._cache[key]
@@ -257,8 +283,17 @@ class VidurPerformanceProvider(PerformanceProvider):
     # ------------------------------------------------------------------
 
     def _invoke_vidur(self, request: PhaseRequest) -> Optional[PhaseMetrics]:
+        target_info = self._targets.get(request.target_id or "")
+        if self._realtime_runner is not None and target_info is not None:
+            try:
+                realtime_metrics = self._realtime_runner.predict(request, target_info)
+            except Exception as exc:  # pragma: no cover - diagnostic path
+                logger.debug("VIDUR realtime prediction failed: %s", exc, exc_info=logger.isEnabledFor(logging.DEBUG))
+            else:
+                if realtime_metrics is not None:
+                    return realtime_metrics
+
         if isinstance(self._oracle, SyntheticVidurOracle):
-            target_info = self._targets.get(request.target_id or "")
             return self._oracle.predict(request, target_info)  # type: ignore[arg-type]
 
         if self._oracle is not None:

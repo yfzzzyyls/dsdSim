@@ -12,6 +12,9 @@ workload:
   rate_rps: 120.0
 performance_model:
   type: vidur
+  vidur:
+    realtime_enabled: true
+    realtime_cache_dir: data/vidur/cache
 scheduler:
   pools:
     prefill_pool:
@@ -68,6 +71,14 @@ devices:
   cluster: default
   server_id: srv0
   gpu_role: prefill
+  vidur:
+    model_name: meta-llama/Llama-2-70b-hf
+    device: H100
+    network_device: H100_DGX
+    tensor_parallel: 1
+    pipeline_parallel: 1
+    scheduler: sarathi
+    chunk_size: 512
 - id: srv0_decode
   role: target
   model: decode-h100
@@ -80,6 +91,14 @@ devices:
   cluster: default
   server_id: srv0
   gpu_role: decode
+  vidur:
+    model_name: meta-llama/Llama-2-70b-hf
+    device: H100
+    network_device: H100_DGX
+    tensor_parallel: 1
+    pipeline_parallel: 1
+    scheduler: sarathi
+    chunk_size: 512
 - id: srv1_prefill
   role: target
   model: prefill-h100
@@ -92,6 +111,14 @@ devices:
   cluster: default
   server_id: srv1
   gpu_role: prefill
+  vidur:
+    model_name: meta-llama/Llama-2-70b-hf
+    device: H100
+    network_device: H100_DGX
+    tensor_parallel: 1
+    pipeline_parallel: 1
+    scheduler: sarathi
+    chunk_size: 512
 - id: srv1_decode
   role: target
   model: decode-h100
@@ -104,6 +131,14 @@ devices:
   cluster: default
   server_id: srv1
   gpu_role: decode
+  vidur:
+    model_name: meta-llama/Llama-2-70b-hf
+    device: H100
+    network_device: H100_DGX
+    tensor_parallel: 1
+    pipeline_parallel: 1
+    scheduler: sarathi
+    chunk_size: 512
 - id: srv2_prefill
   role: target
   model: prefill-h100
@@ -116,6 +151,14 @@ devices:
   cluster: default
   server_id: srv2
   gpu_role: prefill
+  vidur:
+    model_name: meta-llama/Llama-2-70b-hf
+    device: H100
+    network_device: H100_DGX
+    tensor_parallel: 1
+    pipeline_parallel: 1
+    scheduler: sarathi
+    chunk_size: 512
 - id: srv2_decode
   role: target
   model: decode-h100
@@ -128,6 +171,14 @@ devices:
   cluster: default
   server_id: srv2
   gpu_role: decode
+  vidur:
+    model_name: meta-llama/Llama-2-70b-hf
+    device: H100
+    network_device: H100_DGX
+    tensor_parallel: 1
+    pipeline_parallel: 1
+    scheduler: sarathi
+    chunk_size: 512
 - id: srv3_prefill
   role: target
   model: prefill-h100
@@ -140,6 +191,14 @@ devices:
   cluster: default
   server_id: srv3
   gpu_role: prefill
+  vidur:
+    model_name: meta-llama/Llama-2-70b-hf
+    device: H100
+    network_device: H100_DGX
+    tensor_parallel: 1
+    pipeline_parallel: 1
+    scheduler: sarathi
+    chunk_size: 512
 - id: srv3_decode
   role: target
   model: decode-h100
@@ -152,6 +211,14 @@ devices:
   cluster: default
   server_id: srv3
   gpu_role: decode
+  vidur:
+    model_name: meta-llama/Llama-2-70b-hf
+    device: H100
+    network_device: H100_DGX
+    tensor_parallel: 1
+    pipeline_parallel: 1
+    scheduler: sarathi
+    chunk_size: 512
 - id: srv4_prefill
   role: target
   model: prefill-a100
@@ -164,6 +231,14 @@ devices:
   cluster: default
   server_id: srv4
   gpu_role: prefill
+  vidur:
+    model_name: meta-llama/Llama-2-70b-hf
+    device: A100
+    network_device: A100_DGX
+    tensor_parallel: 1
+    pipeline_parallel: 1
+    scheduler: sarathi
+    chunk_size: 512
 - id: srv4_decode
   role: target
   model: decode-a100
@@ -176,6 +251,14 @@ devices:
   cluster: default
   server_id: srv4
   gpu_role: decode
+  vidur:
+    model_name: meta-llama/Llama-2-70b-hf
+    device: A100
+    network_device: A100_DGX
+    tensor_parallel: 1
+    pipeline_parallel: 1
+    scheduler: sarathi
+    chunk_size: 512
 - id: srv5_prefill
   role: target
   model: prefill-a100
@@ -188,6 +271,14 @@ devices:
   cluster: default
   server_id: srv5
   gpu_role: prefill
+  vidur:
+    model_name: meta-llama/Llama-2-70b-hf
+    device: A100
+    network_device: A100_DGX
+    tensor_parallel: 1
+    pipeline_parallel: 1
+    scheduler: sarathi
+    chunk_size: 512
 - id: srv5_decode
   role: target
   model: decode-a100
@@ -200,6 +291,14 @@ devices:
   cluster: default
   server_id: srv5
   gpu_role: decode
+  vidur:
+    model_name: meta-llama/Llama-2-70b-hf
+    device: A100
+    network_device: A100_DGX
+    tensor_parallel: 1
+    pipeline_parallel: 1
+    scheduler: sarathi
+    chunk_size: 512
 - id: srv6_prefill
   role: target
   model: prefill-a100
@@ -212,6 +311,14 @@ devices:
   cluster: default
   server_id: srv6
   gpu_role: prefill
+  vidur:
+    model_name: meta-llama/Llama-2-70b-hf
+    device: A100
+    network_device: A100_DGX
+    tensor_parallel: 1
+    pipeline_parallel: 1
+    scheduler: sarathi
+    chunk_size: 512
 - id: srv6_decode
   role: target
   model: decode-a100
@@ -224,6 +331,14 @@ devices:
   cluster: default
   server_id: srv6
   gpu_role: decode
+  vidur:
+    model_name: meta-llama/Llama-2-70b-hf
+    device: A100
+    network_device: A100_DGX
+    tensor_parallel: 1
+    pipeline_parallel: 1
+    scheduler: sarathi
+    chunk_size: 512
 - id: srv7_prefill
   role: target
   model: prefill-a100
@@ -236,6 +351,14 @@ devices:
   cluster: default
   server_id: srv7
   gpu_role: prefill
+  vidur:
+    model_name: meta-llama/Llama-2-70b-hf
+    device: A100
+    network_device: A100_DGX
+    tensor_parallel: 1
+    pipeline_parallel: 1
+    scheduler: sarathi
+    chunk_size: 512
 - id: srv7_decode
   role: target
   model: decode-a100
@@ -248,6 +371,14 @@ devices:
   cluster: default
   server_id: srv7
   gpu_role: decode
+  vidur:
+    model_name: meta-llama/Llama-2-70b-hf
+    device: A100
+    network_device: A100_DGX
+    tensor_parallel: 1
+    pipeline_parallel: 1
+    scheduler: sarathi
+    chunk_size: 512
 - id: srv8_prefill
   role: target
   model: prefill-l40

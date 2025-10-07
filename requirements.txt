@@ -1,1 +1,3 @@
 # Example set of dependencies for running on AWS Trainium with torch-neuronx
+
+networkx>=3.0

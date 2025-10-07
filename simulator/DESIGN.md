@@ -158,27 +158,31 @@ This document lays out the core components and specifies the auxiliary design fi
 | Planner Tick Event | Event Engine, Planner, Scheduler, LUT Manager, Mode Selector |
 | Logging / Finalization | Metrics Reporter, Reproducibility Log, Queueing Model, Device Registry, Acceptance Estimator |
 
-## TODO
+## Status
 
-### Multi-Cluster Routing & Per-Cluster Routers
+### Completed
 
-- **Rationale**: Many large-scale deployments operate multiple independent clusters (core DC, regional, edge), each with device-specific routers. We extend the auto-topology to synthesise cluster-aware targets/drafts, and the runtime instantiates one router per cluster.
-  - Config additions: `auto_topology.clusters[]`, `cluster_router`, `cluster_router_params`, per-device `cluster` labels.
-  - Build flow: group targets by cluster, create dedicated router instances (`semi_clairvoyant`, `wjsq2`, `jiq`, etc.), and wire drafts to the router associated with their cluster. Connections inherit the cluster context so drafts only see allowed targets.
-  - Benefits: isolates routing policies and load balancing per cluster, allows hybrid topologies (e.g. Sarathi on core, wJSQ on edge), and mirrors realistic multi-region deployments.
+#### Multi-Cluster Routing & Per-Cluster Routers
 
-### Per-Draft Closed-Loop Think Time
+- Auto-topology expansion now emits cluster-aware devices and connections via `_expand_auto_topology`, so configs can define `auto_topology.clusters[]`, `cluster_router`, and `cluster_router_params` for per-cluster policies.
+- During bootstrap the sim instantiates a dedicated router per cluster and binds drafts to the matching router, preserving cluster affinities on devices and connections (`simulator/sim.py`).
+- Scenario templates such as `simulator/configs/config.yaml` demonstrate independent clusters (core, regional, edge) with heterogeneous router selections.
 
-- **Problem**: Open-loop traces can overdrive drafts because arrivals ignore service latency.
-- **Solution**: Introduced `think_time` config (log-normal/exponential/constant/workload), tracked per draft. After a request completes the draft schedules its next arrival at `t_done + think_time`.
-  - Trace replay: actual arrival is `max(trace_arrival, next_available_ms)` so recorded timestamps act as lower bounds.
-  - Synthetic mode: when `think_time.enabled=true`, drafts sample from the configured distribution instead of `workload.interarrival`.
-  - Staging: new helper methods `_sample_think_time` and `_schedule_next_arrival` in `DraftServer`, plus `_next_available_ms` fields.
-- **Impact**: More realistic client pacing and enables interactive response-time analysis; turning off the flag reverts to open-loop behaviour for stress tests.
+#### Per-Draft Closed-Loop Think Time
 
-- Replace the FIFO event queues with a priority queue abstraction to capture SLO-aware arrivals, preemption, and cancellation heuristics.
-- Model GPU resource pools explicitly (streaming multiprocessors, HBM, KV bandwidth) so batching and VIDUR-driven latencies respect resource contention instead of a single-server approximation.
-- Revisit the SimPy kernel choice (PriorityResource, ProcessPool, or an internal dispatcher) once VIDUR integration stabilises to support multi-server targets and GPU sharing semantics.
+- `ThinkTimeConfig` is parsed from config files and stored on each draft to enable log-normal/exponential/constant/workload pacing choices (`simulator/sim.py`).
+- Drafts track `_next_available_ms`, sample think time after completions, and clamp trace replay arrivals with `max(trace_arrival, next_available_ms)` for closed-loop behaviour.
+- Toggling `think_time.enabled` reverts to the original open-loop behaviour for stress-style workloads.
+
+#### Queueing & Resource Modeling Improvements
+
+- The phase scheduler now relies on `simpy.PriorityStore` so arrivals are ordered by priority class instead of FIFO, enabling SLO-aware reordering (`PhaseScheduler` in `simulator/sim.py`).
+- KV usage is tracked explicitly through `KVManager`, enforcing per-target token budgets and paging penalties before admitting batches.
+
+### Remaining TODO
+
+- Extend resource modeling beyond KV to cover GPU execution pools (SMs, HBM, KV bandwidth) so contention flows through the performance model.
+- Revisit the SimPy kernel choice (PriorityResource, ProcessPool, or an internal dispatcher) once VIDUR integration lands for multi-server targets and GPU sharing.
 
 ### 3.2 Event-Driven Loop (Implementation Notes)
 

@@ -40,8 +40,16 @@ class PhaseMetrics:
 class PerformanceProvider(Protocol):
     """Abstract provider interface for iterative performance modelling."""
 
-    def register_target(self, *, target_id: str, model: str, hardware: str,
-                        prefill_per_token_ms: float, decode_per_token_ms: float) -> None:
+    def register_target(
+        self,
+        *,
+        target_id: str,
+        model: str,
+        hardware: str,
+        prefill_per_token_ms: float,
+        decode_per_token_ms: float,
+        metadata: Optional[Mapping[str, Any]] = None,
+    ) -> None:
         """Optional hook allowing providers to learn about targets."""
 
     def get_metrics(self, request: PhaseRequest) -> Optional[PhaseMetrics]:
