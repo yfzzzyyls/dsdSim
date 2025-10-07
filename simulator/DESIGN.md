@@ -179,6 +179,18 @@ This document lays out the core components and specifies the auxiliary design fi
 - The phase scheduler now relies on `simpy.PriorityStore` so arrivals are ordered by priority class instead of FIFO, enabling SLO-aware reordering (`PhaseScheduler` in `simulator/sim.py`).
 - KV usage is tracked explicitly through `KVManager`, enforcing per-target token budgets and paging penalties before admitting batches.
 
+
+#### VIDUR Real-Time Performance Provider
+
+- `performance_model.type: vidur` can now run without pre-generated LUTs. Setting `performance_model.vidur.realtime_enabled: true` spins up the vendored VIDUR random-forest predictors at runtime and caches them under `realtime_cache_dir` for reuse.
+- Target definitions may include a `vidur` (or `vidur_profile`) block describing `model_name`, `device`, `network_device`, `tensor_parallel`, `pipeline_parallel`, and `scheduler`; the simulator forwards this metadata when registering the target so the provider selects the appropriate predictor.
+- The provider still honours LUT or synthetic fallbacks, using real-time predictions first, then table/oracle, and finally the heuristic model if vidur assets are missing.
+
+#### Topology-Aware Network Model
+
+- Auto-topology connectivity supports an optional `network_model` stanza. When present the builder calls `network.topology.build_latency_lookup` (NetworkX-backed) to compute draft→target path costs before sampling fanout.
+- Supported models include a two-tier leaf/spine fabric (`type: clos`) with configurable `spine_count`, `leaf_count`, `hop_latency_ms`, and `device_edge_latency_ms`, plus a `type: complete` fallback for homogeneous deployments.
+- Generated latencies populate `forward_latency_ms` and `response_latency_ms` for each connection, with `jitter_pct` (either global or topology-specified) layered on afterwards; legacy `net_ms_ranges` remain available as a fallback or override.
 ### Remaining TODO
 
 - Extend resource modeling beyond KV to cover GPU execution pools (SMs, HBM, KV bandwidth) so contention flows through the performance model.
@@ -530,6 +542,55 @@ reproducibility:
 ```
 
 Validators lock these fields into run metadata, enabling regression comparison across commits and CI.
+
+### 5.7 VIDUR Performance Modes
+
+The performance provider now supports three tiers of fidelity:
+
+1. **Real-time predictors** — enabled with `performance_model.vidur.realtime_enabled: true`. Each target may embed a `vidur` block:
+   ```yaml
+   devices:
+     - id: srv0
+       role: target
+       gpu: H100
+       vidur:
+         model_name: meta-llama/Llama-2-70b-hf
+         device: H100
+         network_device: H100_DGX
+         tensor_parallel: 1
+         pipeline_parallel: 1
+         scheduler: sarathi
+         chunk_size: 512
+   ```
+   The provider selects the matching VIDUR predictor, warms it on first use, and caches models under `realtime_cache_dir`. Latency, optional tail metrics, and KV deltas are returned per call.
+2. **Table-backed oracle** — when `table_path` (or a LUT) is provided, the `VidurOracle` performs nearest-neighbour lookup/interpolation and supplies latency/energy data.
+3. **Synthetic fallback** — if neither real-time nor table data is available, the heuristic model estimates latency from tokens, hardware class, and fanout.
+
+The cache key for predictions now includes `target_id`, so per-target metadata (e.g., tp/pp differences) yield distinct timings even on the same GPU tier.
+
+### 5.8 Network Topology Specification
+
+`auto_topology.connectivity.network_model` describes the cluster interconnect. Two presets ship today:
+
+- `type: clos` — builds a two-level leaf/spine fabric with configurable `spine_count`, `leaf_count`, `hop_latency_ms`, and `device_edge_latency_ms`. Devices are round-robin attached to leaves; shortest-path sums produce draft→target RTTs.
+- `type: complete` — assigns a constant per-hop latency between every pair (useful for single-rack deployments or as a baseline).
+
+Example:
+```yaml
+connectivity:
+  network_model:
+    type: clos
+    spine_count: 4
+    leaf_count: 6
+    hop_latency_ms: 0.35
+    device_edge_latency_ms: 0.12
+    jitter_pct: 0.05
+  fanout_per_draft: 3
+  affinity_rules:
+    edge: [standard, edge]
+```
+
+For each draft→target edge selected by fanout rules, the simulator first consults the topology lookup to set `forward_latency_ms` and `response_latency_ms`. If a pair is missing or the model is disabled, it falls back to the legacy `net_ms_ranges` sampling.
 
 ## 6. Scheduling & Planner Design
 
