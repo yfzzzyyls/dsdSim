@@ -191,6 +191,13 @@ This document lays out the core components and specifies the auxiliary design fi
 - Auto-topology connectivity supports an optional `network_model` stanza. When present the builder calls `network.topology.build_latency_lookup` (NetworkX-backed) to compute draft→target path costs before sampling fanout.
 - Supported models include a two-tier leaf/spine fabric (`type: clos`) with configurable `spine_count`, `leaf_count`, `hop_latency_ms`, and `device_edge_latency_ms`, plus a `type: complete` fallback for homogeneous deployments.
 - Generated latencies populate `forward_latency_ms` and `response_latency_ms` for each connection, with `jitter_pct` (either global or topology-specified) layered on afterwards; legacy `net_ms_ranges` remain available as a fallback or override.
+
+#### Continuous Decode Batching
+
+- Decode lane now accepts `scheduler.decode.mode: continuous`, gating chunked tokens so that only one chunk per sequence is in-flight at a time—mirroring vLLM’s continuous batching.
+- Set `scheduler.decode.chunk_tokens` (or global `decode_chunk_tokens`) to control per-step token allotments; the scheduler re-enqueues the next chunk when the prior chunk finishes so new sequences can interleave immediately.
+- Existing batch knobs (`max_batch_requests`, `max_batch_tokens`, `max_wait_ms`) continue to bound each step, and the ChunkBarrier ensures the original completion event fires only after all chunks succeed.
+
 ### Remaining TODO
 
 - Extend resource modeling beyond KV to cover GPU execution pools (SMs, HBM, KV bandwidth) so contention flows through the performance model.
@@ -526,8 +533,19 @@ Scenario `speculation`, `scheduler`, and `planner` sections bind to the followin
 - **Adaptive `k` & depth** — `controller` type with gain parameters (PID/bandit/backpressure) and smoothing factors defined in `acceptance_feedback`.
 - **Partial verification** — `mode` (`all`, `sampled`, `first_token`), `sample_rate`, and `rollback_penalty_ms` to capture mis-speculation recovery cost.
 - **KV admission** — `max_kv_utilization_pct`, `spill_mode` (`fused`, `queue`), and eviction ordering (`least_slack_first`, `oldest_context`).
+- **Continuous decode** — set `scheduler.decode.mode: continuous` with `chunk_tokens` (default 1) to stream one chunk per sequence per iteration; the scheduler re-enqueues subsequent chunks after completion so new sequences can join each batch.
 - **Mode switch** — thresholds on RTT/load or a policy identifier (e.g., `rtt_load_adaptive`) that maps to custom logic selecting distributed vs fused execution per request.
 - **Fairness classes** — explicit grouping keys so metrics can report attainment gaps per device/workload cohort.
+
+Example continuous decode configuration:
+```yaml
+scheduler:
+  decode:
+    mode: continuous
+    chunk_tokens: 1
+    max_batch_tokens: 16
+    max_batch_requests: 8
+```
 
 ### 5.6 Reproducibility Manifest
 

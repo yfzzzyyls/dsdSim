@@ -1062,6 +1062,8 @@ class PhaseSettings:
     max_batch_tokens: int = 0
     max_wait_ms: float = 6.0
     chunk_tokens: int = 0
+    mode: str = "batch"
+    chunk_sequential: bool = False
     delayed_batch_ms: float = 0.0
     retry_backoff_ms: float = 1.0
     max_retries: int = 3
@@ -1191,7 +1193,7 @@ class PhaseScheduler:
             job.priority_class = self.default_priority_class
         job.priority = self.priority_map.get(job.priority_class, self.priority_map.get(self.default_priority_class, 100))
 
-        if self.phase == "prefill" and self.settings.chunk_tokens and job.token_count > self.settings.chunk_tokens:
+        if self.settings.chunk_tokens and job.token_count > self.settings.chunk_tokens:
             self._submit_chunked(job)
             return job.completion_event
 
@@ -1205,6 +1207,7 @@ class PhaseScheduler:
         total_chunks = math.ceil(job.token_count / chunk_size)
         barrier = ChunkBarrier(self.env, total_chunks, job.completion_event)
         base_tokens = job.token_count
+        prev_completion = None
         for idx in range(total_chunks):
             if idx == total_chunks - 1:
                 tokens = base_tokens - chunk_size * (total_chunks - 1)
@@ -1231,7 +1234,28 @@ class PhaseScheduler:
                 chunk_barrier=barrier,
                 parallelism_plan=dict(self.settings.parallelism_plan),
             )
-            self._enqueue_job(chunk_job)
+            if self.settings.chunk_sequential and prev_completion is not None:
+                self._schedule_chunk_after(prev_completion, chunk_job)
+            else:
+                self._enqueue_job(chunk_job)
+            prev_completion = chunk_completion
+
+    def _schedule_chunk_after(self, prior_event: simpy.Event, job: Job) -> None:
+        def _defer():
+            yield prior_event
+            if not getattr(prior_event, 'ok', True):
+                barrier = getattr(job, 'chunk_barrier', None)
+                final_event = getattr(barrier, 'final_event', None) if barrier else None
+                if final_event is not None and not final_event.triggered:
+                    err = getattr(prior_event, 'value', None)
+                    if err is None:
+                        err = RuntimeError('Upstream chunk failed before scheduling next chunk')
+                    final_event.fail(err)
+                return
+            if job.kv_tokens <= 0:
+                job.kv_tokens = self._estimate_kv_tokens(job)
+            self._enqueue_job(job)
+        self.env.process(_defer())
 
     def _enqueue_job(self, job: Job) -> None:
         self._seq += 1
@@ -1522,12 +1546,24 @@ class Scheduler:
         settings.dynamic_policy = dict(phase_cfg.get("dynamic_policy", settings.dynamic_policy) or {})
         settings.max_queue_depth = int(phase_cfg.get("max_queue_depth", settings.max_queue_depth))
         settings.backpressure_wait_ms = float(phase_cfg.get("backpressure_wait_ms", settings.backpressure_wait_ms))
-        if phase == "prefill":
-            chunk_tokens = phase_cfg.get("chunk_tokens")
-            if chunk_tokens is None:
-                chunk_tokens = self.cfg.scheduler_config.get("prefill_chunk_tokens")
-            if chunk_tokens:
-                settings.chunk_tokens = int(chunk_tokens)
+
+        mode = str(phase_cfg.get("mode", settings.mode)).lower()
+        settings.mode = mode
+
+        chunk_tokens = phase_cfg.get("chunk_tokens")
+        if chunk_tokens is None:
+            chunk_tokens = self.cfg.scheduler_config.get(f"{phase}_chunk_tokens")
+        if chunk_tokens:
+            settings.chunk_tokens = max(1, int(chunk_tokens))
+
+        if mode in {"continuous", "continuous_batching"}:
+            settings.mode = "continuous"
+            settings.chunk_sequential = bool(phase_cfg.get("chunk_sequential", True))
+            if settings.chunk_tokens <= 0:
+                settings.chunk_tokens = max(1, int(self.cfg.scheduler_config.get(f"{phase}_chunk_tokens", 1)))
+        else:
+            settings.chunk_sequential = bool(phase_cfg.get("chunk_sequential", False))
+
         return settings
 
     def _resolve_pools(
