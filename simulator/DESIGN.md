@@ -588,7 +588,18 @@ The cache key for predictions now includes `target_id`, so per-target metadata (
 
 ### 5.8 Network Topology Specification
 
-`auto_topology.connectivity.network_model` describes the cluster interconnect. Two presets ship today:
+`auto_topology.connectivity.network_model` describes the cluster interconnect.
+
+### 5.9 Co-Simulation Verification
+
+`simulator/verification/cosim.py` and the `scripts/verify_cosim.py` CLI let us cross-check simulator output against a real vLLM (or other runtime) run:
+
+1. Collect per-request metrics from the real engine in JSON/JSONL form (arrival time, prompt/response tokens, total latency, optional TTFT).
+2. `verify_cosim.py actual.json config.yaml --report-json out.json` converts the log into a trace, runs the simulator, and emits a delta report (throughput, latency percentiles, token/s).
+3. Inspect the diff to validate that scheduler/pipeline changes preserve fidelity; gaps highlight where VIDUR curves or network assumptions need tuning.
+
+The generated trace is stored under `scripts_output/cosim/trace_actual.jsonl` by default so it can be replayed directly with `sim.py` for further experiments.
+ Two presets ship today:
 
 - `type: clos` — builds a two-level leaf/spine fabric with configurable `spine_count`, `leaf_count`, `hop_latency_ms`, and `device_edge_latency_ms`. Devices are round-robin attached to leaves; shortest-path sums produce draft→target RTTs.
 - `type: complete` — assigns a constant per-hop latency between every pair (useful for single-rack deployments or as a baseline).
