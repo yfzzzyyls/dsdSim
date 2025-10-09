@@ -198,6 +198,22 @@ This document lays out the core components and specifies the auxiliary design fi
 - Set `scheduler.decode.chunk_tokens` (or global `decode_chunk_tokens`) to control per-step token allotments; the scheduler re-enqueues the next chunk when the prior chunk finishes so new sequences can interleave immediately.
 - Existing batch knobs (`max_batch_requests`, `max_batch_tokens`, `max_wait_ms`) continue to bound each step, and the ChunkBarrier ensures the original completion event fires only after all chunks succeed.
 
+#### Routing Algorithm Portfolio
+
+- The router factory wires up multiple strategies (`random`, `round_robin`, `jiq`, `jsq2`, `wjsq2`, and a `semi_clairvoyant` policy) so experiments can mix admission behavior without touching core scheduling (`simulator/sim.py`).
+- Cluster routers inherit those implementations automatically; per-cluster overrides and router-specific parameters are accepted via `cluster_router{,_params}` in scenario configs.
+
+#### Trace-Driven Workload Replay
+
+- Trace ingestion utilities (`simulator/trace/trace_loader.py`, `simulator/trace/types.py`) accept JSON/JSONL logs and map them onto configured drafts with optional defaults for missing metadata.
+- Configs can point `trace_path` at recorded traffic to replay heterogeneous arrival patterns; when traces run longer than `sim_time_ms` the builder extends the horizon automatically.
+- Helper script `simulator/scripts/generate_trace.py` exports synthetic workloads for benchmarking or regression suites.
+
+#### Co-Simulation Verification Pipeline
+
+- `simulator/scripts/verify_cosim.py` loads measured metrics from vLLM (or another runtime), runs the simulator with the same configuration, and prints side-by-side latency/throughput comparisons.
+- Supporting helpers in `simulator/verification/cosim.py` derive simulator traces from real runs, compute percentile summaries, and emit JSON reports consumable by dashboards or CI assertions.
+
 ### Remaining TODO
 
 - Extend resource modeling beyond KV to cover GPU execution pools (SMs, HBM, KV bandwidth) so contention flows through the performance model.

@@ -1942,6 +1942,12 @@ def _expand_auto_topology(raw: Dict[str, Any]) -> Dict[str, Any]:
                     "decode_latency_per_token": float(tier.get("decode_latency_per_token", 2.5)),
                     "cluster": cluster_name,
                 }
+                if "vidur" in tier:
+                    entry["vidur"] = dict(tier["vidur"])
+                if "vidur_profile" in tier:
+                    entry["vidur_profile"] = dict(tier["vidur_profile"])
+                if "metadata" in tier:
+                    entry["metadata"] = dict(tier["metadata"])
                 if "verify_latency_ms" in tier:
                     entry["verify_latency_ms"] = float(tier["verify_latency_ms"])
                 if "energy_per_token_mj" in tier:
@@ -1957,6 +1963,7 @@ def _expand_auto_topology(raw: Dict[str, Any]) -> Dict[str, Any]:
         d_count = int(d_spec.get("count", 0))
         gens = list(d_spec.get("gens_ms_per_gamma", [[0, 0]])) or [[0, 0]]
         caps = d_spec.get("capability_map", {})
+        draft_meta = d_spec.get("metadata_by_label", {})
         labels = list(d_spec.get("draft_bucket_labels", []))
         if not labels:
             labels = [str(i) for i in range(len(gens))]
@@ -1989,6 +1996,14 @@ def _expand_auto_topology(raw: Dict[str, Any]) -> Dict[str, Any]:
                 "reliability": reliability,
                 "cluster": cluster_name,
             }
+            if "metadata" in d_spec:
+                entry["metadata"] = dict(d_spec["metadata"])
+            meta_label = str(label)
+            bucket_meta = draft_meta.get(meta_label)
+            if bucket_meta is None:
+                bucket_meta = draft_meta.get(str(bucket))
+            if isinstance(bucket_meta, Mapping):
+                entry.setdefault("metadata", {}).update(bucket_meta)
             cluster_devices.append(entry)
             draft_entries.append(entry)
 

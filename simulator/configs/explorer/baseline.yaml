@@ -4,6 +4,15 @@ verbose: false
 debug: false
 execution_mode: blocking
 gamma: 4
+prompt_length_min: 10
+prompt_length_max: 200
+prompt_scale_by_capability: true
+answer_length: 256
+answer_length_mean: 256
+answer_length_std: 64
+answer_length_min: 64
+answer_length_max: 640
+use_answer_distribution: true
 mixed_batching: false
 router: random
 global_router: disabled
