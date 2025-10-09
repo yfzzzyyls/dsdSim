@@ -21,6 +21,8 @@ DEFAULT_OUTPUT_DIR = REPO_ROOT / "scripts_output" / "router_draft_sweep"
 # Default sweep: 50 → 200 in increments of 5
 DEFAULT_DRAFT_COUNTS = list(range(50, 201, 5))
 ROUTERS = ["random", "round_robin", "semi_clairvoyant"]
+SIM_TIME_MS = 180_000
+REPLICATE_SEEDS = [111, 123, 157, 189, 211]
 
 class SweepError(RuntimeError):
     pass
@@ -136,6 +138,7 @@ def sweep_runs(
             cfg.setdefault("workload", {})["rate_rps"] = round(rate_per_draft * draft_count, 3)
             cfg["burn_in_ms"] = 0
             cfg["verbose"] = False
+            cfg["sim_time_ms"] = SIM_TIME_MS
 
             clusters = cfg.get("auto_topology", {}).get("clusters", [])
             for cluster in clusters:
@@ -168,13 +171,29 @@ def sweep_runs(
                     section.pop("chunk_tokens", None)
                     section.pop("chunk_sequential", None)
 
-            cfg_path = (output_dir / "configs" / f"{router}_{draft_count}.yaml").resolve()
-            _write_config(cfg, cfg_path)
+            aggregate: Dict[str, float] = {}
+            template: Dict[str, object] = {}
 
-            metrics = _run_sim(cfg_path)
-            results[router][draft_count] = metrics
+            for seed in REPLICATE_SEEDS:
+                cfg["seed"] = seed
+                cfg_path = (output_dir / "configs" / f"{router}_{draft_count}_seed{seed}.yaml").resolve()
+                _write_config(cfg, cfg_path)
+                metrics = _run_sim(cfg_path)
+                for key, value in metrics.items():
+                    if key == "_stdout":
+                        continue
+                    if isinstance(value, (int, float)):
+                        aggregate[key] = aggregate.get(key, 0.0) + float(value)
+                    elif key not in template:
+                        template[key] = value
+
+            averaged: Dict[str, object] = dict(template)
+            for key, total in aggregate.items():
+                averaged[key] = total / len(REPLICATE_SEEDS)
+
+            results[router][draft_count] = averaged
             print(
-                f"router={router:>12} drafts={draft_count:4d} avg_latency={metrics['avg_latency_ms']:.2f}ms throughput={metrics['throughput_jobs_s']:.2f}"
+                f"router={router:>12} drafts={draft_count:4d} avg_latency={averaged['avg_latency_ms']:.2f}ms throughput={averaged['throughput_jobs_s']:.2f}"
             )
     return results
 
@@ -233,9 +252,9 @@ def main() -> None:
     if args.draft_counts:
         draft_counts = sorted(set(args.draft_counts))
     else:
-        start = args.start if args.start is not None else 50
+        start = args.start if args.start is not None else 60
         end = args.end if args.end is not None else 200
-        step = args.step if args.step is not None else 5
+        step = args.step if args.step is not None else 2
         if step <= 0:
             parser.error("--step must be positive")
         if end < start:
