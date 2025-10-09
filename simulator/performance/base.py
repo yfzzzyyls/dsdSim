@@ -10,7 +10,7 @@ from typing import Any, Mapping, Optional, Protocol, Sequence
 class PhaseRequest:
     """Describes a model execution request for profiling."""
 
-    phase: str  # prefill | draft_decode | target_decode | verify | decode
+    phase: str  # prefill | decode | verify | fused_draft | fused_verify
     model: Optional[str]
     hardware: Optional[str]
     batch_size: int = 1
@@ -46,15 +46,12 @@ class PerformanceProvider(Protocol):
         target_id: str,
         model: str,
         hardware: str,
-        prefill_per_token_ms: float,
-        decode_per_token_ms: float,
         metadata: Optional[Mapping[str, Any]] = None,
     ) -> None:
-        """Optional hook allowing providers to learn about targets."""
+        """Optional hook allowing providers to learn about execution profiles."""
 
     def get_metrics(self, request: PhaseRequest) -> Optional[PhaseMetrics]:
         """Return metrics for the given request or ``None`` if unavailable."""
 
     def flush(self) -> None:
         """Persist any on-disk caches if the provider maintains them."""
-

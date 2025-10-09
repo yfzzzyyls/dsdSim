@@ -217,21 +217,20 @@ class VidurPerformanceProvider(PerformanceProvider):
         target_id: str,
         model: str,
         hardware: str,
-        prefill_per_token_ms: float,
-        decode_per_token_ms: float,
         metadata: Optional[Mapping[str, Any]] = None,
     ) -> None:
         record: Dict[str, Any] = {
             "model": model,
             "hardware": hardware,
-            "prefill_per_token_ms": prefill_per_token_ms,
-            "decode_per_token_ms": decode_per_token_ms,
         }
         if metadata:
             record["metadata"] = dict(metadata)
             vidur_profile = metadata.get("vidur") or metadata.get("vidur_profile")
             if vidur_profile:
                 record["vidur_profile"] = dict(vidur_profile)
+            draft_profile = metadata.get("fused_draft_profile")
+            if draft_profile:
+                record["fused_draft_profile"] = dict(draft_profile)
         self._targets[target_id] = record
 
     def get_metrics(self, request: PhaseRequest) -> Optional[PhaseMetrics]:

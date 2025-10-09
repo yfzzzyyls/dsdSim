@@ -116,8 +116,6 @@ auto_topology:
             weight: 1.8
             batch_window_ms: 0.28
             batch_size: 12
-            prefill_latency_per_token: 0.30
-            decode_latency_per_token: 1.00
             vidur:
               model_name: Qwen/Qwen-72B
               device: H100
@@ -133,8 +131,6 @@ auto_topology:
             weight: 1.6
             batch_window_ms: 0.35
             batch_size: 16
-            prefill_latency_per_token: 0.34
-            decode_latency_per_token: 1.05
             vidur:
               model_name: meta-llama/Llama-2-70b-hf
               device: H100
@@ -145,9 +141,6 @@ auto_topology:
               chunk_size: 512
       drafts:
         count: 40
-        gens_ms_per_gamma:
-          - [8, 14]
-          - [16, 26]
         capability_map:
           0: 1.35
           1: 0.95
@@ -201,8 +194,6 @@ auto_topology:
             weight: 1.2
             batch_window_ms: 0.9
             batch_size: 18
-            prefill_latency_per_token: 0.48
-            decode_latency_per_token: 1.35
             vidur:
               model_name: Qwen/Qwen-72B
               device: A100
@@ -218,8 +209,6 @@ auto_topology:
             weight: 1.1
             batch_window_ms: 0.8
             batch_size: 20
-            prefill_latency_per_token: 0.55
-            decode_latency_per_token: 1.45
             vidur:
               model_name: meta-llama/Llama-2-70b-hf
               device: A100
@@ -230,10 +219,6 @@ auto_topology:
               chunk_size: 512
       drafts:
         count: 35
-        gens_ms_per_gamma:
-          - [14, 22]
-          - [24, 38]
-          - [40, 62]
         capability_map:
           0: 0.85
           1: 0.6
@@ -303,8 +288,6 @@ auto_topology:
             weight: 0.75
             batch_window_ms: 1.8
             batch_size: 10
-            prefill_latency_per_token: 1.10
-            decode_latency_per_token: 2.70
             vidur:
               model_name: meta-llama/Llama-2-70b-hf
               device: A40
@@ -320,8 +303,6 @@ auto_topology:
             weight: 0.65
             batch_window_ms: 1.6
             batch_size: 12
-            prefill_latency_per_token: 0.92
-            decode_latency_per_token: 2.35
             vidur:
               model_name: codellama/CodeLlama-34b-Instruct-hf
               device: A40
@@ -332,9 +313,6 @@ auto_topology:
               chunk_size: 512
       drafts:
         count: 25
-        gens_ms_per_gamma:
-          - [24, 42]
-          - [48, 82]
         capability_map:
           0: 0.34
           1: 0.22

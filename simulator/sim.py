@@ -27,20 +27,20 @@ class TargetParams:
     weight: float = 1.0               # capacity weight (relative speed)
     batch_window_ms: float = 6.0      # Delta: wait to form a batch
     batch_size: int = 32              # B: max jobs per batch
-    verify_latency_ms: float = 8.0    # fixed service time per batch (legacy, for non-mixed mode)
-    prefill_latency_per_token: float = 0.5  # ms per token for prefill requests
-    decode_latency_per_token: float = 2.5   # ms per token for decode requests
     cluster: str = "default"
     kv_capacity_tokens: Optional[int] = None
+    metadata: Dict[str, Any] = field(default_factory=dict)
+    mode: str = "distributed"         # distributed | fused
+    fused_draft_profile: Optional[Dict[str, Any]] = None
 
 @dataclass
 class DraftParams:
     id: str
     capability: float = 1.0           # relative compute speed (affects generation rate)
-    generation_latency_ms: float = 0.0  # time to generate gamma tokens (0 = instant)
     burst_factor: float = 1.0         # short-term burst multiplier
     reliability: float = 0.99         # connection reliability (0-1)
     cluster: str = "default"
+    metadata: Dict[str, Any] = field(default_factory=dict)
 
 @dataclass
 class ConnectionParams:
@@ -295,6 +295,7 @@ class TargetServer:
         self.scheduler_config = self.cfg.scheduler_config  # Get scheduler config
         self.metrics = metrics
         self.debug = debug
+        self.metadata = params.metadata
         self.router = router  # Reference to router for JIQ notifications
         self.q = simpy.Store(env)           # FIFO queue of Job
         self.performance = performance_provider
@@ -347,16 +348,9 @@ class TargetServer:
             return max_latency
 
         if not self.cfg.mixed_batching:
-            return self.p.verify_latency_ms
+            return 0.0
 
-        max_latency = 0.0
-        for job in batch:
-            if job.job_type == "prefill":
-                latency = job.token_count * self.p.prefill_latency_per_token
-            else:
-                latency = job.token_count * self.p.decode_latency_per_token
-            max_latency = max(max_latency, latency)
-        return max_latency
+        return 0.0
 
     def _estimate_job_latency(self, job: Job) -> float:
         provider = getattr(self, "performance", None)
@@ -462,11 +456,8 @@ class TargetServer:
         # Use average batch latency if available (for mixed batching), otherwise use typical verify time
         if self._avg_batch_latency_ms is not None:
             batch_latency = self._avg_batch_latency_ms
-        elif hasattr(self.p, 'verify_latency_ms'):
-            batch_latency = self.p.verify_latency_ms
         else:
-            # Estimate based on decode latency (most common case)
-            batch_latency = self.cfg.gamma * self.p.decode_latency_per_token if hasattr(self.p, 'decode_latency_per_token') else 37.0
+            batch_latency = 37.0
         
         # Total estimated time to clear queue
         eta_ms = remaining_ms + batches_queued * batch_latency
@@ -632,6 +623,7 @@ class DraftServer:
         self.gamma = cfg.gamma  # tokens per chunk
         self.metrics = metrics  # Reference to global metrics
         self.performance = performance_provider
+        self.metadata = params.metadata
         self._trace_records = list(trace_records) if trace_records else None
         self._trace_index = 0
         self._trace_mode = self._trace_records is not None
@@ -784,6 +776,38 @@ class DraftServer:
             rejected_tokens=rejected,
             total_tokens=tokens
         )
+
+    def _predict_generation_latency(self, tokens: int, context_length: int) -> float:
+        """Use the performance provider to estimate local draft generation time."""
+        if self.performance is None or tokens <= 0:
+            return 0.0
+
+        metadata = self.metadata or {}
+        profile = metadata.get("vidur_profile") or metadata.get("vidur") or {}
+        model = metadata.get("model") or profile.get("model_name")
+        hardware = metadata.get("gpu") or profile.get("device")
+
+        if not model and not hardware and not profile:
+            return 0.0
+
+        request = PhaseRequest(
+            phase="decode",
+            model=model,
+            hardware=hardware,
+            batch_size=1,
+            microbatch_size=1,
+            fanout=max(1, self.gamma),
+            sequence_length=max(1, context_length),
+            tokens_to_generate=max(1, tokens),
+            context_length=max(0, context_length),
+            draft_id=self.id,
+            target_id=self.id,
+            extra_metadata=metadata,
+        )
+        metrics = self.performance.get_metrics(request)
+        if metrics is None:
+            return 0.0
+        return max(0.0, metrics.latency_ms)
     
     def _sample_prompt_length(self) -> int:
         """Sample prompt length based on device capability"""
@@ -820,10 +844,9 @@ class DraftServer:
         if self.cfg.verbose:
             my_share = self.p.capability / self.total_capability
             my_rate = self.cfg.workload.rate_rps * my_share
-            gen_info = f", gen_latency={self.p.generation_latency_ms:.0f}ms" if self.p.generation_latency_ms > 0 else ""
             mode = "trace replay" if self._trace_mode else "blocking mode"
             print(
-                f"[{self.env.now:.1f}ms] Draft {self.id} starting {mode} (gamma={self.gamma}, rate={my_rate:.1f} req/s{gen_info})",
+                f"[{self.env.now:.1f}ms] Draft {self.id} starting {mode} (gamma={self.gamma}, rate={my_rate:.1f} req/s)",
                 flush=True,
             )
 
@@ -944,9 +967,11 @@ class DraftServer:
                 tokens_remaining = answer_length - tokens_generated_in_conversation
                 tokens_this_round = min(self.gamma, tokens_remaining)
 
-                # Generate draft tokens (takes time on edge device!)
-                if self.p.generation_latency_ms > 0:
-                    yield self.env.timeout(self.p.generation_latency_ms)
+                current_context = prompt_length + tokens_generated_in_conversation
+                # Generate draft tokens using performance provider latency
+                generation_latency = self._predict_generation_latency(tokens_this_round, current_context)
+                if generation_latency > 0:
+                    yield self.env.timeout(generation_latency)
 
                 self.chunks_sent += 1
                 self.total_tokens_generated += tokens_this_round
@@ -967,7 +992,7 @@ class DraftServer:
                     completion_event=decode_completion,
                     rtt_start_ms=round_start,
                     request_id=request_id,
-                    context_len=prompt_length + tokens_generated_in_conversation,
+                    context_len=current_context + tokens_this_round,
                     target_id=target_id,
                     priority_class=priority_class,
                     phase="decode",
@@ -1930,28 +1955,26 @@ def _expand_auto_topology(raw: Dict[str, Any]) -> Dict[str, Any]:
             for _ in range(count):
                 tid = f"{prefix}_t{target_index:02d}"
                 target_index += 1
+                vidur_profile = dict(tier.get("vidur") or tier.get("vidur_profile") or {})
                 entry: Dict[str, Any] = {
                     "id": tid,
                     "role": "target",
-                    "model": tier.get("model", ""),
-                    "gpu": tier.get("gpu", ""),
+                    "model": tier.get("model") or vidur_profile.get("model_name", ""),
+                    "gpu": tier.get("gpu") or vidur_profile.get("device", ""),
                     "weight": float(tier.get("weight", 1.0)),
                     "batch_window_ms": float(tier.get("batch_window_ms", 6.0)),
                     "batch_size": int(tier.get("batch_size", 32)),
-                    "prefill_latency_per_token": float(tier.get("prefill_latency_per_token", 0.5)),
-                    "decode_latency_per_token": float(tier.get("decode_latency_per_token", 2.5)),
                     "cluster": cluster_name,
+                    "mode": str(tier.get("mode", "distributed")).lower(),
                 }
                 if "vidur" in tier:
                     entry["vidur"] = dict(tier["vidur"])
                 if "vidur_profile" in tier:
                     entry["vidur_profile"] = dict(tier["vidur_profile"])
+                if tier.get("draft_vidur"):
+                    entry["fused_draft_profile"] = dict(tier["draft_vidur"])
                 if "metadata" in tier:
                     entry["metadata"] = dict(tier["metadata"])
-                if "verify_latency_ms" in tier:
-                    entry["verify_latency_ms"] = float(tier["verify_latency_ms"])
-                if "energy_per_token_mj" in tier:
-                    entry["energy_per_token_mj"] = float(tier["energy_per_token_mj"])
                 cluster_devices.append(entry)
                 target_entries.append(entry)
                 tier_of[tid] = tier_name
@@ -1961,51 +1984,79 @@ def _expand_auto_topology(raw: Dict[str, Any]) -> Dict[str, Any]:
         # --- Drafts ---
         d_spec = cluster_spec.get("drafts", {})
         d_count = int(d_spec.get("count", 0))
-        gens = list(d_spec.get("gens_ms_per_gamma", [[0, 0]])) or [[0, 0]]
-        caps = d_spec.get("capability_map", {})
+        capability_map = d_spec.get("capability_map", {})
         draft_meta = d_spec.get("metadata_by_label", {})
-        labels = list(d_spec.get("draft_bucket_labels", []))
-        if not labels:
-            labels = [str(i) for i in range(len(gens))]
         reliability_map = d_spec.get("reliability", {})
+        labels = list(d_spec.get("draft_bucket_labels", []))
+        if not labels and capability_map:
+            labels = [str(k) for k in capability_map.keys()]
+        counts_by_label = d_spec.get("count_by_label", {})
         if d_count <= 0:
-            d_count = len(gens)
-        drafts_per_bucket = d_count // len(gens)
-        draft_entries: list[Dict[str, Any]] = []
-        for i in range(d_count):
-            if i < drafts_per_bucket * len(gens):
-                bucket = i // drafts_per_bucket
+            if counts_by_label:
+                d_count = sum(int(v) for v in counts_by_label.values())
+            elif labels:
+                d_count = len(labels)
+        if d_count <= 0:
+            d_count = 1
+        if not labels:
+            labels = [str(i) for i in range(d_count)]
+        bucket_counts: List[int] = []
+        remaining = d_count
+        for idx, label in enumerate(labels):
+            if label in counts_by_label:
+                count = int(counts_by_label[label])
             else:
-                bucket = len(gens) - 1
-            lo, hi = gens[bucket]
-            gen_ms = rng.uniform(float(lo), float(hi))
-            label = labels[bucket] if bucket < len(labels) else str(bucket)
-            capability = float(caps.get(bucket, caps.get(str(bucket), d_spec.get("default_capability", 1.0))))
-            reliability = float(
-                reliability_map.get(label, reliability_map.get(str(bucket), d_spec.get("default_reliability", 0.99)))
-            )
-            did = f"{prefix}_d{i:03d}"
-            entry = {
-                "id": did,
-                "role": "draft",
-                "capability": capability,
-                "generation_latency_ms": float(gen_ms),
-                "bucket": bucket,
-                "label": label,
-                "burst_factor": float(d_spec.get("burst_factor", 1.0)),
-                "reliability": reliability,
-                "cluster": cluster_name,
-            }
-            if "metadata" in d_spec:
-                entry["metadata"] = dict(d_spec["metadata"])
-            meta_label = str(label)
-            bucket_meta = draft_meta.get(meta_label)
-            if bucket_meta is None:
-                bucket_meta = draft_meta.get(str(bucket))
-            if isinstance(bucket_meta, Mapping):
-                entry.setdefault("metadata", {}).update(bucket_meta)
-            cluster_devices.append(entry)
-            draft_entries.append(entry)
+                count = int(round(d_count / len(labels))) if labels else d_count
+            if idx == len(labels) - 1:
+                count = remaining
+            count = max(0, min(count, remaining))
+            bucket_counts.append(count)
+            remaining -= count
+        if bucket_counts and remaining > 0:
+            bucket_counts[-1] += remaining
+
+        draft_entries: list[Dict[str, Any]] = []
+        draft_index = 0
+        for label, count in zip(labels, bucket_counts):
+            for _ in range(count):
+                did = f"{prefix}_d{draft_index:03d}"
+                draft_index += 1
+                capability = float(
+                    capability_map.get(label, capability_map.get(str(label), d_spec.get("default_capability", 1.0)))
+                )
+                reliability = float(
+                    reliability_map.get(label, reliability_map.get(str(label), d_spec.get("default_reliability", 0.99)))
+                )
+                combined_meta: Dict[str, Any] = {}
+                if "metadata" in d_spec:
+                    combined_meta.update(d_spec["metadata"])
+                bucket_meta = draft_meta.get(label) or draft_meta.get(str(label))
+                if isinstance(bucket_meta, Mapping):
+                    combined_meta.update(bucket_meta)
+                entry = {
+                    "id": did,
+                    "role": "draft",
+                    "capability": capability,
+                    "bucket": label,
+                    "label": label,
+                    "burst_factor": float(d_spec.get("burst_factor", 1.0)),
+                    "reliability": reliability,
+                    "cluster": cluster_name,
+                }
+                if combined_meta:
+                    entry["metadata"] = combined_meta
+                model_name = combined_meta.get("model") or combined_meta.get("model_name", "")
+                hardware = combined_meta.get("hardware") or combined_meta.get("device", "")
+                if model_name:
+                    entry["model"] = model_name
+                if hardware:
+                    entry["gpu"] = hardware
+                if "vidur_profile" in combined_meta:
+                    entry["vidur_profile"] = dict(combined_meta["vidur_profile"])
+                elif "vidur" in combined_meta:
+                    entry["vidur_profile"] = dict(combined_meta["vidur"])
+                cluster_devices.append(entry)
+                draft_entries.append(entry)
 
         # --- Connectivity ---
         conn_spec = cluster_spec.get("connectivity", {})
@@ -2217,12 +2268,6 @@ def build(env: simpy.Environment, cfg: Config):
         role = d.get("role", "target")
         if role == "target":
             # Calculate typical verify latency if not provided (for mixed batching)
-            if "verify_latency_ms" in d:
-                verify_ms = float(d["verify_latency_ms"])
-            else:
-                # Use decode latency as typical case (most batches are decode-only)
-                verify_ms = cfg.gamma * float(d.get("decode_latency_per_token", 9.25))
-            
             cluster_name = str(d.get("cluster", "default"))
             params = TargetParams(
                 id=d["id"],
@@ -2231,10 +2276,11 @@ def build(env: simpy.Environment, cfg: Config):
                 weight=float(d.get("weight", 1.0)),
                 batch_window_ms=float(d.get("batch_window_ms", 6.0)),
                 batch_size=int(d.get("batch_size", 32)),
-                verify_latency_ms=verify_ms,
-                prefill_latency_per_token=float(d.get("prefill_latency_per_token", 0.5)),
-                decode_latency_per_token=float(d.get("decode_latency_per_token", 2.5)),
                 cluster=cluster_name,
+                kv_capacity_tokens=d.get("kv_capacity_tokens"),
+                metadata=dict(d),
+                mode=str(d.get("mode", "distributed")).lower(),
+                fused_draft_profile=dict(d.get("fused_draft_profile", {})) if d.get("fused_draft_profile") else None,
             )
             target = TargetServer(
                 env,
@@ -2255,9 +2301,7 @@ def build(env: simpy.Environment, cfg: Config):
                 target_id=params.id,
                 model=params.model,
                 hardware=params.gpu,
-                prefill_per_token_ms=params.prefill_latency_per_token,
-                decode_per_token_ms=params.decode_latency_per_token,
-                metadata=d,
+                metadata=dict(d),
             )
         elif role == "draft":
             # Store draft configs for later processing
@@ -2372,10 +2416,10 @@ def build(env: simpy.Environment, cfg: Config):
         params = DraftParams(
             id=d["id"],
             capability=float(d.get("capability", 1.0)),
-            generation_latency_ms=float(d.get("generation_latency_ms", 0.0)),
             burst_factor=float(d.get("burst_factor", 1.0)),
             reliability=float(d.get("reliability", 0.99)),
             cluster=cluster_name,
+            metadata=dict(d),
         )
 
         draft_connections_all = connection_map.get(d["id"], {})
@@ -2389,6 +2433,13 @@ def build(env: simpy.Environment, cfg: Config):
             raise ValueError(f"No router available for cluster '{cluster_name}' (draft {d['id']})")
 
         trace_records = trace_schedule.for_draft(d["id"]) if trace_schedule else None
+
+        performance_provider.register_target(
+            target_id=params.id,
+            model=str(params.metadata.get("model", "")),
+            hardware=str(params.metadata.get("gpu", "")),
+            metadata=dict(d),
+        )
         drafts.append(
             DraftServer(
                 env=env,

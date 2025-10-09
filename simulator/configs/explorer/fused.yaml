@@ -1,0 +1,191 @@
+sim_time_ms: 90000
+seed: 123
+verbose: false
+debug: false
+
+execution_mode: blocking
+gamma: 4
+
+prompt_length_min: 24
+prompt_length_max: 512
+prompt_scale_by_capability: true
+answer_length_mean: 420
+answer_length_std: 120
+answer_length_min: 96
+answer_length_max: 960
+use_answer_distribution: true
+mixed_batching: true
+
+router: disabled
+global_router: disabled
+
+workload:
+  arrival: poisson
+  rate_rps: 140.0
+
+think_time:
+  enabled: true
+  distribution: lognormal
+  mean_ms: 1700
+  cv: 0.6
+  min_ms: 220
+
+trace_defaults:
+  slo_class: hetero_baseline
+  target_p95_latency_ms: 260.0
+  target_p99_latency_ms: 360.0
+  target_ttft_ms: 140.0
+
+performance_model:
+  type: vidur
+  vidur:
+    table_path: null
+    bootstrap_defaults: false
+    realtime_enabled: true
+    realtime_cache_dir: data/vidur/cache
+
+scheduler:
+  type: baseline
+  pools: {}
+  prefill:
+    queue_policy: priority
+    max_batch_requests: 6
+    max_wait_ms: 1.0
+    max_queue_depth: 16
+    backpressure_wait_ms: 0.08
+    dynamic_policy:
+      enabled: true
+      low_queue_depth: 1
+      high_queue_depth: 6
+      low_wait_ms: 0.20
+      high_wait_ms: 1.50
+      low_batch_requests: 2
+      high_batch_requests: 6
+  decode:
+    queue_policy: priority
+    max_batch_requests: 5
+    max_wait_ms: 0.9
+    max_queue_depth: 18
+    backpressure_wait_ms: 0.1
+    dynamic_policy:
+      enabled: true
+      low_queue_depth: 2
+      high_queue_depth: 8
+      low_wait_ms: 0.15
+      high_wait_ms: 1.00
+      low_batch_requests: 2
+      high_batch_requests: 6
+  kv:
+    default_capacity_tokens: 240000
+    max_utilization_pct: 82.0
+
+auto_topology:
+  clusters:
+    - name: dc_core
+      targets:
+        count: 2
+        tiers:
+          - name: dc_prefill
+            count: 1
+            model: qwen-72b-prefill
+            gpu: H100
+            weight: 1.8
+            batch_window_ms: 0.28
+            batch_size: 12
+            vidur:
+              model_name: Qwen/Qwen-72B
+              device: H100
+              network_device: H100_DGX
+              tensor_parallel: 1
+              pipeline_parallel: 1
+              scheduler: sarathi
+              chunk_size: 512
+          - name: dc_decode
+            count: 1
+            model: llama-2-70b-decode
+            gpu: H100
+            weight: 1.6
+            batch_window_ms: 0.35
+            batch_size: 16
+            vidur:
+              model_name: meta-llama/Llama-2-70b-hf
+              device: H100
+              network_device: H100_DGX
+              tensor_parallel: 1
+              pipeline_parallel: 1
+              scheduler: sarathi
+              chunk_size: 512
+      drafts:
+        count: 0
+    - name: regional
+      targets:
+        count: 2
+        tiers:
+          - name: regional_qwen
+            count: 1
+            model: qwen-72b
+            gpu: A100
+            weight: 1.2
+            batch_window_ms: 0.9
+            batch_size: 18
+            vidur:
+              model_name: Qwen/Qwen-72B
+              device: A100
+              network_device: A100_DGX
+              tensor_parallel: 1
+              pipeline_parallel: 1
+              scheduler: sarathi
+              chunk_size: 512
+          - name: regional_llama
+            count: 1
+            model: llama-2-70b
+            gpu: A100
+            weight: 1.1
+            batch_window_ms: 0.8
+            batch_size: 20
+            vidur:
+              model_name: meta-llama/Llama-2-70b-hf
+              device: A100
+              network_device: A100_DGX
+              tensor_parallel: 1
+              pipeline_parallel: 1
+              scheduler: sarathi
+              chunk_size: 512
+      drafts:
+        count: 0
+    - name: edge
+      targets:
+        count: 2
+        tiers:
+          - name: edge_heavy
+            count: 1
+            model: llama-2-70b
+            gpu: A40
+            weight: 0.75
+            batch_window_ms: 1.8
+            batch_size: 10
+            vidur:
+              model_name: meta-llama/Llama-2-70b-hf
+              device: A40
+              network_device: A40_PAIRWISE_NVLINK
+              tensor_parallel: 1
+              pipeline_parallel: 1
+              scheduler: sarathi
+              chunk_size: 512
+          - name: edge_mid
+            count: 1
+            model: codellama-34b
+            gpu: A40
+            weight: 0.65
+            batch_window_ms: 1.6
+            batch_size: 12
+            vidur:
+              model_name: codellama/CodeLLaMA-34b-Instruct-hf
+              device: A40
+              network_device: A40_PAIRWISE_NVLINK
+              tensor_parallel: 1
+              pipeline_parallel: 1
+              scheduler: sarathi
+              chunk_size: 512
+      drafts:
+        count: 0
