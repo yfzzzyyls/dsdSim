@@ -47,26 +47,14 @@ VARIANTS: List[VariantSpec] = [
         },
     },
     {
-        "name": "semi_clairvoyant_adaptive",
-        "description": "Semi-clairvoyant routing with adaptive chunked batching.",
+        "name": "jsq_priority",
+        "description": "Join-the-shortest-queue routing with priority queues.",
         "overrides": {
-            "router": "semi_clairvoyant",
+            "router": "jsq",
             "router_params": {},
             "scheduler": {
-                "prefill": {
-                    "queue_policy": "priority",
-                    "mode": "continuous",
-                    "chunk_tokens": 24,
-                    "chunk_sequential": True,
-                    "max_wait_ms": 0.4,
-                },
-                "decode": {
-                    "queue_policy": "priority",
-                    "mode": "continuous",
-                    "chunk_tokens": 24,
-                    "chunk_sequential": True,
-                    "max_wait_ms": 0.4,
-                },
+                "prefill": {"queue_policy": "priority", "max_wait_ms": 0.4},
+                "decode": {"queue_policy": "priority", "max_wait_ms": 0.4},
             },
         },
     },

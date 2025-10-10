@@ -16,13 +16,13 @@ import sys
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SIM_PATH = REPO_ROOT / "sim.py"
-DEFAULT_CONFIG = REPO_ROOT / "configs" / "explorer" / "baseline.yaml"
+DEFAULT_CONFIG = REPO_ROOT / "configs" / "explorer" / "router_sweep.yaml"
 DEFAULT_OUTPUT_DIR = REPO_ROOT / "scripts_output" / "router_draft_sweep"
 # Default sweep: 50 → 200 in increments of 5
-DEFAULT_DRAFT_COUNTS = list(range(50, 201, 5))
-ROUTERS = ["random", "round_robin", "semi_clairvoyant"]
+DEFAULT_DRAFT_COUNTS = list(range(50, 201, 2))
+ROUTERS = ["random", "round_robin", "jsq"]
 SIM_TIME_MS = 180_000
-REPLICATE_SEEDS = [111, 123, 157, 189, 211]
+REPLICATE_SEEDS = [123]
 
 class SweepError(RuntimeError):
     pass
@@ -238,7 +238,7 @@ def main() -> None:
     parser.add_argument("--draft-counts", type=int, nargs="*", help="Explicit draft counts to evaluate")
     parser.add_argument("--start", type=int, help="Start draft count (inclusive) if --draft-counts omitted")
     parser.add_argument("--end", type=int, help="End draft count (inclusive) if --draft-counts omitted")
-    parser.add_argument("--step", type=int, help="Step when generating draft counts (default 5)")
+    parser.add_argument("--step", type=int, help="Step when generating draft counts (default 2)")
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR, help="Where to write configs/plots")
     parser.add_argument("--routers", nargs="*", default=ROUTERS, help="Routers to compare")
     parser.add_argument("--metrics-json", type=Path, default=None, help="Optional path to dump metrics JSON")

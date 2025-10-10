@@ -734,6 +734,12 @@ class DraftServer:
                 target = pool[0]
             target_id = target.p.id
             return target_id, self.connections[target_id]
+        elif hasattr(self.router, 'jsq_select_filtered'):
+            target = self.router.jsq_select_filtered(allowed_ids)
+            if not target:
+                target = pool[0]
+            target_id = target.p.id
+            return target_id, self.connections[target_id]
         elif hasattr(self.router, 'semi_clairvoyant_select_filtered'):
             # Semi-Clairvoyant router - fairness based on progress
             target = self.router.semi_clairvoyant_select_filtered(self.id, allowed_ids)
@@ -1672,6 +1678,19 @@ class RoundRobinRouter:
         self._counters[draft_id] += 1
         
         return target
+class JSQRouter:
+    """Join-the-Shortest-Queue router (global queue awareness)."""
+    def __init__(self, targets: List[TargetServer]):
+        if not targets:
+            raise ValueError("Router needs at least one target")
+        self.targets = targets
+
+    def jsq_select_filtered(self, allowed_ids) -> TargetServer:
+        """Pick the target with the fewest queued jobs among the allowed set."""
+        pool = [t for t in self.targets if t.p.id in allowed_ids]
+        if not pool:
+            return None
+        return min(pool, key=lambda t: t.queue_len())
 
 class JIQRouter:
     """Join-Idle-Queue router with FIFO idle queue."""
@@ -1889,6 +1908,7 @@ GLOBAL_ROUTERS = {
 ROUTERS = {
     "random": RandomRouter,
     "round_robin": RoundRobinRouter,
+    "jsq": JSQRouter,
     "jsq2": JSQ2Router,
     "wjsq2": WeightedJSQ2Router,
     "jiq": JIQRouter,
