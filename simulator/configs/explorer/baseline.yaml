@@ -3,7 +3,7 @@ seed: 123
 verbose: false
 debug: false
 
-execution_mode: speculative
+execution_mode: blocking
 gamma: 4
 
 prompt_length_min: 24
@@ -26,7 +26,7 @@ workload:
   rate_rps: 140.0
 
 think_time:
-  enabled: true
+  enabled: false
   distribution: lognormal
   mean_ms: 1700
   cv: 0.6

@@ -193,12 +193,46 @@ class Metrics:
         self.token_metrics = TokenMetrics()  # Add token tracking
         self.connection_counts = defaultdict(int)     # (draft_id, target_id) -> hits
         self.tier_utilization = defaultdict(list)     # gpu/model tier -> samples
+        self.conversations: list[dict[str, Any]] = []  # Completed conversation records
 
     def add(self, job: Job):
         self.completed.append(job)
         # Progress indicator every 100 jobs
         if self.verbose and len(self.completed) % 100 == 0:
             print(f"  Completed {len(self.completed)} jobs...")
+
+    def record_conversation(
+        self,
+        conversation_id: str,
+        *,
+        start_ms: float,
+        end_ms: float,
+        draft_id: str,
+        target_id: str,
+        tokens_generated: int,
+        tokens_accepted: int,
+        answer_tokens: int,
+    ) -> None:
+        """Track per-conversation timing (only after burn-in)."""
+        if start_ms < self.burn_in_ms:
+            return
+        duration = end_ms - start_ms
+        if duration < 0:
+            return
+        self.conversations.append(
+            {
+                "id": conversation_id,
+                "draft_id": draft_id,
+                "target_id": target_id,
+                "start_ms": start_ms,
+                "end_ms": end_ms,
+                "duration_ms": duration,
+                "tokens_generated": tokens_generated,
+                "tokens_accepted": tokens_accepted,
+                "answer_tokens": answer_tokens,
+                "completed": True,
+            }
+        )
 
     def summary(self) -> Dict[str, float]:
         # Filter out burn-in period
@@ -238,7 +272,114 @@ class Metrics:
             "p95_ms": pct(0.95) if lat else 0, 
             "p99_ms": pct(0.99) if lat else 0,
         }
-        
+
+        conv_records: Dict[str, Dict[str, Any]] = {}
+        for entry in self.conversations:
+            cid = entry.get("id")
+            if not cid:
+                continue
+            conv_records[cid] = dict(entry)
+
+        conv_map: Dict[str, Dict[str, Any]] = {}
+        for job in filtered:
+            rid = job.request_id
+            if not rid:
+                continue
+            rec = conv_map.setdefault(
+                rid,
+                {
+                    "start_ms": None,
+                    "end_ms": None,
+                    "jobs": 0,
+                    "draft_id": job.draft_id,
+                    "target_id": job.target_id,
+                    "decode_tokens": 0,
+                    "prompt_tokens": 0,
+                },
+            )
+            if job.rtt_start_ms is not None:
+                rec["start_ms"] = job.rtt_start_ms if rec["start_ms"] is None else min(rec["start_ms"], job.rtt_start_ms)
+            if job.rtt_end_ms is not None:
+                rec["end_ms"] = job.rtt_end_ms if rec["end_ms"] is None else max(rec["end_ms"], job.rtt_end_ms)
+            rec["jobs"] += 1
+            if job.job_type == "decode":
+                rec["decode_tokens"] += job.token_count
+            elif job.job_type == "prefill":
+                rec["prompt_tokens"] += job.token_count
+            if job.target_id and not rec.get("target_id"):
+                rec["target_id"] = job.target_id
+
+        for rid, rec in conv_map.items():
+            start = rec.get("start_ms")
+            end = rec.get("end_ms")
+            if start is None or end is None or end < start:
+                continue
+            duration = end - start
+            existing = conv_records.get(rid)
+            if existing:
+                existing.setdefault("start_ms", start)
+                existing.setdefault("end_ms", end)
+                existing.setdefault("duration_ms", duration)
+                existing.setdefault("decode_tokens", rec.get("decode_tokens", 0))
+                existing.setdefault("prompt_tokens", rec.get("prompt_tokens", 0))
+                existing["observed_jobs"] = rec.get("jobs", 0)
+            else:
+                conv_records[rid] = {
+                    "id": rid,
+                    "draft_id": rec.get("draft_id"),
+                    "target_id": rec.get("target_id"),
+                    "start_ms": start,
+                    "end_ms": end,
+                    "duration_ms": duration,
+                    "decode_tokens": rec.get("decode_tokens", 0),
+                    "prompt_tokens": rec.get("prompt_tokens", 0),
+                    "observed_jobs": rec.get("jobs", 0),
+                    "completed": False,
+                }
+
+        observed_entries = [entry for entry in conv_records.values() if entry.get("duration_ms") is not None]
+        completed_entries = [entry for entry in observed_entries if entry.get("completed")]
+
+        def pct_conv(values: List[float], p: float) -> float:
+            if not values:
+                return 0.0
+            idx = int(round(p * (len(values) - 1)))
+            return values[max(0, min(idx, len(values) - 1))]
+
+        def compute_stats(values: List[float], suffix: str) -> None:
+            values_sorted = sorted(values)
+            if not values_sorted:
+                return
+            result[f"avg_conversation_ms{suffix}"] = sum(values_sorted) / len(values_sorted)
+            result[f"p50_conversation_ms{suffix}"] = pct_conv(values_sorted, 0.50)
+            result[f"p95_conversation_ms{suffix}"] = pct_conv(values_sorted, 0.95)
+            result[f"p99_conversation_ms{suffix}"] = pct_conv(values_sorted, 0.99)
+
+        if observed_entries:
+            observed_durations = [entry["duration_ms"] for entry in observed_entries]
+            result["conversation_count"] = len(observed_entries)
+            compute_stats(observed_durations, "")
+
+        if completed_entries:
+            completed_durations = [entry["duration_ms"] for entry in completed_entries]
+            result["completed_conversation_count"] = len(completed_entries)
+            result["conversation_completion_rate"] = len(completed_entries) / max(1, len(observed_entries))
+            compute_stats(completed_durations, "_completed")
+            # Prefer completed stats for primary fields
+            result["avg_conversation_ms"] = result.get("avg_conversation_ms_completed", result.get("avg_conversation_ms", 0))
+            result["p50_conversation_ms"] = result.get("p50_conversation_ms_completed", result.get("p50_conversation_ms", 0))
+            result["p95_conversation_ms"] = result.get("p95_conversation_ms_completed", result.get("p95_conversation_ms", 0))
+            result["p99_conversation_ms"] = result.get("p99_conversation_ms_completed", result.get("p99_conversation_ms", 0))
+        elif observed_entries:
+            result["completed_conversation_count"] = 0
+            result["conversation_completion_rate"] = 0.0
+        else:
+            result["conversation_count"] = 0
+            result["completed_conversation_count"] = 0
+            result["conversation_completion_rate"] = 0.0
+
+        self.conversations = list(conv_records.values())
+
         # Add RTT metrics if available
         if rtt:
             result["rtt_avg_ms"] = sum(rtt)/len(rtt)
@@ -624,6 +765,7 @@ class DraftServer:
         self.metrics = metrics  # Reference to global metrics
         self.performance = performance_provider
         self.metadata = params.metadata
+        self._workload_enabled = bool(cfg.workload.rate_rps > 0) if cfg and cfg.workload else False
         self._trace_records = list(trace_records) if trace_records else None
         self._trace_index = 0
         self._trace_mode = self._trace_records is not None
@@ -631,8 +773,13 @@ class DraftServer:
 
         self._think_enabled = self.cfg.think_time.enabled
         self._next_available_ms = self.env.now
-        if not self._trace_mode and self._think_enabled:
-            self._next_available_ms = self.env.now + self._sample_think_time()
+        if not self._trace_mode:
+            initial_wait = 0.0
+            if self._workload_enabled:
+                initial_wait = max(initial_wait, self._ia())
+            if self._think_enabled:
+                initial_wait = max(initial_wait, self._sample_think_time())
+            self._next_available_ms = self.env.now + initial_wait
 
         # Metrics
         self.chunks_sent = 0
@@ -678,10 +825,11 @@ class DraftServer:
         raise ValueError(f"Unsupported think-time distribution: {cfg.distribution}")
 
     def _schedule_next_arrival(self, reference_ms: float) -> None:
-        if not self._think_enabled:
-            self._next_available_ms = reference_ms
-            return
-        wait = self._sample_think_time()
+        wait = 0.0
+        if self._workload_enabled:
+            wait = max(wait, self._ia())
+        if self._think_enabled:
+            wait = max(wait, self._sample_think_time())
         self._next_available_ms = reference_ms + wait
 
     def _select_target(self) -> tuple[str, ConnectionParams]:
@@ -881,17 +1029,17 @@ class DraftServer:
                 request_id = record.request_id
                 trace_record = record
             else:
-                if self._think_enabled:
-                    scheduled = max(self._next_available_ms, self.env.now)
-                    if scheduled > self.env.now:
-                        yield self.env.timeout(scheduled - self.env.now)
-                    self._next_available_ms = self.env.now
+                scheduled = max(self._next_available_ms, self.env.now)
+                if scheduled > self.env.now:
+                    yield self.env.timeout(scheduled - self.env.now)
+                self._next_available_ms = self.env.now
                 conversation_start = self.env.now
                 prompt_length = self._sample_prompt_length()
                 answer_length = self._sample_answer_length()
                 request_id = None
 
             conversation_count += 1
+            conversation_id = request_id or f"{self.id}_conv{conversation_count}"
 
             target_id, conn = self._select_target()
 
@@ -923,7 +1071,7 @@ class DraftServer:
                 token_count=prompt_length,
                 completion_event=prefill_completion,
                 rtt_start_ms=prefill_rtt_start,
-                request_id=request_id,
+                request_id=conversation_id,
                 context_len=prompt_length,
                 target_id=target_id,
                 priority_class=priority_class,
@@ -997,7 +1145,7 @@ class DraftServer:
                     token_count=tokens_this_round,
                     completion_event=decode_completion,
                     rtt_start_ms=round_start,
-                    request_id=request_id,
+                    request_id=conversation_id,
                     context_len=current_context + tokens_this_round,
                     target_id=target_id,
                     priority_class=priority_class,
@@ -1062,6 +1210,18 @@ class DraftServer:
                 print(f"[{self.env.now:.1f}ms] Draft {self.id}: Conversation #{conversation_count} completed - "
                       f"prompt={prompt_length}, answer={tokens_generated_in_conversation}/{answer_length} tokens, "
                       f"acceptance={conversation_acceptance:.2%}, time={conversation_time:.1f}ms", flush=True)
+
+            if hasattr(self.metrics, "record_conversation"):
+                self.metrics.record_conversation(
+                    conversation_id,
+                    start_ms=conversation_start,
+                    end_ms=self.env.now,
+                    draft_id=self.id,
+                    target_id=target_id,
+                    tokens_generated=tokens_generated_in_conversation,
+                    tokens_accepted=tokens_accepted_in_conversation,
+                    answer_tokens=answer_length,
+                )
 
             if self._think_enabled:
                 self._schedule_next_arrival(self.env.now)
@@ -2655,7 +2815,23 @@ def _collect_metrics_json(cfg: Config, metrics, summary: Dict[str, float], targe
         "throughput_jobs_s": summary.get("throughput_jobs_s", 0),
         "acceptance_rate": metrics.token_metrics.get_acceptance_rate() if hasattr(metrics, 'token_metrics') else 0,
         "effective_tok_s": metrics.token_metrics.get_effective_tokens_per_second() if hasattr(metrics, 'token_metrics') else 0,
+        "avg_conversation_ms": summary.get("avg_conversation_ms", 0),
+        "p50_conversation_ms": summary.get("p50_conversation_ms", 0),
+        "p95_conversation_ms": summary.get("p95_conversation_ms", 0),
+        "p99_conversation_ms": summary.get("p99_conversation_ms", 0),
+        "conversation_count": summary.get("conversation_count", 0),
+        "completed_conversation_count": summary.get("completed_conversation_count", 0),
+        "conversation_completion_rate": summary.get("conversation_completion_rate", 0),
     }
+
+    for key in (
+        "avg_conversation_ms_completed",
+        "p50_conversation_ms_completed",
+        "p95_conversation_ms_completed",
+        "p99_conversation_ms_completed",
+    ):
+        if key in summary:
+            metrics_json[key] = summary[key]
 
     if targets:
         all_batch_sizes = []
