@@ -4,3 +4,9 @@
 # Ignore Python bytecode
 *.pyc
 __pycache__/
+
+# Ignore large vendored dependencies and output directories
+simulator/vidur/
+simulator/thirdparty/
+simulator/ddsketch/
+simulator/scripts_output/
