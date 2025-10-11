@@ -198,6 +198,12 @@ This document lays out the core components and specifies the auxiliary design fi
 - Set `scheduler.decode.chunk_tokens` (or global `decode_chunk_tokens`) to control per-step token allotments; the scheduler re-enqueues the next chunk when the prior chunk finishes so new sequences can interleave immediately.
 - Existing batch knobs (`max_batch_requests`, `max_batch_tokens`, `max_wait_ms`) continue to bound each step, and the ChunkBarrier ensures the original completion event fires only after all chunks succeed.
 
+#### Conversation-Level Metrics & Load Sweeps
+
+- `Metrics.summary()` now aggregates per-request timelines (grouped by `request_id`) in addition to per-job latencies, emitting conversation-level averages and tail percentiles plus completion counts and rates. Each draft attaches a stable `conversation_id` to all generated chunks and records start/end timestamps when a conversation completes.
+- The JSON payload surfaced by `sim.py` includes the new fields (`avg_conversation_ms`, `p95_conversation_ms`, completion rate, etc.) so downstream tooling and plots can reason about full request durations rather than just chunk latency.
+- `simulator/scripts/router_load_sweep.py` provides a fixed-topology experiment that holds draft/target counts constant while sweeping offered load. The helper rewrites per-cluster router selections on the fly, runs the simulator for each load/router pair, and produces throughput and conversation-latency plots (average & P95) to compare routing policies under pressure.
+
 #### Routing Algorithm Portfolio
 
 - The router factory wires up multiple strategies (`random`, `round_robin`, `jiq`, `jsq2`, `wjsq2`, and a `semi_clairvoyant` policy) so experiments can mix admission behavior without touching core scheduling (`simulator/sim.py`).

@@ -19,8 +19,8 @@ DEFAULT_CONFIG = REPO_ROOT / "configs" / "explorer" / "router_sweep.yaml"
 DEFAULT_OUTPUT_DIR = REPO_ROOT / "scripts_output" / "router_load_sweep"
 ROUTERS = ["random", "round_robin", "jsq"]
 LOAD_POINTS = [float(x) for x in range(60, 242, 2)]
-SIM_TIME_MS = 120_000
-SEEDS = [123]
+SIM_TIME_MS = 300_000  # 5 minutes for proper saturation measurements
+DEFAULT_SEEDS = [123]
 
 
 class SweepError(RuntimeError):
@@ -61,6 +61,7 @@ def sweep_loads(
     load_points: List[float],
     routers: List[str],
     output_dir: Path,
+    seeds: List[int],
 ) -> Dict[str, Dict[float, Dict[str, float]]]:
     results: Dict[str, Dict[float, Dict[str, float]]] = {router: {} for router in routers}
 
@@ -69,7 +70,7 @@ def sweep_loads(
             aggregate: Dict[str, float] = {}
             samples = 0
 
-            for seed in SEEDS:
+            for seed in seeds:
                 cfg = deepcopy(base_cfg)
                 cfg["seed"] = seed
                 cfg.setdefault("router_params", {})
@@ -99,9 +100,10 @@ def sweep_loads(
             averaged = {k: v / samples for k, v in aggregate.items()}
             results[router][load] = averaged
             p95_value = averaged.get("p95_conversation_ms", averaged.get("p95_latency_ms", 0.0))
+            conv_throughput = averaged.get("conversation_throughput_rps", 0.0)
             print(
-                f"router={router:>12} load={load:5.1f} throughput={averaged.get('throughput_jobs_s',0):6.2f} "
-                f"p95_conv={p95_value:6.2f}"
+                f"router={router:>12} load={load:5.1f} jobs_thr={averaged.get('throughput_jobs_s',0):6.2f} "
+                f"conv_thr={conv_throughput:6.2f} p95_conv={p95_value:6.2f}"
             )
 
     return results
@@ -111,51 +113,49 @@ def plot_results(results: Dict[str, Dict[float, Dict[str, float]]], output_dir: 
     output_dir.mkdir(parents=True, exist_ok=True)
     loads = sorted(next(iter(results.values())).keys())
 
-    # Throughput plot
+    # Plot 1: Throughput & Goodput
     plt.figure(figsize=(7, 4))
     for router, data in results.items():
-        y = [data[load]["throughput_jobs_s"] for load in loads]
-        plt.plot(loads, y, marker="o", label=router)
+        throughput = [data[load].get("throughput_jobs_s", 0.0) for load in loads]
+        plt.plot(loads, throughput, marker="o", label=f"{router} (job throughput)", linestyle="-")
+
+        conv_throughput = [data[load].get("conversation_throughput_rps", 0.0) for load in loads]
+        plt.plot(loads, conv_throughput, marker="^", label=f"{router} (conversation throughput)", linestyle=":", alpha=0.9)
     plt.xlabel("Offered load (requests/s)")
-    plt.ylabel("Throughput (jobs/s)")
-    plt.title("Throughput vs load")
+    plt.ylabel("Requests/s")
+    plt.title("Throughput & Goodput vs Load")
     plt.grid(True, alpha=0.3)
-    plt.legend()
+    plt.legend(fontsize=8)
     plt.tight_layout()
-    plt.savefig(output_dir / "throughput_vs_load.png", dpi=150)
+    plt.savefig(output_dir / "throughput_goodput_vs_load.png", dpi=150)
     plt.close()
 
-    # Latency plots
+    # Plot 2: TTFT P95
     plt.figure(figsize=(7, 4))
     for router, data in results.items():
-        y = [
-            data[load].get("p95_conversation_ms", data[load].get("p95_latency_ms", 0.0))
-            for load in loads
-        ]
+        y = [data[load].get("ttft_p95_ms", 0.0) for load in loads]
         plt.plot(loads, y, marker="o", label=router)
     plt.xlabel("Offered load (requests/s)")
-    plt.ylabel("P95 conversation latency (ms)")
-    plt.title("P95 conversation latency vs load")
+    plt.ylabel("TTFT P95 (ms)")
+    plt.title("Time To First Token (P95) vs Load")
     plt.grid(True, alpha=0.3)
     plt.legend()
     plt.tight_layout()
-    plt.savefig(output_dir / "latency_vs_load.png", dpi=150)
+    plt.savefig(output_dir / "ttft_p95_vs_load.png", dpi=150)
     plt.close()
 
+    # Plot 3: TPOT P95
     plt.figure(figsize=(7, 4))
     for router, data in results.items():
-        y = [
-            data[load].get("avg_conversation_ms", data[load].get("avg_latency_ms", 0.0))
-            for load in loads
-        ]
+        y = [data[load].get("tpot_p95_ms", 0.0) for load in loads]
         plt.plot(loads, y, marker="o", label=router)
     plt.xlabel("Offered load (requests/s)")
-    plt.ylabel("Average conversation latency (ms)")
-    plt.title("Average conversation latency vs load")
+    plt.ylabel("TPOT P95 (ms)")
+    plt.title("Time Per Output Token (P95) vs Load")
     plt.grid(True, alpha=0.3)
     plt.legend()
     plt.tight_layout()
-    plt.savefig(output_dir / "avg_latency_vs_load.png", dpi=150)
+    plt.savefig(output_dir / "tpot_p95_vs_load.png", dpi=150)
     plt.close()
 
 
@@ -169,6 +169,8 @@ def main() -> None:
     parser.add_argument("--routers", nargs="*", default=ROUTERS, help="Routers to compare")
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR, help="Where to store outputs")
     parser.add_argument("--metrics-json", type=Path, help="Optional path to dump metrics JSON")
+    parser.add_argument("--seeds", type=int, nargs="*", default=DEFAULT_SEEDS, help="Random seeds to average over")
+    parser.add_argument("--no-plots", action="store_true", help="Skip plot generation for faster iteration")
 
     args = parser.parse_args()
 
@@ -190,8 +192,13 @@ def main() -> None:
     routers = args.routers or ROUTERS
     output_dir = args.output_dir if args.output_dir.is_absolute() else Path.cwd() / args.output_dir
 
-    results = sweep_loads(base_cfg, load_points, routers, output_dir)
-    plot_results(results, output_dir / "plots")
+    seeds = args.seeds if args.seeds else DEFAULT_SEEDS
+    seeds = sorted(set(seeds))
+
+    results = sweep_loads(base_cfg, load_points, routers, output_dir, seeds)
+
+    if not args.no_plots:
+        plot_results(results, output_dir / "plots")
 
     if args.metrics_json:
         metrics_path = args.metrics_json if args.metrics_json.is_absolute() else Path.cwd() / args.metrics_json

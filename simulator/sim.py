@@ -146,6 +146,7 @@ class Job:
     chunk_barrier: Optional["ChunkBarrier"] = None
     parallelism_plan: Dict[str, Any] = field(default_factory=dict)
     retry_count: int = 0
+    accepted_tokens: int = 0
 
 
 class ChunkBarrier:
@@ -212,6 +213,8 @@ class Metrics:
         tokens_generated: int,
         tokens_accepted: int,
         answer_tokens: int,
+        ttft_ms: Optional[float] = None,
+        tpot_samples: Optional[Sequence[float]] = None,
     ) -> None:
         """Track per-conversation timing (only after burn-in)."""
         if start_ms < self.burn_in_ms:
@@ -219,20 +222,23 @@ class Metrics:
         duration = end_ms - start_ms
         if duration < 0:
             return
-        self.conversations.append(
-            {
-                "id": conversation_id,
-                "draft_id": draft_id,
-                "target_id": target_id,
-                "start_ms": start_ms,
-                "end_ms": end_ms,
-                "duration_ms": duration,
-                "tokens_generated": tokens_generated,
-                "tokens_accepted": tokens_accepted,
-                "answer_tokens": answer_tokens,
-                "completed": True,
-            }
-        )
+        record: Dict[str, Any] = {
+            "id": conversation_id,
+            "draft_id": draft_id,
+            "target_id": target_id,
+            "start_ms": start_ms,
+            "end_ms": end_ms,
+            "duration_ms": duration,
+            "tokens_generated": tokens_generated,
+            "tokens_accepted": tokens_accepted,
+            "answer_tokens": answer_tokens,
+            "completed": True,
+        }
+        if ttft_ms is not None:
+            record["ttft_ms"] = ttft_ms
+        if tpot_samples:
+            record["tpot_samples"] = list(tpot_samples)
+        self.conversations.append(record)
 
     def summary(self) -> Dict[str, float]:
         # Filter out burn-in period
@@ -271,6 +277,7 @@ class Metrics:
             "p50_ms": pct(0.50) if lat else 0, 
             "p95_ms": pct(0.95) if lat else 0, 
             "p99_ms": pct(0.99) if lat else 0,
+            "observed_span_ms": span,
         }
 
         conv_records: Dict[str, Dict[str, Any]] = {}
@@ -279,6 +286,8 @@ class Metrics:
             if not cid:
                 continue
             conv_records[cid] = dict(entry)
+            if entry.get("tpot_samples"):
+                conv_records[cid]["tpot_samples"] = list(entry.get("tpot_samples", []))
 
         conv_map: Dict[str, Dict[str, Any]] = {}
         for job in filtered:
@@ -295,6 +304,8 @@ class Metrics:
                     "target_id": job.target_id,
                     "decode_tokens": 0,
                     "prompt_tokens": 0,
+                    "tpot_samples": [],
+                    "first_token_end_ms": None,
                 },
             )
             if job.rtt_start_ms is not None:
@@ -304,6 +315,13 @@ class Metrics:
             rec["jobs"] += 1
             if job.job_type == "decode":
                 rec["decode_tokens"] += job.token_count
+                if job.accepted_tokens > 0 and job.rtt_end_ms is not None and job.rtt_start_ms is not None:
+                    chunk_rtt = job.rtt_end_ms - job.rtt_start_ms
+                    per_token = chunk_rtt / max(1, job.accepted_tokens)
+                    rec.setdefault("tpot_samples", []).extend([per_token] * job.accepted_tokens)
+                    first_end = rec.get("first_token_end_ms")
+                    if first_end is None or job.rtt_end_ms < first_end:
+                        rec["first_token_end_ms"] = job.rtt_end_ms
             elif job.job_type == "prefill":
                 rec["prompt_tokens"] += job.token_count
             if job.target_id and not rec.get("target_id"):
@@ -323,7 +341,15 @@ class Metrics:
                 existing.setdefault("decode_tokens", rec.get("decode_tokens", 0))
                 existing.setdefault("prompt_tokens", rec.get("prompt_tokens", 0))
                 existing["observed_jobs"] = rec.get("jobs", 0)
+                if existing.get("ttft_ms") is None and rec.get("first_token_end_ms") is not None:
+                    existing["ttft_ms"] = rec["first_token_end_ms"] - start if start is not None else None
+                if rec.get("tpot_samples"):
+                    existing.setdefault("tpot_samples", [])
+                    existing["tpot_samples"].extend(rec.get("tpot_samples", []))
             else:
+                ttft_ms = None
+                if rec.get("first_token_end_ms") is not None:
+                    ttft_ms = rec["first_token_end_ms"] - start if start is not None else None
                 conv_records[rid] = {
                     "id": rid,
                     "draft_id": rec.get("draft_id"),
@@ -335,6 +361,8 @@ class Metrics:
                     "prompt_tokens": rec.get("prompt_tokens", 0),
                     "observed_jobs": rec.get("jobs", 0),
                     "completed": False,
+                    "ttft_ms": ttft_ms,
+                    "tpot_samples": list(rec.get("tpot_samples", [])),
                 }
 
         observed_entries = [entry for entry in conv_records.values() if entry.get("duration_ms") is not None]
@@ -387,7 +415,75 @@ class Metrics:
             result["rtt_p95_ms"] = pct_rtt(0.95)
             result["rtt_p99_ms"] = pct_rtt(0.99)
             result["rtt_count"] = len(rtt)
-        
+
+        # Add TTFT/TPOT metrics
+        ttft_values = [
+            entry.get("ttft_ms") for entry in conv_records.values() if entry.get("ttft_ms") is not None
+        ]
+        tpot_samples: List[float] = []
+        for entry in conv_records.values():
+            samples = entry.get("tpot_samples") or []
+            tpot_samples.extend(samples)
+
+        def percentile(values: List[float], p: float) -> float:
+            if not values:
+                return 0.0
+            values_sorted = sorted(values)
+            idx = int(round(p * (len(values_sorted) - 1)))
+            return values_sorted[max(0, min(idx, len(values_sorted) - 1))]
+
+        if ttft_values:
+            result["ttft_count"] = len(ttft_values)
+            ttft_sorted = sorted(ttft_values)
+            result["ttft_avg_ms"] = sum(ttft_sorted) / len(ttft_sorted)
+            result["ttft_p50_ms"] = percentile(ttft_sorted, 0.50)
+            result["ttft_p95_ms"] = percentile(ttft_sorted, 0.95)
+            result["ttft_p99_ms"] = percentile(ttft_sorted, 0.99)
+        else:
+            result["ttft_count"] = 0
+            result["ttft_avg_ms"] = 0.0
+            result["ttft_p50_ms"] = 0.0
+            result["ttft_p95_ms"] = 0.0
+            result["ttft_p99_ms"] = 0.0
+
+        if tpot_samples:
+            result["tpot_count"] = len(tpot_samples)
+            tpot_sorted = sorted(tpot_samples)
+            result["tpot_avg_ms"] = sum(tpot_sorted) / len(tpot_sorted)
+            result["tpot_p50_ms"] = percentile(tpot_sorted, 0.50)
+            result["tpot_p95_ms"] = percentile(tpot_sorted, 0.95)
+            result["tpot_p99_ms"] = percentile(tpot_sorted, 0.99)
+        else:
+            result["tpot_count"] = 0
+            result["tpot_avg_ms"] = 0.0
+            result["tpot_p50_ms"] = 0.0
+            result["tpot_p95_ms"] = 0.0
+            result["tpot_p99_ms"] = 0.0
+
+        if ttft_values and tpot_samples:
+            TTFT_SLO_MS = 300.0
+            TPOT_SLO_MS = 35.0
+            slo_meeting = 0
+            for entry in conv_records.values():
+                ttft = entry.get("ttft_ms")
+                samples = entry.get("tpot_samples") or []
+                if ttft is None or not samples:
+                    continue
+                if ttft <= TTFT_SLO_MS and max(samples) <= TPOT_SLO_MS:
+                    slo_meeting += 1
+            total_conv = len(conv_records)
+            result["slo_meeting_count"] = slo_meeting
+            result["slo_attainment_rate"] = slo_meeting / total_conv if total_conv else 0.0
+            if filtered:
+                span = max(j.finished_ms for j in filtered) - min(j.created_ms for j in filtered) + 1e-9
+                result["goodput_rps"] = 1000.0 * slo_meeting / span
+            else:
+                result["goodput_rps"] = 0.0
+        else:
+            result["slo_meeting_count"] = 0
+            result["slo_attainment_rate"] = 0.0
+            result["goodput_rps"] = 0.0
+
         return result
 
 # ---------- Helper Functions ----------
@@ -830,7 +926,8 @@ class DraftServer:
             wait = max(wait, self._ia())
         if self._think_enabled:
             wait = max(wait, self._sample_think_time())
-        self._next_available_ms = reference_ms + wait
+        # Cap next arrival at sim_time_ms to prevent scheduling beyond simulation end
+        self._next_available_ms = min(reference_ms + wait, self.cfg.sim_time_ms)
 
     def _select_target(self) -> tuple[str, ConnectionParams]:
         """Select a target among only those this draft can reach (connection-aware).
@@ -1032,7 +1129,6 @@ class DraftServer:
                 scheduled = max(self._next_available_ms, self.env.now)
                 if scheduled > self.env.now:
                     yield self.env.timeout(scheduled - self.env.now)
-                self._next_available_ms = self.env.now
                 conversation_start = self.env.now
                 prompt_length = self._sample_prompt_length()
                 answer_length = self._sample_answer_length()
@@ -1109,6 +1205,8 @@ class DraftServer:
             rounds_needed = (answer_length + self.gamma - 1) // self.gamma  # ceiling division
             tokens_generated_in_conversation = 0
             tokens_accepted_in_conversation = 0
+            first_token_time_ms = None  # Track TTFT
+            conversation_tpot_samples: List[float] = []
 
             # Initialize progress for Semi-Clairvoyant router
             if hasattr(self.router, 'update_progress'):
@@ -1179,9 +1277,20 @@ class DraftServer:
 
                 # Simulate verification result
                 result = self._simulate_verification(tokens_this_round, conn.acceptance_rate)
+                job.accepted_tokens = result.accepted_tokens
                 self.total_tokens_accepted += result.accepted_tokens
                 self.total_tokens_rejected += result.rejected_tokens
                 tokens_accepted_in_conversation += result.accepted_tokens
+
+                # Calculate round-trip time for this chunk
+                rtt = self.env.now - round_start
+                self.total_round_trip_time += rtt
+
+                if result.accepted_tokens > 0:
+                    per_token = rtt / max(1, result.accepted_tokens)
+                    conversation_tpot_samples.extend([per_token] * result.accepted_tokens)
+                    if first_token_time_ms is None:
+                        first_token_time_ms = self.env.now
 
                 # Update progress for Semi-Clairvoyant router with actual acceptance
                 if hasattr(self.router, 'update_progress'):
@@ -1193,10 +1302,6 @@ class DraftServer:
                     self.metrics.token_metrics.total_generated_tokens += tokens_this_round
                     self.metrics.token_metrics.total_accepted_tokens += result.accepted_tokens
                     self.metrics.token_metrics.total_rejected_tokens += result.rejected_tokens
-
-                # Calculate round-trip time
-                rtt = self.env.now - round_start
-                self.total_round_trip_time += rtt
 
                 if self.cfg.debug:
                     print(f"[{self.env.now:.1f}ms] Draft {self.id}: Round {round_num+1} result: "
@@ -1212,6 +1317,7 @@ class DraftServer:
                       f"acceptance={conversation_acceptance:.2%}, time={conversation_time:.1f}ms", flush=True)
 
             if hasattr(self.metrics, "record_conversation"):
+                ttft_ms = (first_token_time_ms - conversation_start) if first_token_time_ms is not None else None
                 self.metrics.record_conversation(
                     conversation_id,
                     start_ms=conversation_start,
@@ -1221,14 +1327,13 @@ class DraftServer:
                     tokens_generated=tokens_generated_in_conversation,
                     tokens_accepted=tokens_accepted_in_conversation,
                     answer_tokens=answer_length,
+                    ttft_ms=ttft_ms,
+                    tpot_samples=conversation_tpot_samples,
                 )
 
-            if self._think_enabled:
+            # Schedule next arrival for both think_enabled and workload-driven modes
+            if not self._trace_mode:
                 self._schedule_next_arrival(self.env.now)
-            elif not self._trace_mode:
-                ia = self._ia()
-                if ia > 0:
-                    yield self.env.timeout(ia)
 
         # Final statistics
         if self.chunks_sent > 0:
@@ -1238,9 +1343,9 @@ class DraftServer:
             acceptance_rate = 0
             avg_rtt = 0
 
-        print(f"[{self.env.now:.1f}ms] Draft {self.id} finished: chunks={self.chunks_sent}, "
+        print(f"[{self.env.now:.1f}ms] Draft {self.id} finished: conversations={conversation_count}, chunks={self.chunks_sent}, "
               f"tokens={self.total_tokens_generated}, accepted={self.total_tokens_accepted} ({acceptance_rate:.2%}), "
-              f"avg RTT={avg_rtt:.1f}ms", flush=True)
+              f"avg RTT={avg_rtt:.1f}ms, scheduler={'Yes' if self.scheduler else 'No'}", flush=True)
 
 # ---------- Scheduler Core ----------
 
@@ -2822,6 +2927,21 @@ def _collect_metrics_json(cfg: Config, metrics, summary: Dict[str, float], targe
         "conversation_count": summary.get("conversation_count", 0),
         "completed_conversation_count": summary.get("completed_conversation_count", 0),
         "conversation_completion_rate": summary.get("conversation_completion_rate", 0),
+        "ttft_avg_ms": summary.get("ttft_avg_ms", 0),
+        "ttft_p50_ms": summary.get("ttft_p50_ms", 0),
+        "ttft_p95_ms": summary.get("ttft_p95_ms", 0),
+        "ttft_p99_ms": summary.get("ttft_p99_ms", 0),
+        "ttft_count": summary.get("ttft_count", 0),
+        "tpot_avg_ms": summary.get("tpot_avg_ms", 0),
+        "tpot_p50_ms": summary.get("tpot_p50_ms", 0),
+        "tpot_p95_ms": summary.get("tpot_p95_ms", 0),
+        "tpot_p99_ms": summary.get("tpot_p99_ms", 0),
+        "tpot_count": summary.get("tpot_count", 0),
+        "slo_attainment_rate": summary.get("slo_attainment_rate", 0),
+        "slo_meeting_count": summary.get("slo_meeting_count", 0),
+        "goodput_rps": summary.get("goodput_rps", 0),
+        "conversation_throughput_rps": 0.0,
+        "observed_span_ms": summary.get("observed_span_ms", cfg.sim_time_ms),
     }
 
     for key in (
@@ -2832,6 +2952,10 @@ def _collect_metrics_json(cfg: Config, metrics, summary: Dict[str, float], targe
     ):
         if key in summary:
             metrics_json[key] = summary[key]
+
+    span_ms = metrics_json["observed_span_ms"] if metrics_json["observed_span_ms"] is not None else cfg.sim_time_ms
+    if span_ms and span_ms > 0:
+        metrics_json["conversation_throughput_rps"] = summary.get("completed_conversation_count", 0) / (span_ms / 1000.0)
 
     if targets:
         all_batch_sizes = []
