@@ -198,6 +198,13 @@ This document lays out the core components and specifies the auxiliary design fi
 - Set `scheduler.decode.chunk_tokens` (or global `decode_chunk_tokens`) to control per-step token allotments; the scheduler re-enqueues the next chunk when the prior chunk finishes so new sequences can interleave immediately.
 - Existing batch knobs (`max_batch_requests`, `max_batch_tokens`, `max_wait_ms`) continue to bound each step, and the ChunkBarrier ensures the original completion event fires only after all chunks succeed.
 
+#### Prefill / Decode Pool Isolation and Draft Affinity  *(NEW)*
+
+- **Per-target pool split.** Each target server exposes distinct prefill and decode sub-pools (e.g., a 4-GPU host may dedicate 1 GPU to prefill, 3 GPUs to decode). Scheduler phase configs must route prefill jobs exclusively to prefill pools and decode jobs exclusively to decode pools—the simulator must never admit a decode job into a prefill pool or vice versa.
+- **Dedicated connectivity.** Drafts build explicit connections that encode which target they contact. Once a draft’s prefill request is assigned to target *T*, all subsequent decode rounds for that conversation must stay on *T*. The connection table enforces this affinity so routing algorithms decide which target to engage but cannot migrate a conversation mid-flight.
+- **Router choice still matters.** With multiple targets per cluster the router selects which target handles the prefill leg. Because decode jobs inherit the same target, load-balancing (JSQ, RR, random, etc.) directly governs queue depth on each pool and therefore latency.
+- **Configuration guidance.** Auto-topology expansion should emit separate pool definitions for prefill/decode with the appropriate GPU counts, and the scheduler should map each phase to the matching pool. Draft metadata must list reachable targets so the connection builder (and later the scheduler) can respect the pool isolation constraints automatically.
+
 #### Conversation-Level Metrics & Load Sweeps
 
 - `Metrics.summary()` now aggregates per-request timelines (grouped by `request_id`) in addition to per-job latencies, emitting conversation-level averages and tail percentiles plus completion counts and rates. Each draft attaches a stable `conversation_id` to all generated chunks and records start/end timestamps when a conversation completes.

@@ -1137,7 +1137,9 @@ class DraftServer:
             conversation_count += 1
             conversation_id = request_id or f"{self.id}_conv{conversation_count}"
 
-            target_id, conn = self._select_target()
+            conversation_target_id, conversation_conn = self._select_target()
+            target_id = conversation_target_id
+            conn = conversation_conn
 
             if hasattr(self.metrics, "connection_counts"):
                 self.metrics.connection_counts[(self.id, target_id)] += 1
@@ -1207,129 +1209,142 @@ class DraftServer:
             tokens_accepted_in_conversation = 0
             first_token_time_ms = None  # Track TTFT
             conversation_tpot_samples: List[float] = []
+            conversation_completed = False
 
             # Initialize progress for Semi-Clairvoyant router
             if hasattr(self.router, 'update_progress'):
                 self.router.update_progress(self.id, 0, 0, answer_length)
 
-            for round_num in range(rounds_needed):
-                round_start = self.env.now
+            try:
+                for round_num in range(rounds_needed):
+                    round_start = self.env.now
 
-                # Determine how many tokens to generate in this round
-                tokens_remaining = answer_length - tokens_generated_in_conversation
-                tokens_this_round = min(self.gamma, tokens_remaining)
+                    # Determine how many tokens to generate in this round
+                    tokens_remaining = answer_length - tokens_generated_in_conversation
+                    tokens_this_round = min(self.gamma, tokens_remaining)
 
-                current_context = prompt_length + tokens_generated_in_conversation
-                # Generate draft tokens using performance provider latency
-                generation_latency = self._predict_generation_latency(tokens_this_round, current_context)
-                if generation_latency > 0:
-                    yield self.env.timeout(generation_latency)
+                    current_context = prompt_length + tokens_generated_in_conversation
+                    # Generate draft tokens using performance provider latency
+                    generation_latency = self._predict_generation_latency(tokens_this_round, current_context)
+                    if generation_latency > 0:
+                        yield self.env.timeout(generation_latency)
 
-                self.chunks_sent += 1
-                self.total_tokens_generated += tokens_this_round
-                tokens_generated_in_conversation += tokens_this_round
+                    self.chunks_sent += 1
+                    self.total_tokens_generated += tokens_this_round
+                    tokens_generated_in_conversation += tokens_this_round
 
-                if self.cfg.debug:
-                    print(f"[{self.env.now:.1f}ms] Draft {self.id}: Round {round_num+1}/{rounds_needed} - "
-                          f"Generated {tokens_this_round} tokens for target {target_id}", flush=True)
+                    if self.cfg.debug:
+                        print(f"[{self.env.now:.1f}ms] Draft {self.id}: Round {round_num+1}/{rounds_needed} - "
+                              f"Generated {tokens_this_round} tokens for target {target_id}", flush=True)
 
-                # Create a decode job with completion event
-                decode_completion = self.env.event()
-                job = Job(
-                    jid=self.chunks_sent, 
-                    created_ms=self.env.now, 
-                    draft_id=self.id,
-                    job_type="decode",
-                    token_count=tokens_this_round,
-                    completion_event=decode_completion,
-                    rtt_start_ms=round_start,
-                    request_id=conversation_id,
-                    context_len=current_context + tokens_this_round,
-                    target_id=target_id,
-                    priority_class=priority_class,
-                    phase="decode",
-                )
+                    # Create a decode job with completion event
+                    decode_completion = self.env.event()
+                    job = Job(
+                        jid=self.chunks_sent,
+                        created_ms=self.env.now,
+                        draft_id=self.id,
+                        job_type="decode",
+                        token_count=tokens_this_round,
+                        completion_event=decode_completion,
+                        rtt_start_ms=round_start,
+                        request_id=conversation_id,
+                        context_len=current_context + tokens_this_round,
+                        target_id=target_id,
+                        priority_class=priority_class,
+                        phase="decode",
+                    )
 
-                # Send chunk to target (forward latency)
-                yield self.env.timeout(conn.forward_latency_ms)
+                    # Send chunk to target (forward latency)
+                    yield self.env.timeout(conn.forward_latency_ms)
 
-                # Job arrives at target after network delay
-                job.created_ms = self.env.now
+                    # Job arrives at target after network delay
+                    job.created_ms = self.env.now
 
-                if self.scheduler is None:
-                    target_server = self._target_lookup.get(target_id)
-                    if target_server is None:
-                        print(f"Warning: Target {target_id} not found for draft {self.id}", flush=True)
-                        break
-                    target_server.enqueue(job)
-                    wait_event = decode_completion
+                    if self.scheduler is None:
+                        target_server = self._target_lookup.get(target_id)
+                        if target_server is None:
+                            print(f"Warning: Target {target_id} not found for draft {self.id}", flush=True)
+                            break
+                        target_server.enqueue(job)
+                        wait_event = decode_completion
+                    else:
+                        wait_event = self.scheduler.submit_job(job)
+
+                    # Wait for actual job completion instead of synthetic sleep
+                    yield wait_event
+
+                    # Wait for response to travel back
+                    yield self.env.timeout(conn.response_latency_ms)
+
+                    # Mark RTT end after response received
+                    job.rtt_end_ms = self.env.now
+
+                    # Simulate verification result
+                    result = self._simulate_verification(tokens_this_round, conn.acceptance_rate)
+                    job.accepted_tokens = result.accepted_tokens
+                    self.total_tokens_accepted += result.accepted_tokens
+                    self.total_tokens_rejected += result.rejected_tokens
+                    tokens_accepted_in_conversation += result.accepted_tokens
+
+                    # Calculate round-trip time for this chunk
+                    rtt = self.env.now - round_start
+                    self.total_round_trip_time += rtt
+
+                    if result.accepted_tokens > 0:
+                        per_token = rtt / max(1, result.accepted_tokens)
+                        conversation_tpot_samples.extend([per_token] * result.accepted_tokens)
+                        if first_token_time_ms is None:
+                            first_token_time_ms = self.env.now
+
+                    # Update progress for Semi-Clairvoyant router with actual acceptance
+                    if hasattr(self.router, 'update_progress'):
+                        self.router.update_progress(self.id, tokens_generated_in_conversation,
+                                                   tokens_accepted_in_conversation, answer_length)
+
+                    # Update global token metrics (only count after burn-in)
+                    if self.env.now >= self.cfg.burn_in_ms:
+                        self.metrics.token_metrics.total_generated_tokens += tokens_this_round
+                        self.metrics.token_metrics.total_accepted_tokens += result.accepted_tokens
+                        self.metrics.token_metrics.total_rejected_tokens += result.rejected_tokens
+
+                    if self.cfg.debug:
+                        print(f"[{self.env.now:.1f}ms] Draft {self.id}: Round {round_num+1} result: "
+                              f"{result.accepted_tokens}/{tokens_this_round} accepted, RTT={rtt:.1f}ms", flush=True)
                 else:
-                    wait_event = self.scheduler.submit_job(job)
+                    conversation_completed = True
+            finally:
+                if conversation_completed and tokens_generated_in_conversation > 0:
+                    conversation_time = self.env.now - conversation_start
+                    conversation_acceptance = (
+                        tokens_accepted_in_conversation / tokens_generated_in_conversation
+                        if tokens_generated_in_conversation > 0 else 0
+                    )
 
-                # Wait for actual job completion instead of synthetic sleep
-                yield wait_event
+                    if self.cfg.verbose or self.cfg.debug:
+                        print(
+                            f"[{self.env.now:.1f}ms] Draft {self.id}: Conversation #{conversation_count} completed - "
+                            f"prompt={prompt_length}, answer={tokens_generated_in_conversation}/{answer_length} tokens, "
+                            f"acceptance={conversation_acceptance:.2%}, time={conversation_time:.1f}ms",
+                            flush=True,
+                        )
 
-                # Wait for response to travel back
-                yield self.env.timeout(conn.response_latency_ms)
-
-                # Mark RTT end after response received
-                job.rtt_end_ms = self.env.now
-
-                # Simulate verification result
-                result = self._simulate_verification(tokens_this_round, conn.acceptance_rate)
-                job.accepted_tokens = result.accepted_tokens
-                self.total_tokens_accepted += result.accepted_tokens
-                self.total_tokens_rejected += result.rejected_tokens
-                tokens_accepted_in_conversation += result.accepted_tokens
-
-                # Calculate round-trip time for this chunk
-                rtt = self.env.now - round_start
-                self.total_round_trip_time += rtt
-
-                if result.accepted_tokens > 0:
-                    per_token = rtt / max(1, result.accepted_tokens)
-                    conversation_tpot_samples.extend([per_token] * result.accepted_tokens)
-                    if first_token_time_ms is None:
-                        first_token_time_ms = self.env.now
-
-                # Update progress for Semi-Clairvoyant router with actual acceptance
-                if hasattr(self.router, 'update_progress'):
-                    self.router.update_progress(self.id, tokens_generated_in_conversation,
-                                               tokens_accepted_in_conversation, answer_length)
-
-                # Update global token metrics (only count after burn-in)
-                if self.env.now >= self.cfg.burn_in_ms:
-                    self.metrics.token_metrics.total_generated_tokens += tokens_this_round
-                    self.metrics.token_metrics.total_accepted_tokens += result.accepted_tokens
-                    self.metrics.token_metrics.total_rejected_tokens += result.rejected_tokens
-
-                if self.cfg.debug:
-                    print(f"[{self.env.now:.1f}ms] Draft {self.id}: Round {round_num+1} result: "
-                          f"{result.accepted_tokens}/{tokens_this_round} accepted, RTT={rtt:.1f}ms", flush=True)
-
-            # Conversation completed
-            conversation_time = self.env.now - conversation_start
-            conversation_acceptance = tokens_accepted_in_conversation / tokens_generated_in_conversation if tokens_generated_in_conversation > 0 else 0
-
-            if self.cfg.verbose or self.cfg.debug:
-                print(f"[{self.env.now:.1f}ms] Draft {self.id}: Conversation #{conversation_count} completed - "
-                      f"prompt={prompt_length}, answer={tokens_generated_in_conversation}/{answer_length} tokens, "
-                      f"acceptance={conversation_acceptance:.2%}, time={conversation_time:.1f}ms", flush=True)
-
-            if hasattr(self.metrics, "record_conversation"):
-                ttft_ms = (first_token_time_ms - conversation_start) if first_token_time_ms is not None else None
-                self.metrics.record_conversation(
-                    conversation_id,
-                    start_ms=conversation_start,
-                    end_ms=self.env.now,
-                    draft_id=self.id,
-                    target_id=target_id,
-                    tokens_generated=tokens_generated_in_conversation,
-                    tokens_accepted=tokens_accepted_in_conversation,
-                    answer_tokens=answer_length,
-                    ttft_ms=ttft_ms,
-                    tpot_samples=conversation_tpot_samples,
-                )
+                    if hasattr(self.metrics, "record_conversation"):
+                        ttft_ms = (
+                            (first_token_time_ms - conversation_start)
+                            if first_token_time_ms is not None else None
+                        )
+                        self.metrics.record_conversation(
+                            conversation_id,
+                            start_ms=conversation_start,
+                            end_ms=self.env.now,
+                            draft_id=self.id,
+                            target_id=target_id,
+                            tokens_generated=tokens_generated_in_conversation,
+                            tokens_accepted=tokens_accepted_in_conversation,
+                            answer_tokens=answer_length,
+                            ttft_ms=ttft_ms,
+                            tpot_samples=conversation_tpot_samples,
+                        )
 
             # Schedule next arrival for both think_enabled and workload-driven modes
             if not self._trace_mode:
@@ -1905,17 +1920,19 @@ class Scheduler:
 
 class RandomRouter:
     """Pure random selection - no load awareness."""
-    def __init__(self, targets: List[TargetServer]):
+
+    def __init__(self, targets: List[TargetServer], seed: Optional[int] = None):
         if not targets:
             raise ValueError("Router needs at least one target")
         self.targets = targets
-    
+        self._rng = random.Random(seed)
+
     def random_select_filtered(self, allowed_ids) -> TargetServer:
         """Randomly select one target from allowed set."""
         pool = [t for t in self.targets if t.p.id in allowed_ids]
         if not pool:
             return None
-        return random.choice(pool)
+        return self._rng.choice(pool)
 
 class RoundRobinRouter:
     """Round-robin router with per-draft counters for connection-aware routing."""
@@ -2610,7 +2627,7 @@ def build(env: simpy.Environment, cfg: Config):
             )
 
     router_instances: Dict[str, object] = {}
-    for cluster_name, cluster_targets in targets_by_cluster.items():
+    for cluster_idx, (cluster_name, cluster_targets) in enumerate(targets_by_cluster.items()):
         router_name = cfg.cluster_router.get(cluster_name, cfg.router)
         RouterCls = ROUTERS.get(router_name, RoundRobinRouter)
         params = dict(cfg.router_params or {})
@@ -2619,6 +2636,9 @@ def build(env: simpy.Environment, cfg: Config):
             router = RouterCls(cluster_targets, d_choices=int(params.get("d_choices", 2)), debug=cfg.debug)
         elif RouterCls == JSQ2Router:
             router = RouterCls(cluster_targets, d_choices=int(params.get("d_choices", 2)))
+        elif RouterCls == RandomRouter:
+            seed = (cfg.seed if isinstance(cfg.seed, int) else 0) + cluster_idx * 9973
+            router = RouterCls(cluster_targets, seed=seed)
         else:
             router = RouterCls(cluster_targets)
         router_instances[cluster_name] = router
@@ -2635,6 +2655,9 @@ def build(env: simpy.Environment, cfg: Config):
             router = RouterCls(targets, d_choices=int(params.get("d_choices", 2)), debug=cfg.debug)
         elif RouterCls == JSQ2Router:
             router = RouterCls(targets, d_choices=int(params.get("d_choices", 2)))
+        elif RouterCls == RandomRouter:
+            seed = (cfg.seed if isinstance(cfg.seed, int) else 0)
+            router = RouterCls(targets, seed=seed)
         else:
             router = RouterCls(targets)
         router_instances["default"] = router

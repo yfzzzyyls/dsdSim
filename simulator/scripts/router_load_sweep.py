@@ -117,6 +117,7 @@ def plot_results(results: Dict[str, Dict[float, Dict[str, float]]], output_dir: 
     plt.figure(figsize=(7, 4))
     for router, data in results.items():
         throughput = [data[load].get("throughput_jobs_s", 0.0) for load in loads]
+        throughput = [data[load].get("throughput_jobs_s", 0.0) for load in loads]
         plt.plot(loads, throughput, marker="o", label=f"{router} (job throughput)", linestyle="-")
 
         conv_throughput = [data[load].get("conversation_throughput_rps", 0.0) for load in loads]
