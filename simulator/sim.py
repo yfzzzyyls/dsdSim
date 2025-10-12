@@ -569,7 +569,9 @@ class TargetServer:
             print(f"[{self.env.now:.1f}ms] WARNING: Target {self.p.id} queue size: {self._enqueued_count}", flush=True)
 
     def queue_len(self) -> int:
-        return self._enqueued_count
+        # Include the job currently in service so JSQ sees busy targets
+        busy = 1 if self._busy else 0
+        return self._enqueued_count + busy
 
     def _calculate_batch_latency(self, batch: List[Job]) -> float:
         """Calculate batch processing time with optional VIDUR support."""
@@ -1962,17 +1964,24 @@ class RoundRobinRouter:
         return target
 class JSQRouter:
     """Join-the-Shortest-Queue router (global queue awareness)."""
-    def __init__(self, targets: List[TargetServer]):
+
+    def __init__(self, targets: List[TargetServer], seed: Optional[int] = None):
         if not targets:
             raise ValueError("Router needs at least one target")
         self.targets = targets
+        self._rng = random.Random(seed)
 
     def jsq_select_filtered(self, allowed_ids) -> TargetServer:
         """Pick the target with the fewest queued jobs among the allowed set."""
         pool = [t for t in self.targets if t.p.id in allowed_ids]
         if not pool:
             return None
-        return min(pool, key=lambda t: t.queue_len())
+        lengths = [t.queue_len() for t in pool]
+        min_len = min(lengths)
+        candidates = [t for t, qlen in zip(pool, lengths) if qlen == min_len]
+        if len(candidates) == 1:
+            return candidates[0]
+        return self._rng.choice(candidates)
 
 class JIQRouter:
     """Join-Idle-Queue router with FIFO idle queue."""
@@ -2636,6 +2645,9 @@ def build(env: simpy.Environment, cfg: Config):
             router = RouterCls(cluster_targets, d_choices=int(params.get("d_choices", 2)), debug=cfg.debug)
         elif RouterCls == JSQ2Router:
             router = RouterCls(cluster_targets, d_choices=int(params.get("d_choices", 2)))
+        elif RouterCls == JSQRouter:
+            seed = (cfg.seed if isinstance(cfg.seed, int) else 0) + cluster_idx * 9973
+            router = RouterCls(cluster_targets, seed=seed)
         elif RouterCls == RandomRouter:
             seed = (cfg.seed if isinstance(cfg.seed, int) else 0) + cluster_idx * 9973
             router = RouterCls(cluster_targets, seed=seed)
@@ -2655,6 +2667,9 @@ def build(env: simpy.Environment, cfg: Config):
             router = RouterCls(targets, d_choices=int(params.get("d_choices", 2)), debug=cfg.debug)
         elif RouterCls == JSQ2Router:
             router = RouterCls(targets, d_choices=int(params.get("d_choices", 2)))
+        elif RouterCls == JSQRouter:
+            seed = (cfg.seed if isinstance(cfg.seed, int) else 0)
+            router = RouterCls(targets, seed=seed)
         elif RouterCls == RandomRouter:
             seed = (cfg.seed if isinstance(cfg.seed, int) else 0)
             router = RouterCls(targets, seed=seed)

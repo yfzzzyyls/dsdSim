@@ -64,14 +64,14 @@ auto_topology:
     targets:
       count: 3
       tiers:
-      - name: atlas
+      - name: atlas_h100_llama70b
         count: 1
         model: llama-2-70b
         gpu: H100
         weight: 1.0
-        batch_window_ms: 0.5
-        batch_size: 4
-        vidur: &id001
+        batch_window_ms: 0.45
+        batch_size: 6
+        vidur:
           model_name: meta-llama/Llama-2-70b-hf
           device: H100
           network_device: H100_DGX
@@ -79,40 +79,99 @@ auto_topology:
           pipeline_parallel: 1
           scheduler: sarathi
           chunk_size: 512
-      - name: zephyr
+      - name: zephyr_a100_qwen72b
         count: 1
-        model: llama-2-70b
-        gpu: H100
-        weight: 1.0
-        batch_window_ms: 0.5
+        model: qwen-72b
+        gpu: A100
+        weight: 0.75
+        batch_window_ms: 0.6
         batch_size: 4
-        vidur: *id001
-      - name: orion
+        vidur:
+          model_name: Qwen/Qwen-72B
+          device: A100
+          network_device: A100_DGX
+          tensor_parallel: 1
+          pipeline_parallel: 1
+          scheduler: sarathi
+          chunk_size: 512
+      - name: orion_a40_llama33b
         count: 1
-        model: llama-2-70b
-        gpu: H100
-        weight: 1.0
-        batch_window_ms: 0.5
-        batch_size: 4
-        vidur: *id001
+        model: llama-2-33b
+        gpu: A40
+        weight: 0.4
+        batch_window_ms: 0.9
+        batch_size: 2
+        vidur:
+          model_name: meta-llama/Llama-2-34b-hf
+          device: A40
+          network_device: A40_PAIRWISE_NVLINK
+          tensor_parallel: 1
+          pipeline_parallel: 1
+          scheduler: sarathi
+          chunk_size: 512
     drafts:
       count: 10
       capability_map:
-        baseline: 1.0
+        ultra: 1.5
+        pro: 1.0
+        edge: 0.6
+        cpu: 0.3
       draft_bucket_labels:
-      - baseline
+      - ultra
+      - pro
+      - edge
+      - cpu
       reliability:
-        baseline: 0.99
+        ultra: 0.995
+        pro: 0.99
+        edge: 0.975
+        cpu: 0.95
       count_by_label:
-        baseline: 10
+        ultra: 10
+        pro: 20
+        edge: 20
+        cpu: 10
       metadata_by_label:
-        baseline:
+        ultra:
+          model: llama-2-13b
+          gpu: RTX4090
+          vidur_profile:
+            model_name: meta-llama/Llama-2-13b-hf
+            device: RTX4090
+            network_device: PCIe
+            tensor_parallel: 1
+            pipeline_parallel: 1
+            scheduler: sarathi
+            chunk_size: 512
+        pro:
           model: llama-2-7b
-          gpu: A40
+          gpu: A10
           vidur_profile:
             model_name: meta-llama/Llama-2-7b-hf
-            device: A40
-            network_device: A40_PAIRWISE_NVLINK
+            device: A10
+            network_device: PCIe
+            tensor_parallel: 1
+            pipeline_parallel: 1
+            scheduler: sarathi
+            chunk_size: 512
+        edge:
+          model: llama-2-3b
+          gpu: L4
+          vidur_profile:
+            model_name: meta-llama/Llama-2-3b-hf
+            device: L4
+            network_device: PCIe
+            tensor_parallel: 1
+            pipeline_parallel: 1
+            scheduler: sarathi
+            chunk_size: 512
+        cpu:
+          model: gptj-6b
+          gpu: CPU
+          vidur_profile:
+            model_name: EleutherAI/gpt-j-6b
+            device: CPU
+            network_device: Ethernet
             tensor_parallel: 1
             pipeline_parallel: 1
             scheduler: sarathi
@@ -120,18 +179,18 @@ auto_topology:
     connectivity:
       fanout_per_draft: 3
       net_ms_ranges:
-        atlas:
+        atlas_h100_llama70b:
         - 1.0
-        - 1.4
-        zephyr:
-        - 1.1
-        - 1.5
-        orion:
+        - 1.3
+        zephyr_a100_qwen72b:
         - 1.2
         - 1.6
+        orion_a40_llama33b:
+        - 1.6
+        - 2.2
       acceptance_by_tier:
         baseline:
-          atlas: 0.95
-          zephyr: 0.94
-          orion: 0.93
+          atlas_h100_llama70b: 0.96
+          zephyr_a100_qwen72b: 0.92
+          orion_a40_llama33b: 0.88
       link_jitter_pct: 0.0
