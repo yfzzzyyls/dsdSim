@@ -1,1 +1,0 @@
-Given that f(x) = 4x^3 - 9x - 14, find the value of f(2).

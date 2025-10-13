@@ -3258,7 +3258,7 @@ def main():
             json.dump({label: metrics for label, metrics in aggregated}, fh, indent=2)
 
     if args.plot:
-        output_path = Path(args.plot if args.plot != "AUTO" else repo_root / "scripts_output" / "latency_comparison.png")
+        output_path = Path(args.plot if args.plot != "AUTO" else repo_root / "experiments" / "results" / "latency_comparison.png")
         plot_path = _maybe_plot(aggregated, output_path.resolve())
         print(f"Plot saved to {plot_path}")
 
