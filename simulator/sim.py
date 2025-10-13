@@ -215,6 +215,8 @@ class Metrics:
         answer_tokens: int,
         ttft_ms: Optional[float] = None,
         tpot_samples: Optional[Sequence[float]] = None,
+        ttft_breakdown: Optional[Mapping[str, float]] = None,
+        decode_breakdown: Optional[Mapping[str, float]] = None,
     ) -> None:
         """Track per-conversation timing (only after burn-in)."""
         if start_ms < self.burn_in_ms:
@@ -238,6 +240,10 @@ class Metrics:
             record["ttft_ms"] = ttft_ms
         if tpot_samples:
             record["tpot_samples"] = list(tpot_samples)
+        if ttft_breakdown:
+            record["ttft_breakdown"] = dict(ttft_breakdown)
+        if decode_breakdown:
+            record["decode_breakdown"] = dict(decode_breakdown)
         self.conversations.append(record)
 
     def summary(self) -> Dict[str, float]:
@@ -398,6 +404,29 @@ class Metrics:
             result["p50_conversation_ms"] = result.get("p50_conversation_ms_completed", result.get("p50_conversation_ms", 0))
             result["p95_conversation_ms"] = result.get("p95_conversation_ms_completed", result.get("p95_conversation_ms", 0))
             result["p99_conversation_ms"] = result.get("p99_conversation_ms_completed", result.get("p99_conversation_ms", 0))
+
+            ttft_components: Dict[str, float] = {}
+            ttft_count = 0
+            decode_components: Dict[str, float] = {}
+            decode_count = 0
+            for entry in completed_entries:
+                comp = entry.get("ttft_breakdown")
+                if comp:
+                    ttft_count += 1
+                    for k, v in comp.items():
+                        ttft_components[k] = ttft_components.get(k, 0.0) + float(v)
+                comp_dec = entry.get("decode_breakdown")
+                if comp_dec:
+                    decode_count += 1
+                    for k, v in comp_dec.items():
+                        decode_components[k] = decode_components.get(k, 0.0) + float(v)
+
+            if ttft_count:
+                for k, total in ttft_components.items():
+                    result[f"ttft_breakdown_{k}_avg"] = total / ttft_count
+            if decode_count:
+                for k, total in decode_components.items():
+                    result[f"decode_breakdown_{k}_avg"] = total / decode_count
         elif observed_entries:
             result["completed_conversation_count"] = 0
             result["conversation_completion_rate"] = 0.0
@@ -1143,6 +1172,26 @@ class DraftServer:
             target_id = conversation_target_id
             conn = conversation_conn
 
+            ttft_breakdown = {
+                "prefill_forward_ms": conversation_conn.forward_latency_ms,
+                "prefill_queue_ms": 0.0,
+                "prefill_compute_ms": 0.0,
+                "prefill_response_ms": conversation_conn.response_latency_ms,
+                "decode_generation_ms": 0.0,
+                "decode_forward_ms": 0.0,
+                "decode_queue_ms": 0.0,
+                "decode_compute_ms": 0.0,
+                "decode_response_ms": 0.0,
+            }
+            decode_breakdown = {
+                "generation_ms": 0.0,
+                "forward_ms": 0.0,
+                "queue_ms": 0.0,
+                "compute_ms": 0.0,
+                "response_ms": 0.0,
+            }
+            ttft_pending = True
+
             if hasattr(self.metrics, "connection_counts"):
                 self.metrics.connection_counts[(self.id, target_id)] += 1
 
@@ -1202,6 +1251,12 @@ class DraftServer:
             # Mark RTT end for prefill
             prefill_job.rtt_end_ms = self.env.now
 
+            prefill_started = prefill_job.started_ms if prefill_job.started_ms is not None else prefill_job.created_ms
+            prefill_queue = max(0.0, (prefill_started - prefill_job.created_ms) if prefill_started is not None else 0.0)
+            prefill_compute = max(0.0, (prefill_job.finished_ms - prefill_started) if prefill_started is not None and prefill_job.finished_ms is not None else 0.0)
+            ttft_breakdown["prefill_queue_ms"] += prefill_queue
+            ttft_breakdown["prefill_compute_ms"] += prefill_compute
+
             if self.cfg.debug:
                 print(f"[{self.env.now:.1f}ms] Draft {self.id}: Prefill completed for {prompt_length} tokens", flush=True)
 
@@ -1228,8 +1283,11 @@ class DraftServer:
                     current_context = prompt_length + tokens_generated_in_conversation
                     # Generate draft tokens using performance provider latency
                     generation_latency = self._predict_generation_latency(tokens_this_round, current_context)
-                    if generation_latency > 0:
-                        yield self.env.timeout(generation_latency)
+                if generation_latency > 0:
+                    yield self.env.timeout(generation_latency)
+                decode_breakdown["generation_ms"] += generation_latency
+                if ttft_pending:
+                    ttft_breakdown["decode_generation_ms"] += generation_latency
 
                     self.chunks_sent += 1
                     self.total_tokens_generated += tokens_this_round
@@ -1257,7 +1315,10 @@ class DraftServer:
                     )
 
                     # Send chunk to target (forward latency)
-                    yield self.env.timeout(conn.forward_latency_ms)
+                yield self.env.timeout(conn.forward_latency_ms)
+                decode_breakdown["forward_ms"] += conversation_conn.forward_latency_ms
+                if ttft_pending:
+                    ttft_breakdown["decode_forward_ms"] += conversation_conn.forward_latency_ms
 
                     # Job arrives at target after network delay
                     job.created_ms = self.env.now
@@ -1273,13 +1334,26 @@ class DraftServer:
                         wait_event = self.scheduler.submit_job(job)
 
                     # Wait for actual job completion instead of synthetic sleep
-                    yield wait_event
+                yield wait_event
 
-                    # Wait for response to travel back
-                    yield self.env.timeout(conn.response_latency_ms)
+                # Wait for response to travel back
+                yield self.env.timeout(conn.response_latency_ms)
+                decode_breakdown["response_ms"] += conversation_conn.response_latency_ms
+                if ttft_pending:
+                    ttft_breakdown["decode_response_ms"] += conversation_conn.response_latency_ms
 
-                    # Mark RTT end after response received
-                    job.rtt_end_ms = self.env.now
+                # Mark RTT end after response received
+                job.rtt_end_ms = self.env.now
+
+                # Queue wait and compute durations
+                job_started = job.started_ms if job.started_ms is not None else job.created_ms
+                queue_wait = max(0.0, (job_started - job.created_ms) if job_started is not None else 0.0)
+                compute_ms = max(0.0, (job.finished_ms - job_started) if job_started is not None and job.finished_ms is not None else 0.0)
+                decode_breakdown["queue_ms"] += queue_wait
+                decode_breakdown["compute_ms"] += compute_ms
+                if ttft_pending:
+                    ttft_breakdown["decode_queue_ms"] += queue_wait
+                    ttft_breakdown["decode_compute_ms"] += compute_ms
 
                     # Simulate verification result
                     result = self._simulate_verification(tokens_this_round, conn.acceptance_rate)
@@ -1292,11 +1366,12 @@ class DraftServer:
                     rtt = self.env.now - round_start
                     self.total_round_trip_time += rtt
 
-                    if result.accepted_tokens > 0:
-                        per_token = rtt / max(1, result.accepted_tokens)
-                        conversation_tpot_samples.extend([per_token] * result.accepted_tokens)
-                        if first_token_time_ms is None:
-                            first_token_time_ms = self.env.now
+                if result.accepted_tokens > 0:
+                    per_token = rtt / max(1, result.accepted_tokens)
+                    conversation_tpot_samples.extend([per_token] * result.accepted_tokens)
+                    if first_token_time_ms is None:
+                        first_token_time_ms = self.env.now
+                        ttft_pending = False
 
                     # Update progress for Semi-Clairvoyant router with actual acceptance
                     if hasattr(self.router, 'update_progress'):
@@ -1346,6 +1421,8 @@ class DraftServer:
                             answer_tokens=answer_length,
                             ttft_ms=ttft_ms,
                             tpot_samples=conversation_tpot_samples,
+                            ttft_breakdown=ttft_breakdown,
+                            decode_breakdown=decode_breakdown,
                         )
 
             # Schedule next arrival for both think_enabled and workload-driven modes
@@ -2994,6 +3071,10 @@ def _collect_metrics_json(cfg: Config, metrics, summary: Dict[str, float], targe
     span_ms = metrics_json["observed_span_ms"] if metrics_json["observed_span_ms"] is not None else cfg.sim_time_ms
     if span_ms and span_ms > 0:
         metrics_json["conversation_throughput_rps"] = summary.get("completed_conversation_count", 0) / (span_ms / 1000.0)
+
+    for key, value in summary.items():
+        if key.startswith("ttft_breakdown_") or key.startswith("decode_breakdown_"):
+            metrics_json[key] = value
 
     if targets:
         all_batch_sizes = []

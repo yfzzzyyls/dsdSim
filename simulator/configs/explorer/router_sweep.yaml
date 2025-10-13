@@ -59,12 +59,12 @@ scheduler:
     max_utilization_pct: 85.0
 auto_topology:
   clusters:
-  - name: default
+  - name: dc_primary
     router: jsq
     targets:
       count: 3
       tiers:
-      - name: atlas_h100_llama70b
+      - name: dc_atlas_h100_llama70b
         count: 1
         model: llama-2-70b
         gpu: H100
@@ -72,21 +72,21 @@ auto_topology:
         batch_window_ms: 0.45
         batch_size: 6
         vidur:
-          model_name: meta-llama/Llama-2-70b-hf
+          model_name: meta-llama/LLaMA-65B
           device: H100
           network_device: H100_DGX
           tensor_parallel: 1
           pipeline_parallel: 1
           scheduler: sarathi
           chunk_size: 512
-      - name: zephyr_a100_qwen72b
+      - name: dc_zephyr_a100_qwen72b
         count: 1
         model: qwen-72b
         gpu: A100
-        weight: 0.75
+        weight: 0.8
         batch_window_ms: 0.6
         batch_size: 4
-        vidur:
+        vidur: &id002
           model_name: Qwen/Qwen-72B
           device: A100
           network_device: A100_DGX
@@ -94,11 +94,11 @@ auto_topology:
           pipeline_parallel: 1
           scheduler: sarathi
           chunk_size: 512
-      - name: orion_a40_llama33b
+      - name: dc_orion_a40_llama33b
         count: 1
         model: llama-2-33b
         gpu: A40
-        weight: 0.4
+        weight: 0.45
         batch_window_ms: 0.9
         batch_size: 2
         vidur:
@@ -110,7 +110,7 @@ auto_topology:
           scheduler: sarathi
           chunk_size: 512
     drafts:
-      count: 10
+      count: 60
       capability_map:
         ultra: 1.5
         pro: 1.0
@@ -127,17 +127,17 @@ auto_topology:
         edge: 0.975
         cpu: 0.95
       count_by_label:
-        ultra: 10
+        ultra: 15
         pro: 20
-        edge: 20
+        edge: 15
         cpu: 10
       metadata_by_label:
         ultra:
           model: llama-2-13b
           gpu: RTX4090
-          vidur_profile:
+          vidur_profile: &id001
             model_name: meta-llama/Llama-2-13b-hf
-            device: RTX4090
+            device: A10
             network_device: PCIe
             tensor_parallel: 1
             pipeline_parallel: 1
@@ -146,19 +146,12 @@ auto_topology:
         pro:
           model: llama-2-7b
           gpu: A10
-          vidur_profile:
-            model_name: meta-llama/Llama-2-7b-hf
-            device: A10
-            network_device: PCIe
-            tensor_parallel: 1
-            pipeline_parallel: 1
-            scheduler: sarathi
-            chunk_size: 512
+          vidur_profile: *id001
         edge:
-          model: llama-2-3b
+          model: qwen1.5-14b
           gpu: L4
-          vidur_profile:
-            model_name: meta-llama/Llama-2-3b-hf
+          vidur_profile: &id003
+            model_name: Qwen/Qwen1.5-32B
             device: L4
             network_device: PCIe
             tensor_parallel: 1
@@ -166,10 +159,10 @@ auto_topology:
             scheduler: sarathi
             chunk_size: 512
         cpu:
-          model: gptj-6b
+          model: mistral-7b
           gpu: CPU
-          vidur_profile:
-            model_name: EleutherAI/gpt-j-6b
+          vidur_profile: &id004
+            model_name: mistralai/Mistral-7B-Instruct
             device: CPU
             network_device: Ethernet
             tensor_parallel: 1
@@ -179,18 +172,166 @@ auto_topology:
     connectivity:
       fanout_per_draft: 3
       net_ms_ranges:
-        atlas_h100_llama70b:
-        - 1.0
-        - 1.3
-        zephyr_a100_qwen72b:
+        dc_atlas_h100_llama70b:
+        - 0.9
         - 1.2
+        dc_zephyr_a100_qwen72b:
+        - 1.0
+        - 1.4
+        dc_orion_a40_llama33b:
+        - 1.2
+        - 1.8
+      acceptance_by_tier:
+        baseline:
+          dc_atlas_h100_llama70b: 0.96
+          dc_zephyr_a100_qwen72b: 0.92
+          dc_orion_a40_llama33b: 0.88
+      link_jitter_pct: 0.0
+  - name: regional
+    router: jsq
+    targets:
+      count: 3
+      tiers:
+      - name: rg_atlas_a100_llama70b
+        count: 1
+        model: llama-2-70b
+        gpu: A100
+        weight: 0.75
+        batch_window_ms: 0.6
+        batch_size: 4
+        vidur: *id002
+      - name: rg_zephyr_l40_qwen32b
+        count: 1
+        model: qwen-32b
+        gpu: L40
+        weight: 0.5
+        batch_window_ms: 0.8
+        batch_size: 3
+        vidur: *id003
+      - name: rg_orion_a10_llama13b
+        count: 1
+        model: llama-2-13b
+        gpu: A10
+        weight: 0.35
+        batch_window_ms: 0.9
+        batch_size: 2
+        vidur: *id001
+    drafts:
+      count: 45
+      capability_map:
+        pro: 1.0
+        edge: 0.6
+        cpu: 0.3
+      draft_bucket_labels:
+      - pro
+      - edge
+      - cpu
+      reliability:
+        pro: 0.99
+        edge: 0.975
+        cpu: 0.94
+      count_by_label:
+        pro: 15
+        edge: 20
+        cpu: 10
+      metadata_by_label:
+        pro:
+          model: llama-2-7b
+          gpu: A10
+          vidur_profile: *id001
+        edge:
+          model: qwen1.5-7b
+          gpu: L4
+          vidur_profile: *id003
+        cpu:
+          model: phi-2
+          gpu: CPU
+          vidur_profile: *id004
+    connectivity:
+      fanout_per_draft: 3
+      net_ms_ranges:
+        rg_atlas_a100_llama70b:
+        - 1.1
         - 1.6
-        orion_a40_llama33b:
-        - 1.6
+        rg_zephyr_l40_qwen32b:
+        - 1.3
+        - 1.9
+        rg_orion_a10_llama13b:
+        - 1.5
         - 2.2
       acceptance_by_tier:
         baseline:
-          atlas_h100_llama70b: 0.96
-          zephyr_a100_qwen72b: 0.92
-          orion_a40_llama33b: 0.88
+          rg_atlas_a100_llama70b: 0.93
+          rg_zephyr_l40_qwen32b: 0.89
+          rg_orion_a10_llama13b: 0.85
+      link_jitter_pct: 0.0
+  - name: edge
+    router: jsq
+    targets:
+      count: 3
+      tiers:
+      - name: edge_atlas_l40_qwen14b
+        count: 1
+        model: qwen-14b
+        gpu: L40
+        weight: 0.45
+        batch_window_ms: 0.9
+        batch_size: 2
+        vidur: *id003
+      - name: edge_zephyr_a10_llama13b
+        count: 1
+        model: llama-2-13b
+        gpu: A10
+        weight: 0.35
+        batch_window_ms: 1.0
+        batch_size: 2
+        vidur: *id001
+      - name: edge_orion_cpu_mistral7b
+        count: 1
+        model: mistral-7b
+        gpu: CPU
+        weight: 0.15
+        batch_window_ms: 1.2
+        batch_size: 1
+        vidur: *id004
+    drafts:
+      count: 36
+      capability_map:
+        edge: 0.6
+        cpu: 0.3
+      draft_bucket_labels:
+      - edge
+      - cpu
+      reliability:
+        edge: 0.97
+        cpu: 0.93
+      count_by_label:
+        edge: 24
+        cpu: 12
+      metadata_by_label:
+        edge:
+          model: qwen1.5-3b
+          gpu: L4
+          vidur_profile: *id003
+        cpu:
+          model: phi-2
+          gpu: CPU
+          vidur_profile: *id004
+    connectivity:
+      fanout_per_draft: 3
+      net_ms_ranges:
+        edge_atlas_l40_qwen14b:
+        - 1.5
+        - 2.4
+        edge_zephyr_a10_llama13b:
+        - 1.7
+        - 2.6
+        edge_orion_cpu_mistral7b:
+        - 2.0
+        - 3.0
+      acceptance_by_tier:
+        baseline:
+          edge_atlas_l40_qwen14b: 0.87
+          edge_zephyr_a10_llama13b: 0.82
+          edge_orion_cpu_mistral7b: 0.76
       link_jitter_pct: 0.0

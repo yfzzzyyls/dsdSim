@@ -205,6 +205,31 @@ This document lays out the core components and specifies the auxiliary design fi
 - **Router choice still matters.** With multiple targets per cluster the router selects which target handles the prefill leg. Because decode jobs inherit the same target, load-balancing (JSQ, RR, random, etc.) directly governs queue depth on each pool and therefore latency.
 - **Configuration guidance.** Auto-topology expansion should emit separate pool definitions for prefill/decode with the appropriate GPU counts, and the scheduler should map each phase to the matching pool. Draft metadata must list reachable targets so the connection builder (and later the scheduler) can respect the pool isolation constraints automatically.
 
+### 7. Validation Experiments *(NEW)*
+
+We track exploratory experiment setups here so future contributors can reproduce baseline behaviours quickly.
+
+#### 7.1 Single Target (sanity)
+
+- **Topology:** one target server (H100, LLaMA‑70B) with isolated prefill/decode pools.
+- **Drafts:** homogeneous LLaMA‑7B drafts (A10-class). Load driven by draft-count sweep (5→80).
+- **Expectations:** All routing policies overlap exactly. JSQ/RR/random yield identical throughput and TTFT/TPOT once router RNG uses a private stream. Saturation is visible around ~24 conv/s with TTFT spiking beyond 400 ms at high draft counts.
+- **Artifacts:** `draft_sweep_single_target_isolated.json` and `draft_single_isolated_{throughput,ttft,tpot}.png`.
+
+#### 7.2 Heterogeneous Single Cluster
+
+- **Topology:** three targets (H100+LLaMA‑70B, A100+Qwen‑72B, A40+LLaMA‑33B) with distinct weights/batch knobs. Prefill/decode pools isolated per target.
+- **Drafts:** four cohorts (4090, A10, L4, CPU) scaled proportionally via the draft-count sweep.
+- **Observations:** JSQ shares work across the mixed-speed targets and maintains ~125 conv/s plateau with lower TTFT/TPOT tails. Round-robin and random stall around ~70 conv/s because they continue to hammer the slower servers. The separation becomes pronounced beyond ~25 drafts.
+- **Artifacts:** `draft_sweep_hetero.json` with plots `draft_sweep_hetero_{throughput,ttft,tpot}.png`.
+
+#### 7.3 Multi-Cluster, Heterogeneous
+
+- **Topology:** three clusters (datacenter, regional, edge), each with three diverse targets (total 9). All drafts can reach every target (open connectivity) but latencies/acceptance vary by cluster.
+- **Drafts:** cluster-specific mixes (e.g., high-end 4090 vs L4 vs CPU) scaled proportionally in the sweep.
+- **Observations:** JSQ dominates—throughput rises to ~300 conv/s while round-robin/random linger near ~155 conv/s. TTFT/TPOT P95 remain sub-second for JSQ at loads that push the blind routers into multi-second tails. The experiment underscores the value of queue-aware routing in highly heterogeneous fleets.
+- **Artifacts:** `draft_sweep_multicluster.json` and `draft_sweep_multicluster_{throughput,ttft,tpot}.png`.
+
 #### Conversation-Level Metrics & Load Sweeps
 
 - `Metrics.summary()` now aggregates per-request timelines (grouped by `request_id`) in addition to per-job latencies, emitting conversation-level averages and tail percentiles plus completion counts and rates. Each draft attaches a stable `conversation_id` to all generated chunks and records start/end timestamps when a conversation completes.
