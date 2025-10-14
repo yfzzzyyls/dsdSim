@@ -18,7 +18,7 @@ We are building a trace-driven, heterogeneity-aware simulator for **distributed 
 - Plan GPU pool sizes, microbatch sizes, and speculation parameters to maximize **SLO goodput** (requests that meet TTFT/TPOT/TVT per GPU-second).
 - Produce accurate performance estimates using **lookup tables (LUTs)** populated from VIDUR/microbenchmarks.
 - Offer pluggable scheduling, speculation, and admission policies to evaluate new algorithms quickly.
-- Treat **acceptance behavior** as a conditional random variable over method, context, draft depth, and temperature so controllers can adapt dynamically, while keeping energy/cost and fairness as first-class signals.
+- Treat **acceptance behavior** as precomputed probability curves per method, context, draft depth, and temperature derived from offline calibration of drafter/verifier pairs, so controllers can reason about speculative effectiveness while still tracking energy/cost and fairness.
 - Track **tail behavior (P95/P99)** and queueing effects explicitly so iteration-level decisions show up in latency distributions, not just means.
 - Emulate realistic **network behavior** including RTT, bandwidth sharing, jitter, serialization overheads, loss, and link failures so distributed paths are faithfully modelled.
 - Guarantee **reproducibility** via explicit configuration/version pinning (LUT, policy, scenario), deterministic seeds, and compact internal-state logging/regression checks.
@@ -94,7 +94,7 @@ This document lays out the core components and specifies the auxiliary design fi
 | Event Engine        | Drive discrete events: arrivals, prefill completion, draft iteration completion, verification completion, network transfers, timeouts. |
 | Scheduler           | Token-level scheduling for draft and verify phases (EDF/least slack), adaptive fanout `k`, target vs fused mode choice, admission control. |
 | Planner             | DistServe-style goodput maximization: search pool sizes, microbatch sizes, draft-model choices, and speculation parameters. |
-| Acceptance Estimator| Maintain acceptance curves, update online with trace feedback, and provide per-request predictions to schedulers and planners. |
+| Acceptance Estimator| Load acceptance curves captured from offline drafter/verifier evaluations, expose per-request predictions, and optionally blend heuristic adjustments when calibration metadata is provided. |
 | Mode Selector       | Decide between distributed, fused, or hybrid execution per request/class using network/queue telemetry and acceptance forecasts. |
 | Queueing Model      | Maintain per-phase queues with LUT-derived service distributions; expose backpressure (wait, utilization) to policies and planner. |
 | Cold-Start Manager  | Track checkpoint warm/cold state, locality, and load costs for targets; inform mode selection and TTFT estimates. |
@@ -273,11 +273,11 @@ We track exploratory experiment setups here so future contributors can reproduce
      - Prefill (draft or target) batches use **size/timeout** rule constrained by TTFT SLO.
      - Draft decode iterations use adaptive fanout `k` + selective batching.
        - Acceptance forecasts and verify queue depths jointly tune `k`, draft depth, and drafter model choice each iteration.
-       - Maintain portfolios of draft models (tiny/mid/large) and escalate mid-stream when acceptance drops or prompt difficulty rises.
+       - Maintain portfolios of draft models (tiny/mid/large) and escalate mid-stream when predicted acceptance drops or prompt difficulty rises.
      - Verify iterations group requests by context length where possible; otherwise fallback to per-request attention.
        - Use shape-aware micro-cohorting and prefix-similarity hints to reuse KV/cache state when prompts overlap.
        - Support partial/early-exit verification policies (e.g., first-token or sampled verification) with rollback paths when mis-speculation occurs.
-     - After each iteration, materialize acceptance outcomes, update estimators, and feed signals into adaptive `k` and drafter selection controllers.
+   - After each iteration, sample acceptance outcomes from the offline calibration curves (or use expectations when configured), update estimators, and feed signals into adaptive `k` and drafter selection controllers.
    - Query LUT manager to obtain per-iteration latency, memory, energy for specified hardware, parallelism, context length, microbatch, fanout.
    - Tail-aware timing: sample service duration from LUT-provided distributions (e.g., mean + P95 or parametric fit) so iteration-level choices impact latency tails.
    - Priority/preemption hook: allow verify scheduler to preempt or reorder (EDF/least-slack-first) when SLO risk is high; log preemptions for fairness/tail diagnostics.
@@ -285,10 +285,10 @@ We track exploratory experiment setups here so future contributors can reproduce
    - Update KV manager for allocations and releases after each iteration.
      - Enforce KV-first admission control, eviction, and spill-to-fused rules when memory headroom shrinks.
    - Record per-request metrics (TTFT, TPOT, TVT, energy, KV footprint).
-   - Append structured traces (queues, acceptance samples, mode decisions) to reproducibility logs for regression comparison.
+   - Append structured traces (queues, acceptance samples drawn from calibration curves, mode decisions) to reproducibility logs for regression comparison.
 
 3. **Planner loop** (periodic)
-   - Sample recent queue/backpressure statistics (wait time, utilization), acceptance rate, and SLO attainment.
+   - Sample recent queue/backpressure statistics (wait time, utilization), acceptance estimates, and SLO attainment.
    - Enumerate candidate pool splits `(num_draft_replicas, num_verify_replicas)` and parallelism configs.
    - Estimate multi-objective outcomes (goodput, tail latency, fairness, energy/$) via short "what-if" windows or analytic approximations.
    - Produce Pareto candidates and respect explicit SLO/constraint guards before committing.
@@ -310,11 +310,11 @@ We track exploratory experiment setups here so future contributors can reproduce
 
 #### Planner Tick Behavior (Dynamic Configuration Adaptation)
 
-- `Planner Tick` events fire on a fixed cadence or when triggers (queue backlog, utilization swings, acceptance degradation) are detected.
+- `Planner Tick` events fire on a fixed cadence or when triggers (queue backlog, utilization swings, predicted acceptance degradation) are detected.
 - Each tick, the `Scheduler & Planner` gathers fresh telemetry from cooperating modules:
   - `Queueing Model` — queue depths, wait times, drop/deferral statistics.
   - `Device Registry` & parallelism controls — replica utilization, KV/memory headroom.
-  - `Acceptance Estimator` — realized acceptance ratios across drafter tiers and `k` settings.
+  - `Acceptance Estimator` — predicted acceptance ratios across drafter tiers and `k` settings, derived from the offline calibration tables (or sampled realizations when stochastic sampling is enabled).
   - `Network Model` — observed link latency/bandwidth if distributed execution is active.
 - Candidate configurations span pool sizing (draft vs verify vs fused), tensor/pipeline parallelism, batch/microbatch limits, and speculation knobs (fanout `k`, drafter tier, verification policy).
 - For each candidate, the `Planner` combines recent measurements with LUT projections to forecast TTFT, TPOT, throughput, goodput, tail latency, and resource costs, discarding options that violate scenario constraints.
@@ -376,10 +376,7 @@ speculation:
   fused_models:
     - {name: llama34b_fused, lut: lut/llama34b_a100x4_fused.csv}
   acceptance_models:
-    - {name: base, file: acceptance/base.yaml, temperature: 0.7}
-  acceptance_feedback:
-    warmup_requests: 200
-    smoothing: ema_0_2
+    - {name: llama7b_vs_70b_v1, file: acceptance/llama7b_vs_70b_v1.yaml, source: offline_eval_202501, temperature: 0.7}
   adaptive_k:
     enabled: true
     k_min: 1
@@ -451,8 +448,8 @@ metrics:
 - Top-level keys: `scenario_id`, `metadata`, `workload`, `network`, `hardware_profiles`, `speculation`, `scheduler`, `planner`, `metrics`, `reproducibility`.
 - Every `profile:` path must point to a device profile file (see Section 5.2).
 - LUT file references must match the schema defined in Section 5.3.
-- Acceptance models describe acceptance-rate curves per `(context_len, method, temperature)` and feed the adaptive `k` / drafter portfolio logic.
-- `speculation` may optionally configure `acceptance_feedback`, `partial_verification`, and `mode_switch` behavior.
+- Acceptance models describe acceptance-rate curves per `(context_len, method, temperature)`—produced from offline calibration runs of the configured drafter/verifier pair—and feed the adaptive `k` / drafter portfolio logic.
+- `speculation` may optionally configure acceptance model sources (offline calibration bundles), `partial_verification`, and `mode_switch` behavior.
 - `scheduler` can enable `drafter_selection`, `selective_verification`, and `kv_admission` policies.
 - `planner.constraints` sets explicit tails/fairness bounds; `metrics.track_pareto_frontier` toggles frontier reporting.
 - `workload.load_model` controls arrival process/burstiness; `network.serialization_overhead_us` and `network.loss_pct` capture RPC effects.
@@ -557,6 +554,8 @@ Outlined in `lut_population/PLAN.md`:
 
 ### 5.4 Acceptance Model Schema
 
+Because trace-driven experiments do not emit real tokens, acceptance rates must be sourced from offline calibration runs that exercise the exact drafter/verifier pair. Collect a representative prompt sample, run speculative decoding end-to-end, and record the fraction of draft tokens accepted at each depth `k` and context bucket. Aggregate the results into acceptance tables that the simulator can load during trace replay.
+
 Acceptance curves live in `acceptance/*.yaml` and map `(method, context_len, temperature)` to acceptance probabilities.
 
 ```yaml
@@ -577,14 +576,38 @@ source: "SpecBench24"
 notes: "Acceptance curves derived from offline evaluation on dataset X."
 ```
 
-Each acceptance entry may provide `mean` and optional tail statistics (e.g., `p95`) so controllers can reason about rejection risk and adapt `k` accordingly, and may condition on prompt attributes such as `temperature`, `top_p`, or domain labels when available. Histograms or Gaussian-fit parameters can be supplied when richer modelling is required.
+Recommended calibration workflow:
+
+1. Select a prompt dataset that matches the intended deployment domain.
+2. Run the drafter/verifier pair in speculative mode offline, logging accepted vs rejected tokens per iteration depth.
+3. Bucket the observations by context length (and any additional conditioning variables), then compute statistics such as `mean` and optional `p95`.
+4. Export the aggregated results into the YAML structure above and record provenance fields like `source` and `notes`.
+
+#### Profiling Outputs & Granularity
+
+To mirror VIDUR’s phase-level profiling, acceptance calibration should emit measurements at three complementary granularities:
+
+- **Per-token** — capture each token’s acceptance outcome and aggregate by `(context_bucket, fanout_k, temperature, drafter_id, verifier_id, prompt_class)`. Store `mean_accept`, `std_accept`, and sample counts so the simulator can compute expectations or sample Bernoulli draws.
+- **Per-iteration / chunk** — when the drafter emits multi-token chunks, track distributions over “tokens accepted in the chunk” (`histogram`, `mean`, `p95`). Key off `(chunk_size, context_bucket, fanout_k, ...)` to model rollback penalties and selective verification.
+- **Per-conversation** — summarize whole-request behavior (probability conversation completes after `n` iterations, cumulative accepted tokens, rollback counts). These statistics help validate independence assumptions and support higher-level planners.
+
+“Bins” refer to the buckets used when aggregating raw outcomes—e.g., context length ranges (`0-256`, `257-1024`), temperature bands, prompt difficulty classes, or device tiers. Binning early lets us discard heavy per-token logs while keeping representative means, variances, and histograms for each bucket.
+
+#### Aggregation & Interpreter Pipeline
+
+1. **Profiler emission** — instrumentation writes structured JSON/Parquet rows per token and per iteration (containing prompt metadata, k-depth, acceptance flag, chunk size, latency context).
+2. **Aggregator** — an offline job groups rows into bins, computes summary statistics (`mean`, `variance`, histograms, sample counts), and emits compact tables (CSV/Parquet) plus YAML manifests referencing them.
+3. **Interpreter** — the simulator loads the aggregated tables, interpolates between bins when needed (e.g., linear in context length), and exposes APIs to return either deterministic expectations or sampled acceptance outcomes. Configuration toggles choose between expectation mode and Monte Carlo sampling based on histogram data.
+4. **Validation hook** — a held-out prompt set is replayed to compare interpreter predictions against real acceptance traces; deviations beyond tolerance trigger a re-profile similar to VIDUR’s regression checks.
+
+Each acceptance entry may provide `mean` and optional tail statistics (e.g., `p95`) so controllers can quantify rejection risk and adapt `k` accordingly, and may condition on prompt attributes such as `temperature`, `top_p`, or domain labels when available.
 
 ### 5.5 Policy Configuration Schema
 
 Scenario `speculation`, `scheduler`, and `planner` sections bind to the following configuration structures:
 
-- **Drafter selection** — `strategy` (`acceptance_portfolio`, `fixed`, `bandit`), optional `escalation_slack_ms`, and per-tier priorities. Policies consume device priors plus live acceptance estimates.
-- **Adaptive `k` & depth** — `controller` type with gain parameters (PID/bandit/backpressure) and smoothing factors defined in `acceptance_feedback`.
+- **Drafter selection** — `strategy` (`acceptance_portfolio`, `fixed`, `bandit`), optional `escalation_slack_ms`, and per-tier priorities. Policies consume device priors plus acceptance predictions from the calibration tables.
+- **Adaptive `k` & depth** — `controller` type with gain parameters (PID/bandit/backpressure) that consume acceptance predictions from the loaded calibration tables.
 - **Partial verification** — `mode` (`all`, `sampled`, `first_token`), `sample_rate`, and `rollback_penalty_ms` to capture mis-speculation recovery cost.
 - **KV admission** — `max_kv_utilization_pct`, `spill_mode` (`fused`, `queue`), and eviction ordering (`least_slack_first`, `oldest_context`).
 - **Continuous decode** — set `scheduler.decode.mode: continuous` with `chunk_tokens` (default 1) to stream one chunk per sequence per iteration; the scheduler re-enqueues subsequent chunks after completion so new sequences can join each batch.
@@ -726,7 +749,7 @@ For each draft→target edge selected by fanout rules, the simulator first consu
   - Soft preemption between iterations (`scheduler.decode.preemption.enabled`, `slack_threshold_ms`) plus age/EDF weighting (`scheduler.decode.age_weight`) to keep tails in check.
 
 - **Router ↔ Scheduler Feedback**
-  - Router performs global target selection; per-GPU scheduler applies the above knobs. Optional feedback (`scheduler.router_feedback`) exports queue depth/slack/acceptance for router load balancing.
+- Router performs global target selection; per-GPU scheduler applies the above knobs. Optional feedback (`scheduler.router_feedback`) exports queue depth/slack/acceptance estimates for router load balancing.
 
 - **Objective Controls**
   - `scheduler.objective` chooses throughput-centric, latency-centric, or balanced goals; telemetry logs TTFT/TPOT/throughput so experiments (e.g., co-located vs disaggregated, chunk sizes, paging toggles) can be compared.
@@ -741,14 +764,14 @@ These knobs mirror the mechanisms used in ORCA, Sarathi-Serve, DistServe, Triton
 - Adaptive speculation: controllers combine verify queue depth, KV headroom, and acceptance predictions to adjust fanout `k` and draft depth every tick.
   - Load-aware controller: shrink `k` or depth when verify queue wait or KV utilization crosses thresholds; expand when lightly loaded and acceptance confidence is high.
   - Network-aware guard: when outbound link utilization or RTT spikes, bias toward fused mode or lower `k` to avoid saturating slow paths.
-- Drafter portfolio: maintain multiple draft models (tiny/mid/large) and choose per request using prompt features, live acceptance, and escalation slack.
-- Mid-decode escalation: optionally switch a request to a larger drafter at iteration boundaries when observed acceptance falls below targets.
+- Drafter portfolio: maintain multiple draft models (tiny/mid/large) and choose per request using prompt features, acceptance predictions, and escalation slack.
+- Mid-decode escalation: optionally switch a request to a larger drafter at iteration boundaries when sampled/predicted acceptance falls below targets.
 - Prefix reuse: optionally reuse draft KV for requests sharing prompt prefixes; scheduler emits reuse hints to KV manager.
 
 ### 6.2 Verify Scheduler
 
 - Policy: **KV-aware EDF (earliest deadline first)** with selective batching.
-- Microbatching: attempt `max_microbatch`; fallback to per-request when context lengths diverge or acceptance indicates high error risk.
+- Microbatching: attempt `max_microbatch`; fallback to per-request when context lengths diverge or predicted acceptance indicates high error risk.
 - Partial verification: support `all`, `sampled`, or `first_token` verification; when sampling, add rollback work upon rejection.
 - Shape/content cohorting: cluster requests by context length buckets and optional prefix hashes to maximize shared attention computation.
 - Cost modelling: use LUT `cost_nonatt_ms` for batched feed-forward/MLP/norm work and apply `cost_attn_ms` per request unless context bins align (then reuse batched-attention entries).
@@ -757,7 +780,7 @@ These knobs mirror the mechanisms used in ORCA, Sarathi-Serve, DistServe, Triton
 
 ### 6.3 Planner (Goodput Maximizer)
 
-- Inputs: recent measurements (goodput, queue lengths, acceptance, KV utilization, link utilization/RTT, energy), candidate pool sizes, parallelism, `k`, microbatch, mode mix.
+- Inputs: recent measurements (goodput, queue lengths, acceptance estimates, KV utilization, link utilization/RTT, energy), candidate pool sizes, parallelism, `k`, microbatch, mode mix.
 - Objective: maximize `goodput = (TTFT_OK & TPOT_OK & TVT_OK requests) / (num_GPUs × time)` while respecting constraint bounds (tail latency, fairness gap, energy budget) and optionally minimizing cost.
 - Algorithm: iterative search (grid, hill-climb, or bandit). Build Pareto frontier subject to compute **and** network bandwidth constraints, then pick the best feasible configuration.
 
@@ -808,7 +831,7 @@ Metrics collected per scenario:
 - **Queueing**: per-phase wait-time distributions, utilization, and defer/dropped counts due to KV or SLO guards.
 - **Fairness**: SLO attainment per device class / workload class; Jain’s fairness index; configurable attainment gaps.
 - **Resource & Cost**: GPU utilization, KV occupancy, energy/token, joules/request, cost/1k tokens, network bandwidth usage.
-- **Acceptance & Speculation**: acceptance rate vs context length, adaptive `k` timeline, drafter switching events, partial verification savings vs rollback penalties.
+- **Acceptance & Speculation**: acceptance-rate estimates vs context length, adaptive `k` timeline, drafter switching events, partial verification savings vs rollback penalties.
 - **Tail Plots**: P95/P99 TTFT/TPOT/TVT per fairness class, correlated with queue depth and mode decisions.
 - **Pareto Frontiers**: trade-off curves across goodput, tail latency, energy/cost, and fairness.
 - **Network Diagnostics**: link utilization, serialization overhead, retry counts, and time spent in network queues.
@@ -847,7 +870,7 @@ This DESIGN document is the authoritative specification for the simulator implem
 ## Appendix A — Additional Features & Refinements
 
 1. **Priority / Preemption** — Enable preemptive verify scheduling (EDF / least-slack-first) to shield SLOs during bursts; log preemptions for fairness and tail analysis (DistServe-style SLO focus).
-2. **Dynamic / Online Adaptation** — Allow policies to update controller parameters online from telemetry (acceptance, queues) without re-profiling; expose a “live policy state” hook in the scheduler to support adaptive `k` (speculative decoding surveys).
+2. **Dynamic / Online Adaptation** — Allow policies to update controller parameters online from telemetry (acceptance estimates, queues) without re-profiling; expose a “live policy state” hook in the scheduler to support adaptive `k` (speculative decoding surveys).
 3. **Multi-level Speculation** — Optionally chain multiple drafters (tiny → mid → heavy) before verification to explore hierarchical SD strategies.
 4. **Arrival & Burst Modeling** — Support configurable arrival processes (Poisson, replay) and burst factors; surface per-phase queue growth to study instability thresholds (DistServe workload sensitivity).
 5. **Shape Divergence Modeling** — Track context-length divergence inside cohorts to decide when attention can be batched or must remain per-request (ORCA selective batching).

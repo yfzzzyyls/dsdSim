@@ -1,0 +1,611 @@
+#!/usr/bin/env python3
+# Copyright 2025
+# SPDX-License-Identifier: Apache-2.0
+"""
+Offline speculative decoding profiler that measures acceptance behaviour for
+arbitrary drafter / verifier model pairs using Hugging Face Transformers.
+
+The script runs a manual speculative loop:
+  1. Drafter proposes up to `k` tokens per iteration.
+  2. Verifier greedily validates the proposal token-by-token.
+  3. Tokens accepted by the verifier are committed; the first mismatch token is
+     replaced by the verifier's output and the remaining draft tokens are
+     discarded.
+
+Per-iteration outcomes are aggregated into acceptance statistics that can be
+used to populate the simulator's acceptance-rate lookup tables.
+"""
+
+import argparse
+import json
+import os
+import random
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+
+# Avoid importing TensorFlow / Flax when pulling Transformers.
+os.environ.setdefault("TRANSFORMERS_NO_TF", "1")
+os.environ.setdefault("TRANSFORMERS_NO_FLAX", "1")
+
+import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer, set_seed
+
+DEFAULT_PROMPTS: List[str] = [
+    "Summarize the core idea behind speculative decoding in large language models.",
+    "Provide three bullet points comparing Llama-2-7B and Llama-2-70B.",
+    "Explain why acceptance-rate calibration matters when replaying traces without tokens.",
+]
+
+
+@dataclass
+class IterationLog:
+    context_length_before: int
+    draft_token_ids: List[int]
+    accepted_flags: List[bool]
+    accepted_count: int
+    mismatch_token_id: Optional[int]
+    context_length_after: int
+
+
+@dataclass
+class PromptLog:
+    prompt_index: int
+    prompt: str
+    generated_text: str
+    total_generated_tokens: int
+    iterations: List[IterationLog]
+    reached_eos: bool
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Profile speculative decoding acceptance rates "
+        "between a drafter and verifier model pair.",
+    )
+    parser.add_argument(
+        "--drafter-model",
+        required=True,
+        help="Name or path of the drafter (speculative) model.",
+    )
+    parser.add_argument(
+        "--verifier-model",
+        required=True,
+        help="Name or path of the verifier (target) model.",
+    )
+    parser.add_argument(
+        "--device-map",
+        default="auto",
+        help="Device map passed to both models (default: auto).",
+    )
+    parser.add_argument(
+        "--drafter-device-map",
+        help="Optional device map override for the drafter model.",
+    )
+    parser.add_argument(
+        "--verifier-device-map",
+        help="Optional device map override for the verifier model.",
+    )
+    parser.add_argument(
+        "--drafter-dtype",
+        default="bfloat16",
+        help="Torch dtype for drafter weights (default: bfloat16).",
+    )
+    parser.add_argument(
+        "--verifier-dtype",
+        default="bfloat16",
+        help="Torch dtype for verifier weights (default: bfloat16).",
+    )
+    parser.add_argument(
+        "--drafter-load-in-8bit",
+        action="store_true",
+        help="Load drafter model in 8-bit quantized mode (bitsandbytes).",
+    )
+    parser.add_argument(
+        "--max-tokens",
+        type=int,
+        default=128,
+        help="Maximum generation tokens per prompt (default: 128).",
+    )
+    parser.add_argument(
+        "--spec-tokens",
+        type=int,
+        default=4,
+        help="Number of speculative tokens proposed per iteration (default: 4).",
+    )
+    parser.add_argument(
+        "--temperature",
+        type=float,
+        default=0.0,
+        help="Drafter sampling temperature (0 for greedy).",
+    )
+    parser.add_argument(
+        "--top-p",
+        type=float,
+        default=1.0,
+        help="Drafter nucleus sampling top-p value (default: 1.0).",
+    )
+    parser.add_argument(
+        "--repetition-penalty",
+        type=float,
+        default=1.0,
+        help="Repetition penalty for drafter sampling (default: 1.0).",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=1337,
+        help="Random seed for reproducibility (default: 1337).",
+    )
+    parser.add_argument(
+        "--prompts-file",
+        type=Path,
+        help="Optional JSONL file containing prompts with a 'prompt' field.",
+    )
+    parser.add_argument(
+        "--metrics-jsonl",
+        type=Path,
+        help="Append aggregated metrics as JSONL records to this file.",
+    )
+    parser.add_argument(
+        "--details-jsonl",
+        type=Path,
+        help="Optional JSONL file capturing per-prompt iteration logs.",
+    )
+    parser.add_argument(
+        "--print-output",
+        action="store_true",
+        help="Print generated text for each prompt.",
+    )
+    parser.add_argument(
+        "--stop-on-pad",
+        action="store_true",
+        help="Stop iterations when drafter emits pad tokens.",
+    )
+    parser.add_argument(
+        "--max-prompts",
+        type=int,
+        help="Limit the number of prompts processed.",
+    )
+    return parser.parse_args()
+
+
+def resolve_dtype(name: str) -> torch.dtype:
+    lookup = {
+        "float32": torch.float32,
+        "float": torch.float32,
+        "fp32": torch.float32,
+        "float16": torch.float16,
+        "half": torch.float16,
+        "fp16": torch.float16,
+        "bfloat16": torch.bfloat16,
+        "bf16": torch.bfloat16,
+    }
+    key = name.lower()
+    if key not in lookup:
+        raise ValueError(f"Unsupported dtype '{name}'. Choose from {list(lookup)}.")
+    return lookup[key]
+
+
+def load_model(
+    model_name: str,
+    *,
+    dtype: torch.dtype,
+    device_map: str,
+    load_in_8bit: bool = False,
+) -> AutoModelForCausalLM:
+    kwargs: Dict[str, object] = {
+        "device_map": device_map,
+    }
+    if load_in_8bit:
+        kwargs["load_in_8bit"] = True
+    else:
+        kwargs["dtype"] = dtype
+    model = AutoModelForCausalLM.from_pretrained(
+        model_name,
+        use_cache=True,
+        trust_remote_code=False,
+        **kwargs,
+    )
+    model.eval()
+    return model
+
+
+def load_tokenizer(model_name: str) -> AutoTokenizer:
+    tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    return tokenizer
+
+
+def load_prompts(prompts_file: Optional[Path]) -> List[str]:
+    if prompts_file is None:
+        return DEFAULT_PROMPTS
+    prompts: List[str] = []
+    with prompts_file.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            line = line.strip()
+            if not line:
+                continue
+            payload = json.loads(line)
+            if "prompt" not in payload:
+                raise ValueError(f"Prompt record missing 'prompt': {payload}")
+            prompts.append(payload["prompt"])
+    if not prompts:
+        raise ValueError(f"No prompts found in {prompts_file}")
+    return prompts
+
+
+def truncate_at_eos(tokens: Sequence[int], eos_token: int) -> List[int]:
+    if eos_token in tokens:
+        idx = list(tokens).index(eos_token)
+        return list(tokens[: idx + 1])
+    return list(tokens)
+
+
+def infer_primary_device(model: AutoModelForCausalLM) -> torch.device:
+    if hasattr(model, "device"):
+        device = getattr(model, "device")
+        if isinstance(device, torch.device):
+            return device
+    for param in model.parameters():
+        if param.device.type != "meta":
+            return param.device
+    return torch.device("cpu")
+
+
+def speculative_loop(
+    prompt: str,
+    drafter_model: AutoModelForCausalLM,
+    verifier_model: AutoModelForCausalLM,
+    tokenizer: AutoTokenizer,
+    *,
+    spec_tokens: int,
+    max_tokens: int,
+    temperature: float,
+    top_p: float,
+    repetition_penalty: float,
+    stop_on_pad: bool,
+) -> Tuple[PromptLog, dict]:
+    encoded = tokenizer(prompt, return_tensors="pt", add_special_tokens=True)
+    context_ids = encoded["input_ids"]
+    prompt_len = context_ids.shape[1]
+    total_generated = 0
+    reached_eos = False
+    iterations: List[IterationLog] = []
+
+    num_drafts = 0
+    num_draft_tokens = 0
+    num_accepted_tokens = 0
+    position_attempts = [0] * spec_tokens
+    position_accepts = [0] * spec_tokens
+
+    pad_token = tokenizer.pad_token_id
+    eos_token = tokenizer.eos_token_id
+    drafter_device = infer_primary_device(drafter_model)
+    verifier_device = infer_primary_device(verifier_model)
+
+    while total_generated < max_tokens and not reached_eos:
+        remaining = max_tokens - total_generated
+        spec_len = min(spec_tokens, remaining)
+        if spec_len <= 0:
+            break
+        context_len_before = context_ids.shape[1]
+
+        drafter_input = context_ids.to(drafter_device)
+        draft_attention = torch.ones_like(drafter_input, device=drafter_device)
+        draft_generation_kwargs = {
+            "max_new_tokens": spec_len,
+            "do_sample": temperature > 0,
+            "pad_token_id": pad_token,
+            "eos_token_id": eos_token,
+            "use_cache": True,
+            "return_dict_in_generate": True,
+        }
+        if temperature > 0:
+            draft_generation_kwargs["temperature"] = temperature
+            draft_generation_kwargs["top_p"] = top_p
+            if repetition_penalty != 1.0:
+                draft_generation_kwargs["repetition_penalty"] = repetition_penalty
+        elif repetition_penalty != 1.0:
+            draft_generation_kwargs["repetition_penalty"] = repetition_penalty
+
+        draft_output = drafter_model.generate(
+            input_ids=drafter_input,
+            attention_mask=draft_attention,
+            **draft_generation_kwargs,
+        )
+        full_sequence = draft_output.sequences[0].detach().to("cpu")
+        draft_candidates = full_sequence[context_ids.shape[1] :]
+        if draft_candidates.numel() == 0:
+            # Drafter refused to produce more tokens; fall back to verifier.
+            draft_candidates = torch.tensor([eos_token], dtype=torch.long)
+
+        draft_tokens = truncate_at_eos(draft_candidates.tolist(), eos_token)
+        if stop_on_pad:
+            draft_tokens = [tok for tok in draft_tokens if tok != pad_token]
+        if not draft_tokens:
+            # Nothing to verify; bail out by letting verifier generate one token.
+            verifier_output = verifier_model.generate(
+                input_ids=context_ids.to(verifier_device),
+                attention_mask=torch.ones_like(context_ids, device=verifier_device),
+                max_new_tokens=1,
+                do_sample=False,
+                pad_token_id=pad_token,
+                eos_token_id=eos_token,
+                return_dict_in_generate=True,
+            )
+            context_ids = verifier_output.sequences.detach().to("cpu")
+            new_token = context_ids[0, -1].item()
+            total_generated += 1
+            if new_token == eos_token:
+                reached_eos = True
+            continue
+
+        accepted_flags: List[bool] = []
+        mismatch_token: Optional[int] = None
+        verifier_context = context_ids
+
+        for position, draft_token in enumerate(draft_tokens):
+            if position >= spec_tokens:
+                break
+            position_attempts[position] += 1
+
+            verifier_input = verifier_context.to(verifier_device)
+            verifier_output = verifier_model.generate(
+                input_ids=verifier_input,
+                attention_mask=torch.ones_like(verifier_input, device=verifier_device),
+                max_new_tokens=1,
+                do_sample=False,
+                pad_token_id=pad_token,
+                eos_token_id=eos_token,
+                return_dict_in_generate=True,
+            )
+            verifier_context = verifier_output.sequences.detach().to("cpu")
+            predicted_token = verifier_context[0, -1].item()
+            total_generated += 1
+
+            is_accepted = predicted_token == draft_token
+            accepted_flags.append(is_accepted)
+            if is_accepted:
+                position_accepts[position] += 1
+            else:
+                mismatch_token = predicted_token
+                if predicted_token == eos_token:
+                    reached_eos = True
+                break
+
+            if predicted_token == eos_token:
+                reached_eos = True
+                break
+
+            if total_generated >= max_tokens:
+                break
+
+        context_ids = verifier_context
+        num_drafts += 1
+        num_draft_tokens += len(draft_tokens)
+        num_accepted_tokens += sum(accepted_flags)
+
+        iterations.append(
+            IterationLog(
+                context_length_before=context_len_before,
+                draft_token_ids=draft_tokens,
+                accepted_flags=accepted_flags,
+                accepted_count=sum(accepted_flags),
+                mismatch_token_id=mismatch_token,
+                context_length_after=context_ids.shape[1],
+            )
+        )
+
+        if reached_eos:
+            break
+        if total_generated >= max_tokens:
+            break
+
+    generated_text = tokenizer.decode(
+        context_ids[0, prompt_len:], skip_special_tokens=True
+    )
+
+    prompt_log = PromptLog(
+        prompt_index=-1,
+        prompt=prompt,
+        generated_text=generated_text,
+        total_generated_tokens=total_generated,
+        iterations=iterations,
+        reached_eos=reached_eos,
+    )
+
+    summary = {
+        "num_drafts": num_drafts,
+        "num_draft_tokens": num_draft_tokens,
+        "num_accepted_tokens": num_accepted_tokens,
+        "position_attempts": position_attempts,
+        "position_accepts": position_accepts,
+        "total_generated": total_generated,
+    }
+    return prompt_log, summary
+
+
+def aggregate_metrics(
+    prompt_logs: List[PromptLog],
+    per_prompt_summaries: List[dict],
+    max_positions: int,
+) -> dict:
+    total_drafts = sum(summary.get("num_drafts", 0) for summary in per_prompt_summaries)
+    total_draft_tokens = sum(summary.get("num_draft_tokens", 0) for summary in per_prompt_summaries)
+    total_accepted_tokens = sum(summary.get("num_accepted_tokens", 0) for summary in per_prompt_summaries)
+    total_tokens = sum(summary.get("total_generated", 0) for summary in per_prompt_summaries)
+
+    position_attempts = [0] * max_positions
+    position_accepts = [0] * max_positions
+    for summary in per_prompt_summaries:
+        for idx in range(max_positions):
+            position_attempts[idx] += summary.get("position_attempts", [0] * max_positions)[idx]
+            position_accepts[idx] += summary.get("position_accepts", [0] * max_positions)[idx]
+
+    acceptance_per_position = []
+    for attempts, accepts in zip(position_attempts, position_accepts):
+        if attempts == 0:
+            acceptance_per_position.append(0.0)
+        else:
+            acceptance_per_position.append(accepts / attempts)
+
+    mean_acceptance_length = (
+        1.0 + (total_accepted_tokens / total_drafts) if total_drafts > 0 else 1.0
+    )
+
+    return {
+        "num_prompts": len(prompt_logs),
+        "num_drafts": total_drafts,
+        "num_draft_tokens": total_draft_tokens,
+        "num_accepted_tokens": total_accepted_tokens,
+        "total_output_tokens": total_tokens,
+        "mean_acceptance_length": mean_acceptance_length,
+        "acceptance_per_position": acceptance_per_position,
+        "position_attempts": position_attempts,
+        "position_accepts": position_accepts,
+    }
+
+
+def append_jsonl(path: Path, record: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as handle:
+        json.dump(record, handle)
+        handle.write("\n")
+
+
+def main() -> None:
+    args = parse_args()
+    if args.spec_tokens <= 0:
+        raise ValueError("--spec-tokens must be a positive integer.")
+    if args.max_tokens <= 0:
+        raise ValueError("--max-tokens must be a positive integer.")
+    if args.temperature < 0:
+        raise ValueError("--temperature cannot be negative.")
+    if not (0 < args.top_p <= 1.0):
+        raise ValueError("--top-p must be in the interval (0, 1].")
+    if args.repetition_penalty <= 0:
+        raise ValueError("--repetition-penalty must be > 0.")
+
+    set_seed(args.seed)
+    random.seed(args.seed)
+
+    prompts = load_prompts(args.prompts_file)
+    if args.max_prompts is not None:
+        prompts = prompts[: args.max_prompts]
+
+    drafter_tokenizer = load_tokenizer(args.drafter_model)
+    verifier_tokenizer = load_tokenizer(args.verifier_model)
+    if drafter_tokenizer.get_vocab() != verifier_tokenizer.get_vocab():
+        raise ValueError(
+            "Drafter and verifier tokenizers differ. Please ensure both "
+            "models share the same tokenizer."
+        )
+    tokenizer = drafter_tokenizer
+
+    drafter_model = load_model(
+        args.drafter_model,
+        dtype=resolve_dtype(args.drafter_dtype),
+        device_map=args.drafter_device_map or args.device_map,
+        load_in_8bit=args.drafter_load_in_8bit,
+    )
+    verifier_model = load_model(
+        args.verifier_model,
+        dtype=resolve_dtype(args.verifier_dtype),
+        device_map=args.verifier_device_map or args.device_map,
+        load_in_8bit=False,
+    )
+
+    prompt_logs: List[PromptLog] = []
+    summaries: List[dict] = []
+
+    for idx, prompt in enumerate(prompts):
+        prompt_log, summary = speculative_loop(
+            prompt,
+            drafter_model,
+            verifier_model,
+            tokenizer,
+            spec_tokens=args.spec_tokens,
+            max_tokens=args.max_tokens,
+            temperature=args.temperature,
+            top_p=args.top_p,
+            repetition_penalty=args.repetition_penalty,
+            stop_on_pad=args.stop_on_pad,
+        )
+        prompt_log.prompt_index = idx
+        prompt_logs.append(prompt_log)
+        summaries.append(summary)
+
+        if args.print_output:
+            print("-" * 60)
+            print(f"[Prompt {idx}] {prompt}")
+            print(f"[Generated] {prompt_log.generated_text}")
+            print(f"[Iterations] {len(prompt_log.iterations)} "
+                  f"(accepted tokens: {summary['num_accepted_tokens']}, "
+                  f"draft tokens: {summary['num_draft_tokens']})")
+
+        if args.details_jsonl:
+            record = {
+                "prompt_index": idx,
+                "prompt": prompt,
+                "generated_text": prompt_log.generated_text,
+                "iterations": [
+                    {
+                        "context_length_before": log.context_length_before,
+                        "draft_token_ids": log.draft_token_ids,
+                        "draft_tokens": tokenizer.convert_ids_to_tokens(log.draft_token_ids),
+                        "accepted_flags": log.accepted_flags,
+                        "accepted_count": log.accepted_count,
+                        "mismatch_token_id": log.mismatch_token_id,
+                        "context_length_after": log.context_length_after,
+                    }
+                    for log in prompt_log.iterations
+                ],
+                "reached_eos": prompt_log.reached_eos,
+                "total_generated_tokens": prompt_log.total_generated_tokens,
+            }
+            append_jsonl(args.details_jsonl, record)
+
+    summary = aggregate_metrics(prompt_logs, summaries, args.spec_tokens)
+
+    print("Speculative decoding summary")
+    print(f"  Prompts processed  : {summary['num_prompts']}")
+    print(f"  Draft iterations   : {summary['num_drafts']}")
+    print(f"  Draft tokens       : {summary['num_draft_tokens']}")
+    print(f"  Accepted tokens    : {summary['num_accepted_tokens']}")
+    print(f"  Output tokens      : {summary['total_output_tokens']}")
+    print(
+        f"  Mean acceptance len: {summary['mean_acceptance_length']:.3f} tokens per draft"
+    )
+    for pos, rate in enumerate(summary["acceptance_per_position"]):
+        print(f"    Acceptance@{pos:<2d}: {rate:.3f}")
+
+    if args.metrics_jsonl:
+        metrics_record = {
+            "drafter_model": args.drafter_model,
+            "verifier_model": args.verifier_model,
+            "spec_tokens": args.spec_tokens,
+            "max_tokens": args.max_tokens,
+            "temperature": args.temperature,
+            "top_p": args.top_p,
+            "repetition_penalty": args.repetition_penalty,
+            "seed": args.seed,
+            "num_prompts": summary["num_prompts"],
+            "num_drafts": summary["num_drafts"],
+            "num_draft_tokens": summary["num_draft_tokens"],
+            "num_accepted_tokens": summary["num_accepted_tokens"],
+            "total_output_tokens": summary["total_output_tokens"],
+            "mean_acceptance_length": summary["mean_acceptance_length"],
+            "acceptance_per_position": summary["acceptance_per_position"],
+            "position_attempts": summary["position_attempts"],
+            "position_accepts": summary["position_accepts"],
+        }
+        append_jsonl(args.metrics_jsonl, metrics_record)
+
+
+if __name__ == "__main__":
+    torch.set_grad_enabled(False)
+    if torch.cuda.is_available():
+        torch.backends.cuda.matmul.allow_tf32 = True
+    main()

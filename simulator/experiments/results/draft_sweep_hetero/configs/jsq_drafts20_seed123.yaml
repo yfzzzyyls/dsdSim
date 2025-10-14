@@ -1,0 +1,198 @@
+sim_time_ms: 300000
+seed: 123
+verbose: false
+debug: false
+execution_mode: blocking
+gamma: 20
+prompt_length_min: 64
+prompt_length_max: 256
+prompt_scale_by_capability: false
+answer_length_mean: 48
+answer_length_std: 12
+answer_length_min: 24
+answer_length_max: 80
+use_answer_distribution: true
+mixed_batching: true
+router: jsq
+global_router: disabled
+workload:
+  arrival: poisson
+  rate_rps: 0.0
+think_time:
+  enabled: false
+  distribution: exponential
+  mean_ms: 0.0
+  cv: 1.0
+  min_ms: 0.0
+performance_model:
+  type: vidur
+  vidur:
+    table_path: null
+    bootstrap_defaults: false
+    realtime_enabled: true
+    realtime_cache_dir: data/vidur/cache
+scheduler:
+  type: baseline
+  pools:
+    prefill_pool:
+      clusters:
+      - default
+    decode_pool:
+      clusters:
+      - default
+  prefill:
+    pool: prefill_pool
+    queue_policy: priority
+    max_batch_requests: 1
+    max_wait_ms: 0.4
+    max_queue_depth: 4
+    backpressure_wait_ms: 0.1
+  decode:
+    pool: decode_pool
+    queue_policy: priority
+    max_batch_requests: 1
+    max_wait_ms: 0.45
+    max_queue_depth: 4
+    backpressure_wait_ms: 0.1
+  kv:
+    default_capacity_tokens: 240000
+    max_utilization_pct: 85.0
+auto_topology:
+  clusters:
+  - name: default
+    router: jsq
+    targets:
+      count: 3
+      tiers:
+      - name: atlas_h100_llama70b
+        count: 1
+        model: llama-2-70b
+        gpu: H100
+        weight: 1.0
+        batch_window_ms: 0.45
+        batch_size: 6
+        vidur:
+          model_name: meta-llama/Llama-2-70b-hf
+          device: H100
+          network_device: H100_DGX
+          tensor_parallel: 1
+          pipeline_parallel: 1
+          scheduler: sarathi
+          chunk_size: 512
+      - name: zephyr_a100_qwen72b
+        count: 1
+        model: qwen-72b
+        gpu: A100
+        weight: 0.75
+        batch_window_ms: 0.6
+        batch_size: 4
+        vidur:
+          model_name: Qwen/Qwen-72B
+          device: A100
+          network_device: A100_DGX
+          tensor_parallel: 1
+          pipeline_parallel: 1
+          scheduler: sarathi
+          chunk_size: 512
+      - name: orion_a40_llama33b
+        count: 1
+        model: llama-2-33b
+        gpu: A40
+        weight: 0.4
+        batch_window_ms: 0.9
+        batch_size: 2
+        vidur:
+          model_name: meta-llama/Llama-2-34b-hf
+          device: A40
+          network_device: A40_PAIRWISE_NVLINK
+          tensor_parallel: 1
+          pipeline_parallel: 1
+          scheduler: sarathi
+          chunk_size: 512
+    drafts:
+      count: 20
+      capability_map:
+        ultra: 1.5
+        pro: 1.0
+        edge: 0.6
+        cpu: 0.3
+      draft_bucket_labels:
+      - ultra
+      - pro
+      - edge
+      - cpu
+      reliability:
+        ultra: 0.995
+        pro: 0.99
+        edge: 0.975
+        cpu: 0.95
+      count_by_label:
+        ultra: 3
+        pro: 7
+        edge: 7
+        cpu: 3
+      metadata_by_label:
+        ultra:
+          model: llama-2-13b
+          gpu: RTX4090
+          vidur_profile:
+            model_name: meta-llama/Llama-2-13b-hf
+            device: RTX4090
+            network_device: PCIe
+            tensor_parallel: 1
+            pipeline_parallel: 1
+            scheduler: sarathi
+            chunk_size: 512
+        pro:
+          model: llama-2-7b
+          gpu: A10
+          vidur_profile:
+            model_name: meta-llama/Llama-2-7b-hf
+            device: A10
+            network_device: PCIe
+            tensor_parallel: 1
+            pipeline_parallel: 1
+            scheduler: sarathi
+            chunk_size: 512
+        edge:
+          model: llama-2-3b
+          gpu: L4
+          vidur_profile:
+            model_name: meta-llama/Llama-2-3b-hf
+            device: L4
+            network_device: PCIe
+            tensor_parallel: 1
+            pipeline_parallel: 1
+            scheduler: sarathi
+            chunk_size: 512
+        cpu:
+          model: gptj-6b
+          gpu: CPU
+          vidur_profile:
+            model_name: EleutherAI/gpt-j-6b
+            device: CPU
+            network_device: Ethernet
+            tensor_parallel: 1
+            pipeline_parallel: 1
+            scheduler: sarathi
+            chunk_size: 512
+    connectivity:
+      fanout_per_draft: 3
+      net_ms_ranges:
+        atlas_h100_llama70b:
+        - 1.0
+        - 1.3
+        zephyr_a100_qwen72b:
+        - 1.2
+        - 1.6
+        orion_a40_llama33b:
+        - 1.6
+        - 2.2
+      acceptance_by_tier:
+        baseline:
+          atlas_h100_llama70b: 0.96
+          zephyr_a100_qwen72b: 0.92
+          orion_a40_llama33b: 0.88
+      link_jitter_pct: 0.0
+router_params: {}
+global_router_params: {}
