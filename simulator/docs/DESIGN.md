@@ -554,7 +554,7 @@ Outlined in `lut_population/PLAN.md`:
 
 ### 5.4 Acceptance Model Schema
 
-Because trace-driven experiments do not emit real tokens, acceptance rates must be sourced from offline calibration runs that exercise the exact drafter/verifier pair. Collect a representative prompt sample, run speculative decoding end-to-end, and record the fraction of draft tokens accepted at each depth `k` and context bucket. Aggregate the results into acceptance tables that the simulator can load during trace replay.
+Because trace-driven experiments do not emit real tokens, acceptance rates must be sourced from offline calibration runs that exercise the exact drafter/verifier pair. Collect a representative prompt sample, run speculative decoding end-to-end, and record the fraction of draft tokens accepted at each depth `k` and context bucket. Aggregate the results into acceptance tables that the simulator can load during trace replay or train a regression model that predicts acceptance under new conditions.
 
 Acceptance curves live in `acceptance/*.yaml` and map `(method, context_len, temperature)` to acceptance probabilities.
 
@@ -591,14 +591,105 @@ To mirror VIDUR’s phase-level profiling, acceptance calibration should emit me
 - **Per-iteration / chunk** — when the drafter emits multi-token chunks, track distributions over “tokens accepted in the chunk” (`histogram`, `mean`, `p95`). Key off `(chunk_size, context_bucket, fanout_k, ...)` to model rollback penalties and selective verification.
 - **Per-conversation** — summarize whole-request behavior (probability conversation completes after `n` iterations, cumulative accepted tokens, rollback counts). These statistics help validate independence assumptions and support higher-level planners.
 
-“Bins” refer to the buckets used when aggregating raw outcomes—e.g., context length ranges (`0-256`, `257-1024`), temperature bands, prompt difficulty classes, or device tiers. Binning early lets us discard heavy per-token logs while keeping representative means, variances, and histograms for each bucket.
+“Bins” refer to the buckets used when aggregating raw outcomes—e.g., context length ranges (`0-256`, `257-1024`), temperature bands, prompt difficulty classes, or device tiers. Binning early lets us discard heavy per-token logs while keeping representative means, variances, and histograms for each bucket. When we train a regressor we retain the raw iteration logs so the model can learn continuous relationships (context length, `k`, etc.).
 
 #### Aggregation & Interpreter Pipeline
 
 1. **Profiler emission** — instrumentation writes structured JSON/Parquet rows per token and per iteration (containing prompt metadata, k-depth, acceptance flag, chunk size, latency context).
-2. **Aggregator** — an offline job groups rows into bins, computes summary statistics (`mean`, `variance`, histograms, sample counts), and emits compact tables (CSV/Parquet) plus YAML manifests referencing them.
-3. **Interpreter** — the simulator loads the aggregated tables, interpolates between bins when needed (e.g., linear in context length), and exposes APIs to return either deterministic expectations or sampled acceptance outcomes. Configuration toggles choose between expectation mode and Monte Carlo sampling based on histogram data.
-4. **Validation hook** — a held-out prompt set is replayed to compare interpreter predictions against real acceptance traces; deviations beyond tolerance trigger a re-profile similar to VIDUR’s regression checks.
+2. **Aggregator** — an offline job groups rows into bins, computes summary statistics (`mean`, `variance`, histograms, sample counts), and emits compact tables (CSV/Parquet) plus YAML manifests referencing them. This stage is optional when training the regressor but remains useful for LUT-based interpreters or quick sanity checks.
+3. **Interpreter / Regressor** — the simulator either loads the aggregated tables or the trained regression bundle, interpolates as needed (e.g., linear in context length), and exposes APIs to return expectations or sampled outcomes. The regression model mirrors VIDUR’s design: a RandomForest ensemble trained on profiled iterations predicts accepted-token counts and per-position acceptance; the interpreter queries the bundle for new requests.
+4. **Validation hook** — a held-out prompt set is replayed to compare interpreter/regressor predictions against real acceptance traces; deviations beyond tolerance trigger a re-profile similar to VIDUR’s regression checks.
+
+
+#### Acceptance Profiling Pipeline (Commands)
+
+Example end-to-end workflow using the bundled profiling utilities:
+
+1. **Export prompts from each benchmark**
+
+   ```bash
+   # CNN/DailyMail
+   python simulator/experiments/speculative/prepare_prompts.py \
+       --dataset-path simulator/thirdparty/benchmarks/cnn_dailymail \
+       --split train --text-column article \
+       --train-size 800 --test-size 200 \
+       --train-output prompts/cnndm_train.jsonl \
+       --test-output  prompts/cnndm_test.jsonl
+
+   # GSM8K
+   python simulator/experiments/speculative/prepare_prompts.py \
+       --dataset-path simulator/thirdparty/benchmarks/gsm8k \
+       --split train --text-column question \
+       --train-size 640 --test-size 160 \
+       --train-output prompts/gsm8k_train.jsonl \
+       --test-output  prompts/gsm8k_test.jsonl
+
+   # HumanEval (164 total prompts)
+   python simulator/experiments/speculative/prepare_prompts.py \
+       --dataset-path simulator/thirdparty/benchmarks/humaneval \
+       --split test --text-column prompt \
+       --train-size 120 --test-size 44 \
+       --train-output prompts/humaneval_train.jsonl \
+       --test-output  prompts/humaneval_test.jsonl
+   ```
+
+2. **Profile drafter → verifier on training prompts**
+
+   ```bash
+   for split in cnndm gsm8k humaneval; do
+     TRANSFORMERS_NO_TORCHAO=1 \
+     ~/miniconda3/bin/conda run -n llama2spec \
+     python simulator/experiments/speculative/speculative.py \
+       --drafter-model meta-llama/Llama-2-7b-hf \
+       --verifier-model meta-llama/Llama-2-70b-hf \
+        --spec-tokens 4 --max-tokens 160 \
+        --max-prompt-tokens 128 \
+        --prompts-file prompts/${split}_train.jsonl \
+        --metrics-jsonl results/${split}_train_metrics.jsonl \
+        --details-jsonl results/${split}_train_details.jsonl
+   done
+   ```
+
+3. **Train the VIDUR-style acceptance regressor**
+
+   ```bash
+   cat results/*_train_details.jsonl > results/train_details.jsonl
+
+   ~/miniconda3/bin/conda run -n llama2spec \
+   python simulator/experiments/speculative/regressor.py \
+       --details-jsonl results/train_details.jsonl \
+       --spec-tokens 4 \
+       --output-model acceptance/llama2_7b_vs_70b.joblib \
+       --metadata drafter=meta-llama/Llama-2-7b-hf \
+       --metadata verifier=meta-llama/Llama-2-70b-hf \
+       --print-report
+   ```
+
+4. **Profile and evaluate on held-out prompts**
+
+   ```bash
+   for split in cnndm gsm8k humaneval; do
+     TRANSFORMERS_NO_TORCHAO=1 \
+     ~/miniconda3/bin/conda run -n llama2spec \
+     python simulator/experiments/speculative/speculative.py \
+       --drafter-model meta-llama/Llama-2-7b-hf \
+       --verifier-model meta-llama/Llama-2-70b-hf \
+        --spec-tokens 4 --max-tokens 160 \
+        --max-prompt-tokens 128 \
+        --prompts-file prompts/${split}_test.jsonl \
+        --metrics-jsonl results/${split}_test_metrics.jsonl \
+        --details-jsonl results/${split}_test_details.jsonl
+   done
+   cat results/*_test_details.jsonl > results/test_details.jsonl
+
+   ~/miniconda3/bin/conda run -n llama2spec \
+   python simulator/experiments/speculative/evaluate_regressor.py \
+       --model acceptance/llama2_7b_vs_70b.joblib \
+       --details-jsonl results/test_details.jsonl \
+       --print-report \
+       --metrics-json results/test_regressor_metrics.json
+   ```
+   ```
 
 Each acceptance entry may provide `mean` and optional tail statistics (e.g., `p95`) so controllers can quantify rejection risk and adapt `k` accordingly, and may condition on prompt attributes such as `temperature`, `top_p`, or domain labels when available.
 

@@ -163,6 +163,11 @@ def parse_args() -> argparse.Namespace:
         help="Stop iterations when drafter emits pad tokens.",
     )
     parser.add_argument(
+        "--max-prompt-tokens",
+        type=int,
+        help="Optional truncation length for prompt tokens before speculation.",
+    )
+    parser.add_argument(
         "--max-prompts",
         type=int,
         help="Limit the number of prompts processed.",
@@ -266,8 +271,12 @@ def speculative_loop(
     top_p: float,
     repetition_penalty: float,
     stop_on_pad: bool,
+    max_prompt_tokens: Optional[int],
 ) -> Tuple[PromptLog, dict]:
-    encoded = tokenizer(prompt, return_tensors="pt", add_special_tokens=True)
+    encode_kwargs = dict(return_tensors="pt", add_special_tokens=True)
+    if max_prompt_tokens is not None:
+        encode_kwargs.update(dict(truncation=True, max_length=max_prompt_tokens))
+    encoded = tokenizer(prompt, **encode_kwargs)
     context_ids = encoded["input_ids"]
     prompt_len = context_ids.shape[1]
     total_generated = 0
@@ -532,6 +541,7 @@ def main() -> None:
             top_p=args.top_p,
             repetition_penalty=args.repetition_penalty,
             stop_on_pad=args.stop_on_pad,
+            max_prompt_tokens=args.max_prompt_tokens,
         )
         prompt_log.prompt_index = idx
         prompt_logs.append(prompt_log)
