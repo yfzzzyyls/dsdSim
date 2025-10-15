@@ -11,6 +11,7 @@ from pathlib import Path
 print(f"SimPy version: {simpy.__version__}", flush=True)
 from dataclasses import dataclass, field, asdict
 from typing import List, Optional, Dict, Any, Sequence, Iterable, Tuple, Mapping
+from dataclasses import dataclass
 
 from performance import PhaseRequest, PerformanceModelConfig, create_performance_provider
 from network.topology import build_latency_lookup, NetworkModelError
@@ -71,6 +72,13 @@ class VerifyResult:
     accepted_tokens: int
     rejected_tokens: int
     total_tokens: int
+
+
+@dataclass
+class BranchCandidate:
+    branch_id: int
+    depth: int
+    score: float
 
 @dataclass
 class WorkloadCfg:
@@ -994,6 +1002,7 @@ class DraftServer:
         self._prefill_overhead_bytes = float(net_cfg.get("prefill_overhead_bytes", 512.0) or 0.0)
         self._decode_overhead_bytes = float(net_cfg.get("decode_overhead_bytes", 128.0) or 0.0)
         self._response_overhead_bytes = float(net_cfg.get("response_overhead_bytes", 256.0) or 0.0)
+        self._eagle_cfg = dict(getattr(cfg, "speculation_config", {}).get("eagle", {}) or {})
 
         self._think_enabled = self.cfg.think_time.enabled
         self._next_available_ms = self.env.now
@@ -1047,6 +1056,9 @@ class DraftServer:
             value = random.lognormvariate(mu, sigma)
             return max(cfg.min_ms, value)
         raise ValueError(f"Unsupported think-time distribution: {cfg.distribution}")
+
+    def _get_eagle_param(self, key: str, default: Any) -> Any:
+        return self._eagle_cfg.get(key, default)
 
     def _schedule_next_arrival(self, reference_ms: float) -> None:
         wait = 0.0
@@ -1242,6 +1254,264 @@ class DraftServer:
             link_key=link_key,
             fallback_latency_ms=float(latency_ms),
         )
+
+    def _estimate_branch_score(self, depth: int, conn: ConnectionParams) -> float:
+        base = max(1e-6, min(0.999, float(conn.acceptance_rate)))
+        return base ** max(1, depth)
+
+    def _run_eagle_conversation(
+        self,
+        conversation_id: str,
+        conversation_start: float,
+        prompt_length: int,
+        answer_length: int,
+        target_id: str,
+        conn: ConnectionParams,
+        priority_class: str,
+        trace_record: Optional[TraceRecord],
+    ) -> None:
+        ttft_breakdown = {
+            "prefill_forward_ms": 0.0,
+            "prefill_queue_ms": 0.0,
+            "prefill_compute_ms": 0.0,
+            "prefill_response_ms": 0.0,
+            "decode_generation_ms": 0.0,
+            "decode_forward_ms": 0.0,
+            "decode_queue_ms": 0.0,
+            "decode_compute_ms": 0.0,
+            "decode_response_ms": 0.0,
+        }
+        decode_breakdown = {
+            "generation_ms": 0.0,
+            "forward_ms": 0.0,
+            "queue_ms": 0.0,
+            "compute_ms": 0.0,
+            "response_ms": 0.0,
+        }
+
+        fused_mode = self.execution_mode == "fused"
+        target_server = self._target_lookup.get(target_id)
+        if fused_mode and target_server is None:
+            print(f"Warning: Target {target_id} not found for draft {self.id}", flush=True)
+            return
+
+        prefill_completion = self.env.event()
+        prefill_job = Job(
+            jid=self.chunks_sent,
+            created_ms=self.env.now,
+            draft_id=self.id,
+            job_type="prefill",
+            token_count=prompt_length,
+            completion_event=prefill_completion,
+            rtt_start_ms=self.env.now,
+            request_id=conversation_id,
+            context_len=prompt_length,
+            target_id=target_id,
+            priority_class=priority_class,
+            phase="prefill",
+        )
+        self.chunks_sent += 1
+
+        prefill_payload = self._estimate_payload_bytes(prompt_length, self._prefill_overhead_bytes)
+        fwd_start = self.env.now
+        yield self._network_transfer(
+            self.id,
+            target_id,
+            conn.forward_latency_ms,
+            payload_bytes=prefill_payload,
+            link_key=conn.network_forward_key,
+        )
+        ttft_breakdown["prefill_forward_ms"] += self.env.now - fwd_start
+        prefill_job.created_ms = self.env.now
+
+        if fused_mode:
+            wait_event = target_server.fused_execute(prefill_job)
+        elif self.scheduler is None:
+            target = self._target_lookup.get(target_id)
+            if target is None:
+                print(f"Warning: Target {target_id} not found for draft {self.id}", flush=True)
+                return
+            target.enqueue(prefill_job)
+            wait_event = prefill_completion
+        else:
+            wait_event = self.scheduler.submit_job(prefill_job)
+
+        yield wait_event
+
+        rsp_start = self.env.now
+        yield self._network_transfer(
+            target_id,
+            self.id,
+            conn.response_latency_ms,
+            payload_bytes=self._estimate_payload_bytes(prompt_length, self._response_overhead_bytes),
+            link_key=conn.network_response_key,
+        )
+        ttft_breakdown["prefill_response_ms"] += self.env.now - rsp_start
+        prefill_job.rtt_end_ms = self.env.now
+
+        prefill_started = prefill_job.started_ms if prefill_job.started_ms is not None else prefill_job.created_ms
+        prefill_queue = max(0.0, (prefill_started - prefill_job.created_ms) if prefill_started is not None else 0.0)
+        prefill_compute = max(0.0, (prefill_job.finished_ms - prefill_started) if prefill_started is not None and prefill_job.finished_ms is not None else 0.0)
+        ttft_breakdown["prefill_queue_ms"] += prefill_queue
+        ttft_breakdown["prefill_compute_ms"] += prefill_compute
+
+        beam_width = max(1, int(self._get_eagle_param("beam_width", 4)))
+        max_depth = max(1, int(self._get_eagle_param("max_depth", self.gamma)))
+        min_depth = max(1, int(self._get_eagle_param("min_depth", 1)))
+
+        tokens_generated = 0
+        tokens_accepted = 0
+        current_context_len = prompt_length
+        conversation_tpot_samples: List[float] = []
+        ttft_pending = True
+        first_token_time_ms = None
+        conversation_completed = False
+
+        while tokens_accepted < answer_length and not conversation_completed:
+            tokens_remaining = answer_length - tokens_accepted
+            branch_depth = min(max_depth, tokens_remaining)
+            if branch_depth < min_depth:
+                branch_depth = tokens_remaining
+
+            candidates: List[BranchCandidate] = []
+            generation_latency_total = 0.0
+            for idx in range(beam_width):
+                if fused_mode:
+                    generation_latency = 0.0
+                else:
+                    generation_latency = self._predict_generation_latency(branch_depth, current_context_len)
+                if generation_latency > 0:
+                    yield self.env.timeout(generation_latency)
+                generation_latency_total += generation_latency
+                score = self._estimate_branch_score(branch_depth, conn)
+                candidates.append(BranchCandidate(idx, branch_depth, score))
+                self.total_tokens_generated += branch_depth
+                tokens_generated += branch_depth
+            decode_breakdown["generation_ms"] += generation_latency_total
+            candidates.sort(key=lambda c: c.score, reverse=True)
+
+            branch_selected = False
+            for candidate in candidates:
+                branch_start = self.env.now
+                job = Job(
+                    jid=self.chunks_sent,
+                    created_ms=self.env.now,
+                    draft_id=self.id,
+                    job_type="decode",
+                    token_count=candidate.depth,
+                    completion_event=self.env.event(),
+                    rtt_start_ms=branch_start,
+                    request_id=conversation_id,
+                    context_len=prompt_length + tokens_generated + candidate.depth,
+                    target_id=target_id,
+                    priority_class=priority_class,
+                    phase="decode",
+                )
+                self.chunks_sent += 1
+
+                if fused_mode:
+                    wait_event = target_server.fused_execute(job)
+                elif self.scheduler is None:
+                    target = self._target_lookup.get(target_id)
+                    if target is None:
+                        print(f"Warning: Target {target_id} not found for draft {self.id}", flush=True)
+                        conversation_completed = True
+                        break
+                    target.enqueue(job)
+                    wait_event = job.completion_event
+                else:
+                    wait_event = self.scheduler.submit_job(job)
+
+                if not fused_mode:
+                    fwd_start = self.env.now
+                    yield self._network_transfer(
+                        self.id,
+                        target_id,
+                        conn.forward_latency_ms,
+                        payload_bytes=self._estimate_payload_bytes(candidate.depth, self._decode_overhead_bytes),
+                        link_key=conn.network_forward_key,
+                    )
+                    forward_elapsed = self.env.now - fwd_start
+                else:
+                    forward_elapsed = 0.0
+                decode_breakdown["forward_ms"] += forward_elapsed
+                if ttft_pending:
+                    ttft_breakdown["decode_forward_ms"] += forward_elapsed
+
+                yield wait_event
+
+                if not fused_mode:
+                    rsp_start = self.env.now
+                    yield self._network_transfer(
+                        target_id,
+                        self.id,
+                        conn.response_latency_ms,
+                        payload_bytes=self._estimate_payload_bytes(candidate.depth, self._response_overhead_bytes),
+                        link_key=conn.network_response_key,
+                    )
+                    response_elapsed = self.env.now - rsp_start
+                else:
+                    response_elapsed = 0.0
+                decode_breakdown["response_ms"] += response_elapsed
+                if ttft_pending:
+                    ttft_breakdown["decode_response_ms"] += response_elapsed
+
+                result = self._simulate_verification(candidate.depth, conn.acceptance_rate)
+                self.total_tokens_accepted += result.accepted_tokens
+                self.total_tokens_rejected += result.rejected_tokens
+
+                rtt = self.env.now - branch_start
+                self.total_round_trip_time += rtt
+                if result.accepted_tokens > 0:
+                    per_token = rtt / result.accepted_tokens
+                    conversation_tpot_samples.extend([per_token] * result.accepted_tokens)
+                    if first_token_time_ms is None:
+                        first_token_time_ms = self.env.now
+                        ttft_pending = False
+                    tokens_accepted += result.accepted_tokens
+                    current_context_len += result.accepted_tokens
+                    branch_selected = True
+                    break
+                else:
+                    conversation_completed = True
+
+            if not branch_selected and not conversation_completed:
+                conversation_completed = True
+
+        conversation_time = self.env.now - conversation_start
+        acceptance_ratio = (
+            tokens_accepted / tokens_generated if tokens_generated > 0 else 0.0
+        )
+
+        if self.cfg.verbose or self.cfg.debug:
+            print(
+                f"[{self.env.now:.1f}ms] Draft {self.id}: EAGLE conversation completed - "
+                f"prompt={prompt_length}, accepted={tokens_accepted}/{answer_length}, "
+                f"time={conversation_time:.1f}ms, acceptance={acceptance_ratio:.2%}",
+                flush=True,
+            )
+
+        if hasattr(self.metrics, "record_conversation"):
+            ttft_ms = (
+                (first_token_time_ms - conversation_start)
+                if first_token_time_ms is not None
+                else None
+            )
+            self.metrics.record_conversation(
+                conversation_id,
+                start_ms=conversation_start,
+                end_ms=self.env.now,
+                draft_id=self.id,
+                target_id=target_id,
+                tokens_generated=tokens_generated,
+                tokens_accepted=tokens_accepted,
+                answer_tokens=answer_length,
+                ttft_ms=ttft_ms,
+                tpot_samples=conversation_tpot_samples,
+                ttft_breakdown=ttft_breakdown,
+                decode_breakdown=decode_breakdown,
+            )
+
     
     def _generate_blocking(self):
         """Blocking mode: generate full conversations with multiple speculation rounds"""
@@ -1293,6 +1563,21 @@ class DraftServer:
             conversation_target_id, conversation_conn = self._select_target()
             target_id = conversation_target_id
             conn = conversation_conn
+
+            if self.framework == "eagle":
+                yield from self._run_eagle_conversation(
+                    conversation_id,
+                    conversation_start,
+                    prompt_length,
+                    answer_length,
+                    target_id,
+                    conn,
+                    priority_class,
+                    trace_record,
+                )
+                if not self._trace_mode:
+                    self._schedule_next_arrival(self.env.now)
+                continue
 
             ttft_breakdown = {
                 "prefill_forward_ms": 0.0,
