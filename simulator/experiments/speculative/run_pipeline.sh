@@ -28,14 +28,6 @@ RESULTS_DIR="${PROJECT_ROOT}/results"
 ACCEPTANCE_DIR="${PROJECT_ROOT}/acceptance"
 mkdir -p "${PROMPT_DIR}" "${RESULTS_DIR}" "${ACCEPTANCE_DIR}"
 
-RUN_RESULTS_DIR="${RESULTS_DIR}/${MODEL_TAG}"
-mkdir -p "${RUN_RESULTS_DIR}"
-
-RUN_ACCEPTANCE_MODEL="${ACCEPTANCE_DIR}/${MODEL_TAG}.joblib"
-TRAIN_DETAILS_COMBINED="${RUN_RESULTS_DIR}/train_details.jsonl"
-TEST_DETAILS_COMBINED="${RUN_RESULTS_DIR}/test_details.jsonl"
-TEST_METRICS_JSON="${RUN_RESULTS_DIR}/test_regressor_metrics.json"
-
 SPEC_TOKENS=4
 MAX_TOKENS=160
 MAX_PROMPT_TOKENS=128
@@ -108,15 +100,23 @@ else
   MODEL_TAG="${D_TAG}_vs_${V_TAG}"
 fi
 
+RUN_RESULTS_DIR="${RESULTS_DIR}/${MODEL_TAG}"
+mkdir -p "${RUN_RESULTS_DIR}"
+
+RUN_ACCEPTANCE_MODEL="${ACCEPTANCE_DIR}/${MODEL_TAG}.joblib"
+TRAIN_DETAILS_COMBINED="${RUN_RESULTS_DIR}/train_details.jsonl"
+TEST_DETAILS_COMBINED="${RUN_RESULTS_DIR}/test_details.jsonl"
+TEST_METRICS_JSON="${RUN_RESULTS_DIR}/test_regressor_metrics.json"
+
 echo ">>> Configuration:"
 echo "    Drafter : ${DRAFTER_MODEL}"
 echo "    Verifier: ${VERIFIER_MODEL}"
 echo "    Tag     : ${MODEL_TAG}"
 
 declare -a DATASETS=(
-  "cnndm simulator/thirdparty/benchmarks/cnn_dailymail train article 8 2"
-  "gsm8k simulator/thirdparty/benchmarks/gsm8k train question 8 2"
-  "humaneval simulator/thirdparty/benchmarks/humaneval test prompt 8 2"
+  "cnndm simulator/thirdparty/benchmarks/cnn_dailymail train article 500 100"
+  "gsm8k simulator/thirdparty/benchmarks/gsm8k train question 500 100"
+  "humaneval simulator/thirdparty/benchmarks/humaneval test prompt 131 33"
 )
 
 profile_split() {
