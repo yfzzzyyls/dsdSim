@@ -14,6 +14,7 @@ from typing import List, Optional, Dict, Any, Sequence, Iterable, Tuple, Mapping
 
 from performance import PhaseRequest, PerformanceModelConfig, create_performance_provider
 from network.topology import build_latency_lookup, NetworkModelError
+from network.fabric import NetworkFabric
 from trace.trace_loader import iter_trace_records
 from trace.types import TraceRecord, TraceParseError
 
@@ -50,6 +51,8 @@ class ConnectionParams:
     response_latency_ms: float        # target -> draft latency
     acceptance_rate: float            # probability each token is accepted
     cluster: str = "default"
+    network_forward_key: Optional[Tuple[str, str]] = None
+    network_response_key: Optional[Tuple[str, str]] = None
 
 @dataclass
 class DraftChunk:
@@ -121,6 +124,8 @@ class Config:
     burn_in_ms: float = 0.0           # Ignore first X ms for stats
     verbose: bool = True               # Print progress updates
     debug: bool = False                # Print detailed batch formation
+    network_config: Dict[str, Any] = field(default_factory=dict)
+    network_enabled: bool = True
 
 @dataclass
 class Job:
@@ -877,7 +882,7 @@ class DraftServer:
                  connections: Dict[str, ConnectionParams] = None, total_capability: float = 1.0,
                  metrics: Metrics = None, scheduler: Optional["Scheduler"] = None,
                  trace_records: Optional[Sequence[TraceRecord]] = None,
-                 performance_provider=None):
+                 performance_provider=None, network: Optional[NetworkFabric] = None):
         self.env = env
         self.p = params
         self.id = params.id
@@ -897,6 +902,14 @@ class DraftServer:
         self._trace_index = 0
         self._trace_mode = self._trace_records is not None
         self.scheduler = scheduler
+        if not getattr(cfg, "network_enabled", True):
+            network = None
+        self.network = network
+        net_cfg = getattr(cfg, "network_config", {}) or {}
+        self._bytes_per_token = float(net_cfg.get("bytes_per_token", 2.0) or 0.0)
+        self._prefill_overhead_bytes = float(net_cfg.get("prefill_overhead_bytes", 512.0) or 0.0)
+        self._decode_overhead_bytes = float(net_cfg.get("decode_overhead_bytes", 128.0) or 0.0)
+        self._response_overhead_bytes = float(net_cfg.get("response_overhead_bytes", 256.0) or 0.0)
 
         self._think_enabled = self.cfg.think_time.enabled
         self._next_available_ms = self.env.now
@@ -1120,6 +1133,31 @@ class DraftServer:
         else:
             # Use fixed length
             return self.cfg.answer_length
+
+    def _estimate_payload_bytes(self, tokens: int, overhead_bytes: float) -> float:
+        if self.network is None:
+            return 0.0
+        tokens = max(0, int(tokens))
+        return max(0.0, float(overhead_bytes) + tokens * self._bytes_per_token)
+
+    def _network_transfer(
+        self,
+        source_id: str,
+        target_id: str,
+        latency_ms: float,
+        *,
+        payload_bytes: float,
+        link_key: Optional[Tuple[str, str]],
+    ):
+        if self.network is None:
+            return self.env.timeout(max(0.0, float(latency_ms)))
+        return self.network.transfer(
+            source_id,
+            target_id,
+            payload_bytes=payload_bytes,
+            link_key=link_key,
+            fallback_latency_ms=float(latency_ms),
+        )
     
     def _generate_blocking(self):
         """Blocking mode: generate full conversations with multiple speculation rounds"""
@@ -1173,10 +1211,10 @@ class DraftServer:
             conn = conversation_conn
 
             ttft_breakdown = {
-                "prefill_forward_ms": conversation_conn.forward_latency_ms,
+                "prefill_forward_ms": 0.0,
                 "prefill_queue_ms": 0.0,
                 "prefill_compute_ms": 0.0,
-                "prefill_response_ms": conversation_conn.response_latency_ms,
+                "prefill_response_ms": 0.0,
                 "decode_generation_ms": 0.0,
                 "decode_forward_ms": 0.0,
                 "decode_queue_ms": 0.0,
@@ -1229,7 +1267,16 @@ class DraftServer:
             self.chunks_sent += 1
 
             # Send prefill request to target
-            yield self.env.timeout(conn.forward_latency_ms)
+            prefill_payload = self._estimate_payload_bytes(prompt_length, self._prefill_overhead_bytes)
+            fwd_start = self.env.now
+            yield self._network_transfer(
+                self.id,
+                target_id,
+                conn.forward_latency_ms,
+                payload_bytes=prefill_payload,
+                link_key=conn.network_forward_key,
+            )
+            ttft_breakdown["prefill_forward_ms"] += self.env.now - fwd_start
             prefill_job.created_ms = self.env.now
 
             if self.scheduler is None:
@@ -1246,7 +1293,16 @@ class DraftServer:
             yield wait_event
 
             # Wait for response to travel back
-            yield self.env.timeout(conn.response_latency_ms)
+            response_payload = self._estimate_payload_bytes(prompt_length, self._response_overhead_bytes)
+            rsp_start = self.env.now
+            yield self._network_transfer(
+                target_id,
+                self.id,
+                conn.response_latency_ms,
+                payload_bytes=response_payload,
+                link_key=conn.network_response_key,
+            )
+            ttft_breakdown["prefill_response_ms"] += self.env.now - rsp_start
 
             # Mark RTT end for prefill
             prefill_job.rtt_end_ms = self.env.now
@@ -1315,10 +1371,19 @@ class DraftServer:
                     )
 
                     # Send chunk to target (forward latency)
-                yield self.env.timeout(conn.forward_latency_ms)
-                decode_breakdown["forward_ms"] += conversation_conn.forward_latency_ms
+                decode_payload = self._estimate_payload_bytes(tokens_this_round, self._decode_overhead_bytes)
+                fwd_chunk_start = self.env.now
+                yield self._network_transfer(
+                    self.id,
+                    target_id,
+                    conn.forward_latency_ms,
+                    payload_bytes=decode_payload,
+                    link_key=conn.network_forward_key,
+                )
+                forward_elapsed = self.env.now - fwd_chunk_start
+                decode_breakdown["forward_ms"] += forward_elapsed
                 if ttft_pending:
-                    ttft_breakdown["decode_forward_ms"] += conversation_conn.forward_latency_ms
+                    ttft_breakdown["decode_forward_ms"] += forward_elapsed
 
                     # Job arrives at target after network delay
                     job.created_ms = self.env.now
@@ -1337,10 +1402,19 @@ class DraftServer:
                 yield wait_event
 
                 # Wait for response to travel back
-                yield self.env.timeout(conn.response_latency_ms)
-                decode_breakdown["response_ms"] += conversation_conn.response_latency_ms
+                response_payload = self._estimate_payload_bytes(tokens_this_round, self._response_overhead_bytes)
+                rsp_chunk_start = self.env.now
+                yield self._network_transfer(
+                    target_id,
+                    self.id,
+                    conn.response_latency_ms,
+                    payload_bytes=response_payload,
+                    link_key=conn.network_response_key,
+                )
+                response_elapsed = self.env.now - rsp_chunk_start
+                decode_breakdown["response_ms"] += response_elapsed
                 if ttft_pending:
-                    ttft_breakdown["decode_response_ms"] += conversation_conn.response_latency_ms
+                    ttft_breakdown["decode_response_ms"] += response_elapsed
 
                 # Mark RTT end after response received
                 job.rtt_end_ms = self.env.now
@@ -2453,11 +2527,21 @@ def _expand_auto_topology(raw: Dict[str, Any]) -> Dict[str, Any]:
         affinity = conn_spec.get("affinity_rules", {})
         net_ranges = conn_spec.get("net_ms_ranges", {})
         acc_tbl = conn_spec.get("acceptance_by_tier", {})
-        jitter_pct = float(conn_spec.get("link_jitter_pct", 0.0) or 0.0)
+        jitter_pct = float(
+            conn_spec.get(
+                "link_jitter_pct",
+                cfg.network_config.get("jitter_pct", 0.0),
+            )
+            or 0.0
+        )
         drop_tbl = conn_spec.get("drop_rate", {})
-        network_model_spec = conn_spec.get("network_model") or None
+        network_model_spec = None
+        if cfg.network_enabled:
+            network_model_spec = conn_spec.get("network_model")
+            if not network_model_spec:
+                network_model_spec = cfg.network_config.get("model")
         latency_lookup = None
-        if network_model_spec:
+        if cfg.network_enabled and network_model_spec:
             try:
                 latency_lookup = build_latency_lookup(
                     drafts=draft_entries,
@@ -2498,14 +2582,13 @@ def _expand_auto_topology(raw: Dict[str, Any]) -> Dict[str, Any]:
                     fwd_base = rng.uniform(float(fr[0]), float(fr[1])) if fr else 20.0
                     rsp_base = rng.uniform(float(fr[0]), float(fr[1])) if fr else 20.0
 
+                fwd = fwd_base
+                rsp = rsp_base
                 if jitter_pct:
                     jitter = rng.uniform(-jitter_pct, jitter_pct)
                     fwd = max(0.1, fwd_base * (1.0 + jitter))
                     jitter = rng.uniform(-jitter_pct, jitter_pct)
                     rsp = max(0.1, rsp_base * (1.0 + jitter))
-                else:
-                    fwd = fwd_base
-                    rsp = rsp_base
                 row = acc_tbl.get(str(bucket), acc_tbl.get(bucket, {}))
                 base_acc = row.get(t_tier, 0.75)
                 acc = max(0.5, min(0.99, base_acc + rng.uniform(-0.03, 0.03)))
@@ -2516,9 +2599,17 @@ def _expand_auto_topology(raw: Dict[str, Any]) -> Dict[str, Any]:
                     "response_latency_ms": float(rsp),
                     "acceptance_rate": float(acc),
                     "cluster": cluster_name,
+                    "base_forward_latency_ms": float(fwd_base),
+                    "base_response_latency_ms": float(rsp_base),
                 }
                 if jitter_pct:
                     connection["jitter_pct"] = jitter_pct
+                if "bandwidth_mbps" in conn_spec:
+                    connection["bandwidth_mbps"] = float(conn_spec.get("bandwidth_mbps", 0.0))
+                if "response_bandwidth_mbps" in conn_spec:
+                    connection["response_bandwidth_mbps"] = float(conn_spec.get("response_bandwidth_mbps", 0.0))
+                if "link_capacity" in conn_spec:
+                    connection["link_capacity"] = int(conn_spec.get("link_capacity", 1))
                 drop_rate = drop_tbl.get(label, drop_tbl.get(str(bucket), None))
                 if drop_rate is not None:
                     connection["drop_rate"] = float(drop_rate)
@@ -2578,6 +2669,8 @@ def load_config(path: str) -> Config:
     raw = _expand_auto_topology(raw)  # Expand auto-topology if present
     wl = WorkloadCfg(**(raw.get("workload", {}) or {}))
     pm = PerformanceModelConfig(**(raw.get("performance_model", {}) or {}))
+    network_cfg = dict(raw.get("network", {}) or {})
+    network_enabled = bool(network_cfg.get("enabled", True))
     cfg = Config(
         sim_time_ms=raw.get("sim_time_ms", 10_000),
         seed=raw.get("seed", 0),
@@ -2611,6 +2704,8 @@ def load_config(path: str) -> Config:
         burn_in_ms=raw.get("burn_in_ms", 0.0),
         verbose=raw.get("verbose", True),
         debug=raw.get("debug", False),
+        network_config=network_cfg,
+        network_enabled=network_enabled,
     )
     return cfg
 
@@ -2644,6 +2739,9 @@ def build(env: simpy.Environment, cfg: Config):
         max_utilization_pct=kv_cfg.get("max_utilization_pct", 100.0),
         paging=kv_cfg.get("paging"),
     )
+    network_fabric: Optional[NetworkFabric] = None
+    if cfg.network_enabled:
+        network_fabric = NetworkFabric(env, cfg.network_config)
 
     # Require devices to be specified in config
     if not cfg.devices:
@@ -2800,13 +2898,48 @@ def build(env: simpy.Environment, cfg: Config):
             connection_map[draft_id] = {}
 
         conn_cluster = str(conn_cfg.get("cluster", target_cluster_map.get(target_id, draft_cluster_map.get(draft_id, "default"))))
+        forward_latency = float(conn_cfg.get("forward_latency_ms", 0.0))
+        response_latency = float(conn_cfg.get("response_latency_ms", 0.0))
+        forward_base = float(conn_cfg.get("base_forward_latency_ms", forward_latency))
+        response_base = float(conn_cfg.get("base_response_latency_ms", response_latency))
+        bandwidth_mbps = conn_cfg.get("bandwidth_mbps")
+        response_bandwidth_mbps = conn_cfg.get("response_bandwidth_mbps", bandwidth_mbps)
+        link_capacity = conn_cfg.get("link_capacity")
+        jitter_pct = conn_cfg.get("jitter_pct")
+        if bandwidth_mbps is None:
+            bandwidth_mbps = cfg.network_config.get("bandwidth_mbps") if cfg.network_config else None
+        if response_bandwidth_mbps is None:
+            response_bandwidth_mbps = cfg.network_config.get("response_bandwidth_mbps") if cfg.network_config else bandwidth_mbps
+        if link_capacity is None:
+            link_capacity = cfg.network_config.get("link_capacity") if cfg.network_config else None
+        network_forward_key = None
+        network_response_key = None
+        if network_fabric is not None:
+            network_forward_key = network_fabric.register_link(
+                draft_id,
+                target_id,
+                base_latency_ms=forward_base,
+                bandwidth_mbps=float(bandwidth_mbps) if bandwidth_mbps is not None else None,
+                jitter_pct=jitter_pct,
+                capacity=link_capacity,
+            )
+            network_response_key = network_fabric.register_link(
+                target_id,
+                draft_id,
+                base_latency_ms=response_base,
+                bandwidth_mbps=float(response_bandwidth_mbps) if response_bandwidth_mbps is not None else None,
+                jitter_pct=jitter_pct,
+                capacity=link_capacity,
+            )
         connection_map[draft_id][target_id] = ConnectionParams(
             draft_id=draft_id,
             target_id=target_id,
-            forward_latency_ms=float(conn_cfg.get("forward_latency_ms", 20.0)),
-            response_latency_ms=float(conn_cfg.get("response_latency_ms", 20.0)),
+            forward_latency_ms=forward_latency,
+            response_latency_ms=response_latency,
             acceptance_rate=float(conn_cfg.get("acceptance_rate", 0.8)),
             cluster=conn_cluster,
+            network_forward_key=network_forward_key,
+            network_response_key=network_response_key,
         )
     
     # Create draft servers with connections
@@ -2854,6 +2987,7 @@ def build(env: simpy.Environment, cfg: Config):
                 scheduler=scheduler,
                 trace_records=trace_records,
                 performance_provider=performance_provider,
+                network=network_fabric,
             )
         )
 

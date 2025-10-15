@@ -695,6 +695,18 @@ Example end-to-end workflow using the bundled profiling utilities:
 
 Each acceptance entry may provide `mean` and optional tail statistics (e.g., `p95`) so controllers can quantify rejection risk and adapt `k` accordingly, and may condition on prompt attributes such as `temperature`, `top_p`, or domain labels when available.
 
+#### 5.4.1 LLaMA 3.2 1B → LLaMA 3.1 8B Regressor (Oct 15 2025)
+
+First full-scale pipeline run using the new diagnostics (Section 5.4) with `spec_tokens=4`, max prompt 128, max output 160:
+
+- **Drafter / verifier.** `meta-llama/Llama-3.2-1B-Instruct` → `meta-llama/Llama-3.1-8B-Instruct`.
+- **Datasets.** CNN/DailyMail (500 train / 100 test), GSM8K (500 / 100), HumanEval (131 / 33). Combined training details at `results/llama3_1b_vs_8b_500/train_details.jsonl`, combined test details at `results/llama3_1b_vs_8b_500/test_details.jsonl`.
+- **Model artifact.** Acceptance bundle stored at `acceptance/llama3_1b_vs_8b_500.joblib`; evaluation metrics are persisted to `results/llama3_1b_vs_8b_500/test_regressor_metrics.json`.
+- **Training metrics.** 108 662 iterations / 172 644 positions. Count regressor MAE 0.887, MSE 1.377, bias +0.022 tokens (≈1.2 % overshoot), p95 abs error 3.13. Acceptance classifier accuracy 0.656, precision 0.636, recall 0.432, F1 0.514, Brier 0.221, ECE 0.009.
+- **Held-out metrics.** 22 623 iterations / 35 690 positions. Count regressor MAE 0.890, MSE 1.375, bias +0.023, p95 abs 3.13. Acceptance classifier accuracy 0.653, precision 0.616, recall 0.424, F1 0.502, Brier 0.223, ECE 0.011. True acceptance rate ≈0.414 vs predicted mean 1.916 tokens per iteration (bias +0.023).
+
+Keep this subsection updated as new acceptance checkpoints are produced so downstream scenarios know which model/version to consume.
+
 ### 5.5 Policy Configuration Schema
 
 Scenario `speculation`, `scheduler`, and `planner` sections bind to the following configuration structures:
