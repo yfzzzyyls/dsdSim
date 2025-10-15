@@ -31,6 +31,14 @@ os.environ.setdefault("TRANSFORMERS_NO_FLAX", "1")
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, set_seed
 
+from vllm.v1.sample.sampler import Sampler as VllmSampler
+from vllm.v1.worker.gpu_input_batch import (
+    LogitsProcessors as VllmLogitsProcessors,
+    SamplingMetadata as VllmSamplingMetadata,
+)
+
+VLLM_SAMPLING_EPS = 1e-5
+
 try:
     from tqdm.auto import tqdm
 
@@ -132,6 +140,12 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=1.0,
         help="Drafter nucleus sampling top-p value (default: 1.0).",
+    )
+    parser.add_argument(
+        "--top-k",
+        type=int,
+        default=0,
+        help="Drafter top-k sampling (0 disables).",
     )
     parser.add_argument(
         "--repetition-penalty",
@@ -254,59 +268,66 @@ def load_prompts(prompts_file: Optional[Path]) -> List[str]:
     return prompts
 
 
-def apply_repetition_penalty(
-    logits: torch.Tensor, history: Sequence[int], penalty: float
-) -> torch.Tensor:
-    if penalty == 1.0 or not history:
-        return logits
-    unique_tokens = torch.tensor(
-        list(set(history)), dtype=torch.long, device=logits.device
-    )
-    gathered = logits.index_select(-1, unique_tokens)
-    adjusted = torch.where(
-        gathered > 0,
-        gathered / penalty,
-        gathered * penalty,
-    )
-    logits = logits.scatter(-1, unique_tokens.unsqueeze(0), adjusted)
-    return logits
-
-
-def top_p_filtering(
-    probs: torch.Tensor,
-    top_p: float,
-) -> torch.Tensor:
-    if top_p >= 1.0:
-        return probs
-    sorted_probs, sorted_indices = torch.sort(probs, descending=True, dim=-1)
-    cumulative = torch.cumsum(sorted_probs, dim=-1)
-    mask = cumulative > top_p
-    mask[..., 1:] = mask[..., :-1].clone()
-    mask[..., 0] = False
-    sorted_probs = sorted_probs.masked_fill(mask, 0.0)
-    filtered = torch.zeros_like(probs).scatter(-1, sorted_indices, sorted_probs)
-    total = filtered.sum(dim=-1, keepdim=True)
-    filtered = torch.where(total > 0, filtered / total, probs)
-    return filtered
-
-
-def sample_token(
-    logits: torch.Tensor,
+def build_sampling_metadata(
     *,
     temperature: float,
     top_p: float,
+    top_k: int,
     repetition_penalty: float,
-    history: Sequence[int],
-) -> int:
-    logits = logits.clone()
-    logits = apply_repetition_penalty(logits, history, repetition_penalty)
-    if temperature <= 0.0:
-        return int(torch.argmax(logits, dim=-1).item())
-    logits = logits / temperature
-    probs = torch.softmax(logits, dim=-1)
-    probs = top_p_filtering(probs, top_p)
-    token = torch.multinomial(probs, num_samples=1)
-    return int(token.item())
+    prompt_token_ids: Optional[torch.Tensor],
+    generated_tokens: List[int],
+    generator: Optional[torch.Generator],
+    device: torch.device,
+) -> VllmSamplingMetadata:
+    all_greedy = (
+        temperature <= VLLM_SAMPLING_EPS and top_p >= 1.0 and top_k <= 0
+    )
+    all_random = not all_greedy
+    temp_value = float(temperature)
+    if not all_random:
+        temp_value = max(temp_value, VLLM_SAMPLING_EPS)
+    temperature_tensor = torch.tensor(
+        [temp_value], dtype=torch.float32, device=device
+    )
+    top_p_tensor = (
+        None
+        if top_p >= 1.0
+        else torch.tensor([float(top_p)], dtype=torch.float32, device=device)
+    )
+    top_k_tensor = (
+        None
+        if top_k <= 0
+        else torch.tensor([int(top_k)], dtype=torch.int32, device=device)
+    )
+    generators: Dict[int, torch.Generator] = {}
+    if generator is not None and not all_greedy:
+        generators[0] = generator
+
+    no_penalties = repetition_penalty == 1.0
+    frequency_penalties = torch.zeros(1, dtype=torch.float32, device=device)
+    presence_penalties = torch.zeros(1, dtype=torch.float32, device=device)
+    repetition_penalties = torch.full(
+        (1,), float(repetition_penalty), dtype=torch.float32, device=device
+    )
+
+    return VllmSamplingMetadata(
+        temperature=temperature_tensor,
+        all_greedy=all_greedy,
+        all_random=all_random,
+        top_p=top_p_tensor,
+        top_k=top_k_tensor,
+        generators=generators,
+        max_num_logprobs=None,
+        no_penalties=no_penalties,
+        prompt_token_ids=None if no_penalties else prompt_token_ids,
+        frequency_penalties=frequency_penalties,
+        presence_penalties=presence_penalties,
+        repetition_penalties=repetition_penalties,
+        output_token_ids=[generated_tokens.copy()],
+        allowed_token_ids_mask=None,
+        bad_words_token_ids={},
+        logitsprocs=VllmLogitsProcessors(),
+    )
 
 
 def greedy_token(logits: torch.Tensor) -> int:
@@ -348,7 +369,9 @@ def speculative_loop(
     max_tokens: int,
     temperature: float,
     top_p: float,
+    top_k: int,
     repetition_penalty: float,
+    seed: int,
     stop_on_pad: bool,
     max_prompt_tokens: Optional[int],
     logger: Optional[Callable[[str], None]] = None,
@@ -394,6 +417,25 @@ def speculative_loop(
         verifier_past = verifier_outputs.past_key_values
         verifier_next_logits = verifier_outputs.logits[:, -1, :]
 
+    vllm_sampler = VllmSampler().to(drafter_device)
+    vllm_sampler.eval()
+    requires_random = not (
+        temperature <= VLLM_SAMPLING_EPS and top_p >= 1.0 and top_k <= 0
+    )
+    sampler_generator: Optional[torch.Generator] = None
+    if requires_random:
+        generator_device = (
+            drafter_device.type if drafter_device.type in ("cuda", "cpu") else "cpu"
+        )
+        sampler_generator = torch.Generator(device=generator_device)
+        sampler_generator.manual_seed(seed)
+
+    initial_prompt_tokens = context_tokens.copy()
+    prompt_token_tensor = torch.tensor(
+        [initial_prompt_tokens], dtype=torch.int64, device=drafter_device
+    )
+    generated_history: List[int] = []
+
     while total_generated < max_tokens and not reached_eos:
         remaining = max_tokens - total_generated
         spec_len = min(spec_tokens, remaining)
@@ -413,27 +455,24 @@ def speculative_loop(
 
         for _ in range(spec_len):
             current_past, current_logits = drafter_stack[-1]
-            sampling_history = context_tokens + draft_tokens
-            next_token = sample_token(
-                current_logits,
+            sampling_metadata = build_sampling_metadata(
                 temperature=temperature,
                 top_p=top_p,
+                top_k=top_k,
                 repetition_penalty=repetition_penalty,
-                history=sampling_history,
+                prompt_token_ids=prompt_token_tensor,
+                generated_tokens=generated_history,
+                generator=sampler_generator,
+                device=drafter_device,
             )
+            sampler_output = vllm_sampler(
+                current_logits,
+                sampling_metadata,
+            )
+            next_token = int(sampler_output.sampled_token_ids[0, 0].item())
             draft_tokens.append(next_token)
             if logger:
                 logger(f"      drafter proposed token {next_token}")
-            if next_token == eos_token or (stop_on_pad and next_token == pad_token):
-                # Stop generating further speculative tokens.
-                with torch.no_grad():
-                    new_past, new_logits = forward_with_past(
-                        drafter_model,
-                        input_ids=torch.tensor([[next_token]], device=drafter_device),
-                        past_key_values=current_past,
-                    )
-                drafter_stack.append((new_past, new_logits))
-                break
             with torch.no_grad():
                 new_past, new_logits = forward_with_past(
                     drafter_model,
@@ -441,6 +480,8 @@ def speculative_loop(
                     past_key_values=current_past,
                 )
             drafter_stack.append((new_past, new_logits))
+            if next_token == eos_token or (stop_on_pad and next_token == pad_token):
+                break
 
         effective_len = len(draft_tokens)
         if eos_token in draft_tokens:
@@ -469,6 +510,8 @@ def speculative_loop(
             if is_accepted:
                 position_accepts[idx] += 1
                 context_tokens.append(draft_token)
+                if len(context_tokens) > prompt_len:
+                    generated_history.append(draft_token)
                 total_generated += 1
                 committed_count += 1
                 if draft_token == eos_token:
@@ -488,6 +531,8 @@ def speculative_loop(
             # First mismatch
             mismatch_token = verifier_choice
             context_tokens.append(mismatch_token)
+            if len(context_tokens) > prompt_len:
+                generated_history.append(mismatch_token)
             total_generated += 1
             if mismatch_token == eos_token:
                 reached_eos = True
@@ -511,6 +556,8 @@ def speculative_loop(
             # All speculative tokens accepted; consume verifier bonus token.
             verifier_bonus = greedy_token(verifier_next_logits)
             context_tokens.append(verifier_bonus)
+            if len(context_tokens) > prompt_len:
+                generated_history.append(verifier_bonus)
             total_generated += 1
             if logger:
                 logger(
@@ -632,6 +679,8 @@ def main() -> None:
         raise ValueError("--temperature cannot be negative.")
     if not (0 < args.top_p <= 1.0):
         raise ValueError("--top-p must be in the interval (0, 1].")
+    if args.top_k < 0:
+        raise ValueError("--top-k must be >= 0.")
     if args.repetition_penalty <= 0:
         raise ValueError("--repetition-penalty must be > 0.")
 
@@ -713,7 +762,9 @@ def main() -> None:
             max_tokens=args.max_tokens,
             temperature=args.temperature,
             top_p=args.top_p,
+            top_k=args.top_k,
             repetition_penalty=args.repetition_penalty,
+            seed=args.seed + idx,
             stop_on_pad=args.stop_on_pad,
             max_prompt_tokens=args.max_prompt_tokens,
             logger=write_fn if args.debug_progress else None,
