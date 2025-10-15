@@ -28,9 +28,9 @@ DRAFTER_MODEL="meta-llama/Llama-2-7b-hf"
 VERIFIER_MODEL="meta-llama/Llama-2-70b-hf"
 
 declare -a DATASETS=(
-  "cnndm simulator/thirdparty/benchmarks/cnn_dailymail train article 800 200"
-  "gsm8k simulator/thirdparty/benchmarks/gsm8k train question 640 160"
-  "humaneval simulator/thirdparty/benchmarks/humaneval test prompt 120 44"
+  "cnndm simulator/thirdparty/benchmarks/cnn_dailymail train article 8 2"
+  "gsm8k simulator/thirdparty/benchmarks/gsm8k train question 8 2"
+  "humaneval simulator/thirdparty/benchmarks/humaneval test prompt 8 2"
 )
 
 profile_split() {
@@ -45,6 +45,7 @@ profile_split() {
     --spec-tokens "${SPEC_TOKENS}" \
     --max-tokens "${MAX_TOKENS}" \
     --max-prompt-tokens "${MAX_PROMPT_TOKENS}" \
+    --debug-progress \
     --prompts-file "${prompts_file}" \
     --metrics-jsonl "${metrics_file}" \
     --details-jsonl "${details_file}"
@@ -55,6 +56,10 @@ for entry in "${DATASETS[@]}"; do
   read -r tag dataset_path split text_column train_size test_size <<<"${entry}"
   train_out="${PROMPT_DIR}/${tag}_train.jsonl"
   test_out="${PROMPT_DIR}/${tag}_test.jsonl"
+  if [[ -f "${train_out}" && -f "${test_out}" ]]; then
+    echo "  - ${tag}: cached prompts detected (delete files to regenerate)"
+    continue
+  fi
   echo "  - ${tag}: ${train_size} train / ${test_size} test"
   ${CONDA_RUN} python "${SCRIPT_DIR}/prepare_prompts.py" \
     --dataset-path "${dataset_path}" \

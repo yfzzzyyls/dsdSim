@@ -608,27 +608,27 @@ Example end-to-end workflow using the bundled profiling utilities:
 1. **Export prompts from each benchmark**
 
    ```bash
-   # CNN/DailyMail
+   # CNN/DailyMail (tiny debugging subset)
    python simulator/experiments/speculative/prepare_prompts.py \
        --dataset-path simulator/thirdparty/benchmarks/cnn_dailymail \
        --split train --text-column article \
-       --train-size 800 --test-size 200 \
+       --train-size 8 --test-size 2 \
        --train-output prompts/cnndm_train.jsonl \
        --test-output  prompts/cnndm_test.jsonl
 
-   # GSM8K
+   # GSM8K (tiny debugging subset)
    python simulator/experiments/speculative/prepare_prompts.py \
        --dataset-path simulator/thirdparty/benchmarks/gsm8k \
        --split train --text-column question \
-       --train-size 640 --test-size 160 \
+       --train-size 8 --test-size 2 \
        --train-output prompts/gsm8k_train.jsonl \
        --test-output  prompts/gsm8k_test.jsonl
 
-   # HumanEval (164 total prompts)
+   # HumanEval (tiny debugging subset)
    python simulator/experiments/speculative/prepare_prompts.py \
        --dataset-path simulator/thirdparty/benchmarks/humaneval \
        --split test --text-column prompt \
-       --train-size 120 --test-size 44 \
+       --train-size 8 --test-size 2 \
        --train-output prompts/humaneval_train.jsonl \
        --test-output  prompts/humaneval_test.jsonl
    ```
@@ -644,6 +644,7 @@ Example end-to-end workflow using the bundled profiling utilities:
        --verifier-model meta-llama/Llama-2-70b-hf \
         --spec-tokens 4 --max-tokens 160 \
         --max-prompt-tokens 128 \
+        --debug-progress \
         --prompts-file prompts/${split}_train.jsonl \
         --metrics-jsonl results/${split}_train_metrics.jsonl \
         --details-jsonl results/${split}_train_details.jsonl
@@ -674,8 +675,9 @@ Example end-to-end workflow using the bundled profiling utilities:
      python simulator/experiments/speculative/speculative.py \
        --drafter-model meta-llama/Llama-2-7b-hf \
        --verifier-model meta-llama/Llama-2-70b-hf \
-        --spec-tokens 4 --max-tokens 160 \
-        --max-prompt-tokens 128 \
+       --spec-tokens 4 --max-tokens 160 \
+       --max-prompt-tokens 128 \
+        --debug-progress \
         --prompts-file prompts/${split}_test.jsonl \
         --metrics-jsonl results/${split}_test_metrics.jsonl \
         --details-jsonl results/${split}_test_details.jsonl

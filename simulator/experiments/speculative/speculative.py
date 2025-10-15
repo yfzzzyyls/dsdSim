@@ -22,7 +22,7 @@ import os
 import random
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 # Avoid importing TensorFlow / Flax when pulling Transformers.
 os.environ.setdefault("TRANSFORMERS_NO_TF", "1")
@@ -30,6 +30,14 @@ os.environ.setdefault("TRANSFORMERS_NO_FLAX", "1")
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, set_seed
+
+try:
+    from tqdm.auto import tqdm
+
+    _HAS_TQDM = True
+except ModuleNotFoundError:  # pragma: no cover
+    tqdm = None
+    _HAS_TQDM = False
 
 DEFAULT_PROMPTS: List[str] = [
     "Summarize the core idea behind speculative decoding in large language models.",
@@ -172,6 +180,11 @@ def parse_args() -> argparse.Namespace:
         type=int,
         help="Limit the number of prompts processed.",
     )
+    parser.add_argument(
+        "--debug-progress",
+        action="store_true",
+        help="Print detailed progress/debug information for each prompt.",
+    )
     return parser.parse_args()
 
 
@@ -272,12 +285,17 @@ def speculative_loop(
     repetition_penalty: float,
     stop_on_pad: bool,
     max_prompt_tokens: Optional[int],
+    logger: Optional[Callable[[str], None]] = None,
 ) -> Tuple[PromptLog, dict]:
     encode_kwargs = dict(return_tensors="pt", add_special_tokens=True)
     if max_prompt_tokens is not None:
         encode_kwargs.update(dict(truncation=True, max_length=max_prompt_tokens))
     encoded = tokenizer(prompt, **encode_kwargs)
     context_ids = encoded["input_ids"]
+    if logger:
+        logger(
+            f"    initial context tokens: {context_ids.shape[1]}"
+        )
     prompt_len = context_ids.shape[1]
     total_generated = 0
     reached_eos = False
@@ -300,6 +318,10 @@ def speculative_loop(
         if spec_len <= 0:
             break
         context_len_before = context_ids.shape[1]
+        if logger:
+            logger(
+                f"    remaining budget {remaining}, requesting up to {spec_len} draft tokens"
+            )
 
         drafter_input = context_ids.to(drafter_device)
         draft_attention = torch.ones_like(drafter_input, device=drafter_device)
@@ -324,6 +346,10 @@ def speculative_loop(
             attention_mask=draft_attention,
             **draft_generation_kwargs,
         )
+        if logger:
+            logger(
+                f"    drafter generated {draft_output.sequences[0].shape[0] - drafter_input.shape[1]} tokens"
+            )
         full_sequence = draft_output.sequences[0].detach().to("cpu")
         draft_candidates = full_sequence[context_ids.shape[1] :]
         if draft_candidates.numel() == 0:
@@ -373,9 +399,12 @@ def speculative_loop(
             verifier_context = verifier_output.sequences.detach().to("cpu")
             predicted_token = verifier_context[0, -1].item()
             total_generated += 1
-
             is_accepted = predicted_token == draft_token
             accepted_flags.append(is_accepted)
+            if logger:
+                logger(
+                    f"      position {position}: draft={draft_token}, verifier={predicted_token}, accepted={is_accepted}"
+                )
             if is_accepted:
                 position_accepts[position] += 1
             else:
@@ -504,8 +533,18 @@ def main() -> None:
     if args.max_prompts is not None:
         prompts = prompts[: args.max_prompts]
 
+    print(
+        f"[startup] Loading tokenizer for drafter model '{args.drafter_model}'...",
+        flush=True,
+    )
     drafter_tokenizer = load_tokenizer(args.drafter_model)
+    print("[startup] Drafter tokenizer ready.", flush=True)
+    print(
+        f"[startup] Loading tokenizer for verifier model '{args.verifier_model}'...",
+        flush=True,
+    )
     verifier_tokenizer = load_tokenizer(args.verifier_model)
+    print("[startup] Verifier tokenizer ready.", flush=True)
     if drafter_tokenizer.get_vocab() != verifier_tokenizer.get_vocab():
         raise ValueError(
             "Drafter and verifier tokenizers differ. Please ensure both "
@@ -513,11 +552,24 @@ def main() -> None:
         )
     tokenizer = drafter_tokenizer
 
+    print(
+        f"[startup] Loading drafter model '{args.drafter_model}' "
+        f"(dtype={args.drafter_dtype}, device_map={args.drafter_device_map or args.device_map}, "
+        f"load_in_8bit={args.drafter_load_in_8bit})... this may take a few minutes.",
+        flush=True,
+    )
     drafter_model = load_model(
         args.drafter_model,
         dtype=resolve_dtype(args.drafter_dtype),
         device_map=args.drafter_device_map or args.device_map,
         load_in_8bit=args.drafter_load_in_8bit,
+    )
+    print("[startup] Drafter model ready.", flush=True)
+    print(
+        f"[startup] Loading verifier model '{args.verifier_model}' "
+        f"(dtype={args.verifier_dtype}, device_map={args.verifier_device_map or args.device_map})... "
+        "this may take a few minutes.",
+        flush=True,
     )
     verifier_model = load_model(
         args.verifier_model,
@@ -525,11 +577,24 @@ def main() -> None:
         device_map=args.verifier_device_map or args.device_map,
         load_in_8bit=False,
     )
+    print("[startup] Verifier model ready.", flush=True)
 
     prompt_logs: List[PromptLog] = []
     summaries: List[dict] = []
 
-    for idx, prompt in enumerate(prompts):
+    total_prompts = len(prompts)
+    use_progress_bar = _HAS_TQDM and total_prompts > 1
+
+    if use_progress_bar:
+        progress_iter = tqdm(range(total_prompts), desc="Profiling prompts", unit="prompt")
+        write_fn = progress_iter.write
+    else:
+        progress_iter = range(total_prompts)
+        write_fn = print
+
+    for idx in progress_iter:
+        prompt = prompts[idx]
+        write_fn(f"Starting prompt {idx + 1}/{total_prompts}")
         prompt_log, summary = speculative_loop(
             prompt,
             drafter_model,
@@ -542,18 +607,21 @@ def main() -> None:
             repetition_penalty=args.repetition_penalty,
             stop_on_pad=args.stop_on_pad,
             max_prompt_tokens=args.max_prompt_tokens,
+            logger=write_fn if args.debug_progress else None,
         )
         prompt_log.prompt_index = idx
         prompt_logs.append(prompt_log)
         summaries.append(summary)
 
         if args.print_output:
-            print("-" * 60)
-            print(f"[Prompt {idx}] {prompt}")
-            print(f"[Generated] {prompt_log.generated_text}")
-            print(f"[Iterations] {len(prompt_log.iterations)} "
-                  f"(accepted tokens: {summary['num_accepted_tokens']}, "
-                  f"draft tokens: {summary['num_draft_tokens']})")
+            write_fn("-" * 60)
+            write_fn(f"[Prompt {idx}] {prompt}")
+            write_fn(f"[Generated] {prompt_log.generated_text}")
+            write_fn(
+                f"[Iterations] {len(prompt_log.iterations)} "
+                f"(accepted tokens: {summary['num_accepted_tokens']}, "
+                f"draft tokens: {summary['num_draft_tokens']})"
+            )
 
         if args.details_jsonl:
             record = {
@@ -576,6 +644,21 @@ def main() -> None:
                 "total_generated_tokens": prompt_log.total_generated_tokens,
             }
             append_jsonl(args.details_jsonl, record)
+
+        if args.debug_progress:
+            write_fn(
+                f"    prompt {idx + 1}/{total_prompts} summary: accepted"
+                f" {summary['num_accepted_tokens']} of {summary['num_draft_tokens']} draft tokens"
+            )
+
+        if not args.print_output:
+            write_fn(f"[{idx + 1}/{total_prompts}] prompts profiled")
+
+        if use_progress_bar:
+            progress_iter.update(0)  # ensure immediate refresh
+
+    if _HAS_TQDM and hasattr(progress_iter, "close"):
+        progress_iter.close()
 
     summary = aggregate_metrics(prompt_logs, summaries, args.spec_tokens)
 
