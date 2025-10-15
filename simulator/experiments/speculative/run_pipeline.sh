@@ -31,8 +31,8 @@ mkdir -p "${PROMPT_DIR}" "${RESULTS_DIR}" "${ACCEPTANCE_DIR}"
 SPEC_TOKENS=4
 MAX_TOKENS=160
 MAX_PROMPT_TOKENS=128
-DRAFTER_MODEL="meta-llama/Llama-2-7b-hf"
-VERIFIER_MODEL="meta-llama/Llama-2-70b-hf"
+DRAFTER_MODEL="meta-llama/Llama-3.2-1B-Instruct"
+VERIFIER_MODEL="meta-llama/Llama-3.1-8B-Instruct"
 
 declare -a DATASETS=(
   "cnndm simulator/thirdparty/benchmarks/cnn_dailymail train article 8 2"
@@ -56,7 +56,6 @@ profile_split() {
       --spec-tokens '${SPEC_TOKENS}' \
       --max-tokens '${MAX_TOKENS}' \
       --max-prompt-tokens '${MAX_PROMPT_TOKENS}' \
-      --debug-progress \
       --prompts-file '${prompts_file}' \
       --metrics-jsonl '${metrics_file}' \
       --details-jsonl '${details_file}'

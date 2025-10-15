@@ -752,7 +752,6 @@ def main() -> None:
 
     for idx in progress_iter:
         prompt = prompts[idx]
-        write_fn(f"Starting prompt {idx + 1}/{total_prompts}")
         prompt_log, summary = speculative_loop(
             prompt,
             drafter_model,
