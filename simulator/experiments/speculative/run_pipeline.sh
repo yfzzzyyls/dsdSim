@@ -19,6 +19,10 @@ SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 PROJECT_ROOT=$(cd "${SCRIPT_DIR}/../../.." && pwd)
 CONDA_RUN="${HOME}/miniconda3/bin/conda run -n llama2spec"
 
+# For interactive commands with real-time output, source conda directly
+CONDA_BASE="${HOME}/miniconda3"
+CONDA_ENV="llama2spec"
+
 PROMPT_DIR="${PROJECT_ROOT}/prompts"
 RESULTS_DIR="${PROJECT_ROOT}/results"
 ACCEPTANCE_DIR="${PROJECT_ROOT}/acceptance"
@@ -42,16 +46,21 @@ profile_split() {
   local metrics_file="$3"
   local details_file="$4"
   echo ">>> Profiling ${split_name} prompts (${prompts_file})"
-  ${CONDA_RUN} python -u "${SCRIPT_DIR}/speculative.py" \
-    --drafter-model "${DRAFTER_MODEL}" \
-    --verifier-model "${VERIFIER_MODEL}" \
-    --spec-tokens "${SPEC_TOKENS}" \
-    --max-tokens "${MAX_TOKENS}" \
-    --max-prompt-tokens "${MAX_PROMPT_TOKENS}" \
-    --debug-progress \
-    --prompts-file "${prompts_file}" \
-    --metrics-jsonl "${metrics_file}" \
-    --details-jsonl "${details_file}"
+  # Source conda directly for real-time output (conda run buffers aggressively)
+  bash -c "
+    source '${CONDA_BASE}/etc/profile.d/conda.sh' && \
+    conda activate '${CONDA_ENV}' && \
+    exec python -u '${SCRIPT_DIR}/speculative.py' \
+      --drafter-model '${DRAFTER_MODEL}' \
+      --verifier-model '${VERIFIER_MODEL}' \
+      --spec-tokens '${SPEC_TOKENS}' \
+      --max-tokens '${MAX_TOKENS}' \
+      --max-prompt-tokens '${MAX_PROMPT_TOKENS}' \
+      --debug-progress \
+      --prompts-file '${prompts_file}' \
+      --metrics-jsonl '${metrics_file}' \
+      --details-jsonl '${details_file}'
+  "
 }
 
 echo ">>> Step 1: Export prompts"
