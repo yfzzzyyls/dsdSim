@@ -810,7 +810,7 @@ def main() -> None:
                 f" {summary['num_accepted_tokens']} of {summary['num_draft_tokens']} draft tokens"
             )
 
-        if not args.print_output:
+        if (not args.print_output) and (not use_progress_bar):
             write_fn(f"[{idx + 1}/{total_prompts}] prompts profiled")
 
         if use_progress_bar:
