@@ -707,6 +707,15 @@ First full-scale pipeline run using the new diagnostics (Section 5.4) with `spe
 
 Keep this subsection updated as new acceptance checkpoints are produced so downstream scenarios know which model/version to consume.
 
+#### 5.4.2 VIDUR Profiling Assets — Qwen-7B on A40/A100 (Oct 15 2025)
+
+- **Source:** `simulator/thirdparty/Sai_speculative_vidur` (branch `profiling`, commit “Add profiling infrastructure and Qwen-7B profiling data”).
+- **In-repo copies:**
+  - `simulator/profiling_assets/vidur/profiling/compute/a40/**`
+  - `simulator/profiling_assets/vidur/profiling/compute/a100/**`
+  - `simulator/profiling_assets/vidur/profiling/compute/h100/**`
+- **README update:** Supported-model table now lists `Qwen/Qwen-7B` with coverage for A100 DGX, 4×A100 pairwise, and 8×A40 pairwise nodes. Consume these assets via the VIDUR real-time provider or LUT loader when configuring Qwen drafts on A40/A100.
+
 ### 5.5 Policy Configuration Schema
 
 Scenario `speculation`, `scheduler`, and `planner` sections bind to the following configuration structures:
