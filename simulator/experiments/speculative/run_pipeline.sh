@@ -12,6 +12,9 @@
 
 set -euo pipefail
 
+# Force unbuffered output for real-time progress
+export PYTHONUNBUFFERED=1
+
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 PROJECT_ROOT=$(cd "${SCRIPT_DIR}/../../.." && pwd)
 CONDA_RUN="${HOME}/miniconda3/bin/conda run -n llama2spec"
@@ -39,7 +42,7 @@ profile_split() {
   local metrics_file="$3"
   local details_file="$4"
   echo ">>> Profiling ${split_name} prompts (${prompts_file})"
-  ${CONDA_RUN} python "${SCRIPT_DIR}/speculative.py" \
+  ${CONDA_RUN} python -u "${SCRIPT_DIR}/speculative.py" \
     --drafter-model "${DRAFTER_MODEL}" \
     --verifier-model "${VERIFIER_MODEL}" \
     --spec-tokens "${SPEC_TOKENS}" \

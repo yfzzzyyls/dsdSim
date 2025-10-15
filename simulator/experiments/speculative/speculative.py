@@ -254,11 +254,77 @@ def load_prompts(prompts_file: Optional[Path]) -> List[str]:
     return prompts
 
 
-def truncate_at_eos(tokens: Sequence[int], eos_token: int) -> List[int]:
-    if eos_token in tokens:
-        idx = list(tokens).index(eos_token)
-        return list(tokens[: idx + 1])
-    return list(tokens)
+def apply_repetition_penalty(
+    logits: torch.Tensor, history: Sequence[int], penalty: float
+) -> torch.Tensor:
+    if penalty == 1.0 or not history:
+        return logits
+    unique_tokens = torch.tensor(
+        list(set(history)), dtype=torch.long, device=logits.device
+    )
+    gathered = logits.index_select(-1, unique_tokens)
+    adjusted = torch.where(
+        gathered > 0,
+        gathered / penalty,
+        gathered * penalty,
+    )
+    logits = logits.scatter(-1, unique_tokens.unsqueeze(0), adjusted)
+    return logits
+
+
+def top_p_filtering(
+    probs: torch.Tensor,
+    top_p: float,
+) -> torch.Tensor:
+    if top_p >= 1.0:
+        return probs
+    sorted_probs, sorted_indices = torch.sort(probs, descending=True, dim=-1)
+    cumulative = torch.cumsum(sorted_probs, dim=-1)
+    mask = cumulative > top_p
+    mask[..., 1:] = mask[..., :-1].clone()
+    mask[..., 0] = False
+    sorted_probs = sorted_probs.masked_fill(mask, 0.0)
+    filtered = torch.zeros_like(probs).scatter(-1, sorted_indices, sorted_probs)
+    total = filtered.sum(dim=-1, keepdim=True)
+    filtered = torch.where(total > 0, filtered / total, probs)
+    return filtered
+
+
+def sample_token(
+    logits: torch.Tensor,
+    *,
+    temperature: float,
+    top_p: float,
+    repetition_penalty: float,
+    history: Sequence[int],
+) -> int:
+    logits = logits.clone()
+    logits = apply_repetition_penalty(logits, history, repetition_penalty)
+    if temperature <= 0.0:
+        return int(torch.argmax(logits, dim=-1).item())
+    logits = logits / temperature
+    probs = torch.softmax(logits, dim=-1)
+    probs = top_p_filtering(probs, top_p)
+    token = torch.multinomial(probs, num_samples=1)
+    return int(token.item())
+
+
+def greedy_token(logits: torch.Tensor) -> int:
+    return int(torch.argmax(logits, dim=-1).item())
+
+
+def forward_with_past(
+    model: AutoModelForCausalLM,
+    *,
+    input_ids: torch.Tensor,
+    past_key_values,
+) -> Tuple[Tuple[torch.Tensor, ...], torch.Tensor]:
+    outputs = model(
+        input_ids=input_ids,
+        use_cache=True,
+        past_key_values=past_key_values,
+    )
+    return outputs.past_key_values, outputs.logits[:, -1, :]
 
 
 def infer_primary_device(model: AutoModelForCausalLM) -> torch.device:
@@ -312,117 +378,161 @@ def speculative_loop(
     drafter_device = infer_primary_device(drafter_model)
     verifier_device = infer_primary_device(verifier_model)
 
+    context_tokens = context_ids[0].tolist()
+
+    with torch.no_grad():
+        drafter_outputs = drafter_model(
+            input_ids=context_ids.to(drafter_device),
+            use_cache=True,
+        )
+        drafter_past = drafter_outputs.past_key_values
+        drafter_next_logits = drafter_outputs.logits[:, -1, :]
+        verifier_outputs = verifier_model(
+            input_ids=context_ids.to(verifier_device),
+            use_cache=True,
+        )
+        verifier_past = verifier_outputs.past_key_values
+        verifier_next_logits = verifier_outputs.logits[:, -1, :]
+
     while total_generated < max_tokens and not reached_eos:
         remaining = max_tokens - total_generated
         spec_len = min(spec_tokens, remaining)
         if spec_len <= 0:
             break
-        context_len_before = context_ids.shape[1]
+        context_len_before = len(context_tokens)
         if logger:
             logger(
                 f"    remaining budget {remaining}, requesting up to {spec_len} draft tokens"
             )
 
-        drafter_input = context_ids.to(drafter_device)
-        draft_attention = torch.ones_like(drafter_input, device=drafter_device)
-        draft_generation_kwargs = {
-            "max_new_tokens": spec_len,
-            "do_sample": temperature > 0,
-            "pad_token_id": pad_token,
-            "eos_token_id": eos_token,
-            "use_cache": True,
-            "return_dict_in_generate": True,
-        }
-        if temperature > 0:
-            draft_generation_kwargs["temperature"] = temperature
-            draft_generation_kwargs["top_p"] = top_p
-            if repetition_penalty != 1.0:
-                draft_generation_kwargs["repetition_penalty"] = repetition_penalty
-        elif repetition_penalty != 1.0:
-            draft_generation_kwargs["repetition_penalty"] = repetition_penalty
+        # Drafter speculative proposal with cached past.
+        draft_tokens: List[int] = []
+        drafter_stack: List[Tuple[Tuple[torch.Tensor, ...], torch.Tensor]] = [
+            (drafter_past, drafter_next_logits)
+        ]
 
-        draft_output = drafter_model.generate(
-            input_ids=drafter_input,
-            attention_mask=draft_attention,
-            **draft_generation_kwargs,
-        )
-        if logger:
-            logger(
-                f"    drafter generated {draft_output.sequences[0].shape[0] - drafter_input.shape[1]} tokens"
+        for _ in range(spec_len):
+            current_past, current_logits = drafter_stack[-1]
+            sampling_history = context_tokens + draft_tokens
+            next_token = sample_token(
+                current_logits,
+                temperature=temperature,
+                top_p=top_p,
+                repetition_penalty=repetition_penalty,
+                history=sampling_history,
             )
-        full_sequence = draft_output.sequences[0].detach().to("cpu")
-        draft_candidates = full_sequence[context_ids.shape[1] :]
-        if draft_candidates.numel() == 0:
-            # Drafter refused to produce more tokens; fall back to verifier.
-            draft_candidates = torch.tensor([eos_token], dtype=torch.long)
+            draft_tokens.append(next_token)
+            if logger:
+                logger(f"      drafter proposed token {next_token}")
+            if next_token == eos_token or (stop_on_pad and next_token == pad_token):
+                # Stop generating further speculative tokens.
+                with torch.no_grad():
+                    new_past, new_logits = forward_with_past(
+                        drafter_model,
+                        input_ids=torch.tensor([[next_token]], device=drafter_device),
+                        past_key_values=current_past,
+                    )
+                drafter_stack.append((new_past, new_logits))
+                break
+            with torch.no_grad():
+                new_past, new_logits = forward_with_past(
+                    drafter_model,
+                    input_ids=torch.tensor([[next_token]], device=drafter_device),
+                    past_key_values=current_past,
+                )
+            drafter_stack.append((new_past, new_logits))
 
-        draft_tokens = truncate_at_eos(draft_candidates.tolist(), eos_token)
-        if stop_on_pad:
-            draft_tokens = [tok for tok in draft_tokens if tok != pad_token]
-        if not draft_tokens:
-            # Nothing to verify; bail out by letting verifier generate one token.
-            verifier_output = verifier_model.generate(
-                input_ids=context_ids.to(verifier_device),
-                attention_mask=torch.ones_like(context_ids, device=verifier_device),
-                max_new_tokens=1,
-                do_sample=False,
-                pad_token_id=pad_token,
-                eos_token_id=eos_token,
-                return_dict_in_generate=True,
-            )
-            context_ids = verifier_output.sequences.detach().to("cpu")
-            new_token = context_ids[0, -1].item()
-            total_generated += 1
-            if new_token == eos_token:
-                reached_eos = True
-            continue
-
+        effective_len = len(draft_tokens)
+        if eos_token in draft_tokens:
+            effective_len = min(effective_len, draft_tokens.index(eos_token) + 1)
+        if stop_on_pad and pad_token in draft_tokens:
+            pad_idx = draft_tokens.index(pad_token)
+            effective_len = min(effective_len, pad_idx)
+        if effective_len < len(draft_tokens):
+            draft_tokens = draft_tokens[:effective_len]
+            drafter_stack = drafter_stack[: effective_len + 1]
+        num_draft_tokens += len(draft_tokens)
         accepted_flags: List[bool] = []
         mismatch_token: Optional[int] = None
-        verifier_context = context_ids
+        committed_count = 0
 
-        for position, draft_token in enumerate(draft_tokens):
-            if position >= spec_tokens:
-                break
-            position_attempts[position] += 1
-
-            verifier_input = verifier_context.to(verifier_device)
-            verifier_output = verifier_model.generate(
-                input_ids=verifier_input,
-                attention_mask=torch.ones_like(verifier_input, device=verifier_device),
-                max_new_tokens=1,
-                do_sample=False,
-                pad_token_id=pad_token,
-                eos_token_id=eos_token,
-                return_dict_in_generate=True,
-            )
-            verifier_context = verifier_output.sequences.detach().to("cpu")
-            predicted_token = verifier_context[0, -1].item()
-            total_generated += 1
-            is_accepted = predicted_token == draft_token
+        for idx, draft_token in enumerate(draft_tokens):
+            if idx < spec_tokens:
+                position_attempts[idx] += 1
+            verifier_choice = greedy_token(verifier_next_logits)
+            is_accepted = verifier_choice == draft_token
             accepted_flags.append(is_accepted)
             if logger:
                 logger(
-                    f"      position {position}: draft={draft_token}, verifier={predicted_token}, accepted={is_accepted}"
+                    f"      position {idx}: draft={draft_token}, verifier={verifier_choice}, accepted={is_accepted}"
                 )
             if is_accepted:
-                position_accepts[position] += 1
-            else:
-                mismatch_token = predicted_token
-                if predicted_token == eos_token:
+                position_accepts[idx] += 1
+                context_tokens.append(draft_token)
+                total_generated += 1
+                committed_count += 1
+                if draft_token == eos_token:
                     reached_eos = True
-                break
+                with torch.no_grad():
+                    verifier_past, verifier_next_logits = forward_with_past(
+                        verifier_model,
+                        input_ids=torch.tensor(
+                            [[draft_token]], device=verifier_device
+                        ),
+                        past_key_values=verifier_past,
+                    )
+                if reached_eos or total_generated >= max_tokens:
+                    break
+                continue
 
-            if predicted_token == eos_token:
+            # First mismatch
+            mismatch_token = verifier_choice
+            context_tokens.append(mismatch_token)
+            total_generated += 1
+            if mismatch_token == eos_token:
                 reached_eos = True
-                break
+            with torch.no_grad():
+                verifier_past, verifier_next_logits = forward_with_past(
+                    verifier_model,
+                    input_ids=torch.tensor([[mismatch_token]], device=verifier_device),
+                    past_key_values=verifier_past,
+                )
+            # Reset drafter state to last accepted prefix and include mismatch.
+            drafter_past, drafter_next_logits = drafter_stack[committed_count]
+            with torch.no_grad():
+                drafter_past, drafter_next_logits = forward_with_past(
+                    drafter_model,
+                    input_ids=torch.tensor([[mismatch_token]], device=drafter_device),
+                    past_key_values=drafter_past,
+                )
+            break
 
-            if total_generated >= max_tokens:
-                break
+        else:
+            # All speculative tokens accepted; consume verifier bonus token.
+            verifier_bonus = greedy_token(verifier_next_logits)
+            context_tokens.append(verifier_bonus)
+            total_generated += 1
+            if logger:
+                logger(
+                    f"      all draft tokens accepted; verifier produced bonus token {verifier_bonus}"
+                )
+            if verifier_bonus == eos_token:
+                reached_eos = True
+            with torch.no_grad():
+                verifier_past, verifier_next_logits = forward_with_past(
+                    verifier_model,
+                    input_ids=torch.tensor([[verifier_bonus]], device=verifier_device),
+                    past_key_values=verifier_past,
+                )
+            drafter_past, drafter_next_logits = drafter_stack[len(draft_tokens)]
+            with torch.no_grad():
+                drafter_past, drafter_next_logits = forward_with_past(
+                    drafter_model,
+                    input_ids=torch.tensor([[verifier_bonus]], device=drafter_device),
+                    past_key_values=drafter_past,
+                )
 
-        context_ids = verifier_context
         num_drafts += 1
-        num_draft_tokens += len(draft_tokens)
         num_accepted_tokens += sum(accepted_flags)
 
         iterations.append(
@@ -432,17 +542,16 @@ def speculative_loop(
                 accepted_flags=accepted_flags,
                 accepted_count=sum(accepted_flags),
                 mismatch_token_id=mismatch_token,
-                context_length_after=context_ids.shape[1],
+                context_length_after=len(context_tokens),
             )
         )
 
-        if reached_eos:
-            break
-        if total_generated >= max_tokens:
+        if reached_eos or total_generated >= max_tokens:
             break
 
+    generated_tensor = torch.tensor([context_tokens], dtype=torch.long)
     generated_text = tokenizer.decode(
-        context_ids[0, prompt_len:], skip_special_tokens=True
+        generated_tensor[0, prompt_len:], skip_special_tokens=True
     )
 
     prompt_log = PromptLog(
