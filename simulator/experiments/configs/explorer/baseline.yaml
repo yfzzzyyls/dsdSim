@@ -16,9 +16,8 @@ answer_length_max: 960
 use_answer_distribution: true
 mixed_batching: true
 
-router: random
-router_params:
-  d_choices: 3
+router: semi_clairvoyant
+router_params: {}
 global_router: disabled
 
 workload:
@@ -49,50 +48,42 @@ performance_model:
 scheduler:
   type: baseline
   pools:
-    fast_prefill:
-      targets:
-        - dc_core_t00
-    fast_decode:
-      targets:
-        - dc_core_t01
-    regional_pool:
+    global_pool:
       clusters:
-        - regional
-    edge_pool:
-      clusters:
-        - edge
+        - llama
+        - qwen
   prefill:
-    pool: fast_prefill
+    pool: global_pool
     queue_policy: priority
     max_batch_requests: 6
-    max_wait_ms: 1.0
-    delayed_batch_ms: 0.35
-    max_queue_depth: 16
+    max_wait_ms: 0.8
+    delayed_batch_ms: 0.3
+    max_queue_depth: 24
     backpressure_wait_ms: 0.08
     dynamic_policy:
       enabled: true
       low_queue_depth: 1
       high_queue_depth: 6
-      low_wait_ms: 0.20
-      high_wait_ms: 1.50
+      low_wait_ms: 0.2
+      high_wait_ms: 1.4
       low_batch_requests: 2
       high_batch_requests: 6
-      low_delay_ms: 0.20
-      high_delay_ms: 0.60
+      low_delay_ms: 0.18
+      high_delay_ms: 0.55
   decode:
-    pool: fast_decode
+    pool: global_pool
     queue_policy: priority
-    max_batch_requests: 5
-    max_wait_ms: 0.9
-    delayed_batch_ms: 0.25
-    max_queue_depth: 18
-    backpressure_wait_ms: 0.1
+    max_batch_requests: 6
+    max_wait_ms: 0.8
+    delayed_batch_ms: 0.28
+    max_queue_depth: 28
+    backpressure_wait_ms: 0.09
     dynamic_policy:
       enabled: true
       low_queue_depth: 2
       high_queue_depth: 8
-      low_wait_ms: 0.15
-      high_wait_ms: 1.00
+      low_wait_ms: 0.18
+      high_wait_ms: 0.95
       low_batch_requests: 2
       high_batch_requests: 6
       low_delay_ms: 0.10
@@ -103,34 +94,34 @@ scheduler:
 
 auto_topology:
   clusters:
-    - name: dc_core
+    - name: llama
       router: semi_clairvoyant
       router_params: {}
       targets:
-        count: 2
+        count: 10
         tiers:
-          - name: dc_prefill
-            count: 1
-            model: qwen-72b-prefill
-            gpu: H100
-            weight: 1.8
-            batch_window_ms: 0.28
+          - name: llama_a100
+            count: 5
+            model: llama-2-70b
+            gpu: A100
+            weight: 1.6
+            batch_window_ms: 0.35
             batch_size: 12
             vidur:
-              model_name: Qwen/Qwen-72B
-              device: H100
-              network_device: H100_DGX
+              model_name: meta-llama/Llama-2-70b-hf
+              device: A100
+              network_device: A100_PAIRWISE_NVLINK
               tensor_parallel: 1
               pipeline_parallel: 1
               scheduler: sarathi
               chunk_size: 512
-          - name: dc_decode
-            count: 1
-            model: llama-2-70b-decode
+          - name: llama_h100
+            count: 5
+            model: llama-2-70b
             gpu: H100
-            weight: 1.6
-            batch_window_ms: 0.35
-            batch_size: 16
+            weight: 1.9
+            batch_window_ms: 0.3
+            batch_size: 14
             vidur:
               model_name: meta-llama/Llama-2-70b-hf
               device: H100
@@ -142,25 +133,25 @@ auto_topology:
       drafts:
         count: 40
         capability_map:
-          0: 1.35
-          1: 0.95
-        draft_bucket_labels: [rack_ultra, rack_high]
+          0: 0.5
+          1: 0.5
+        draft_bucket_labels: [llama_a40_fast, llama_a40_slow]
         reliability:
-          rack_ultra: 0.997
-          rack_high: 0.992
+          llama_a40_fast: 0.985
+          llama_a40_slow: 0.965
         metadata_by_label:
-          rack_ultra:
+          llama_a40_fast:
             hardware: A40
-            model_name: internlm-20b
+            model_name: llama-2-7b
             vidur_profile:
-              model_name: internlm/internlm-20b
+              model_name: meta-llama/Llama-2-7b-hf
               device: A40
               network_device: A40_PAIRWISE_NVLINK
               tensor_parallel: 1
               pipeline_parallel: 1
               scheduler: sarathi
               chunk_size: 512
-          rack_high:
+          llama_a40_slow:
             hardware: A40
             model_name: llama-2-7b
             vidur_profile:
@@ -172,90 +163,82 @@ auto_topology:
               scheduler: sarathi
               chunk_size: 512
       connectivity:
-        fanout_per_draft: 5
+        fanout_per_draft: 4
         net_ms_ranges:
-          dc_prefill: [1.2, 2.2]
-          dc_decode: [1.8, 3.0]
+          llama_a100: [6.5, 11.0]
+          llama_h100: [5.0, 9.0]
         acceptance_by_tier:
-          "0": {dc_prefill: 0.96, dc_decode: 0.94}
-          "1": {dc_prefill: 0.92, dc_decode: 0.90}
-        link_jitter_pct: 0.04
-    - name: regional
-      router: wjsq2
-      router_params:
-        d_choices: 2
+          "0":
+            llama_a100: 0.82
+            llama_h100: 0.85
+          "1":
+            llama_a100: 0.76
+            llama_h100: 0.80
+        link_jitter_pct: 0.12
+        drop_rate:
+          llama_a40_slow: 0.006
+    - name: qwen
+      router: semi_clairvoyant
+      router_params: {}
       targets:
-        count: 2
+        count: 10
         tiers:
-          - name: regional_qwen
-            count: 1
+          - name: qwen_a100
+            count: 5
             model: qwen-72b
             gpu: A100
-            weight: 1.2
-            batch_window_ms: 0.9
-            batch_size: 18
+            weight: 1.5
+            batch_window_ms: 0.36
+            batch_size: 12
             vidur:
               model_name: Qwen/Qwen-72B
               device: A100
-              network_device: A100_DGX
+              network_device: A100_PAIRWISE_NVLINK
               tensor_parallel: 1
               pipeline_parallel: 1
               scheduler: sarathi
               chunk_size: 512
-          - name: regional_llama
-            count: 1
-            model: llama-2-70b
-            gpu: A100
-            weight: 1.1
-            batch_window_ms: 0.8
-            batch_size: 20
+          - name: qwen_h100
+            count: 5
+            model: qwen-72b
+            gpu: H100
+            weight: 1.8
+            batch_window_ms: 0.31
+            batch_size: 14
             vidur:
-              model_name: meta-llama/Llama-2-70b-hf
-              device: A100
-              network_device: A100_DGX
+              model_name: Qwen/Qwen-72B
+              device: H100
+              network_device: H100_DGX
               tensor_parallel: 1
               pipeline_parallel: 1
               scheduler: sarathi
               chunk_size: 512
       drafts:
-        count: 35
+        count: 40
         capability_map:
-          0: 0.85
-          1: 0.6
-          2: 0.4
-        draft_bucket_labels: [regional_high, regional_mid, regional_low]
+          0: 0.58
+          1: 0.42
+        draft_bucket_labels: [qwen_a40_high, qwen_a40_low]
         reliability:
-          regional_high: 0.989
-          regional_mid: 0.982
-          regional_low: 0.970
+          qwen_a40_high: 0.982
+          qwen_a40_low: 0.960
         metadata_by_label:
-          regional_high:
+          qwen_a40_high:
             hardware: A40
-            model_name: llama-10b-draft
+            model_name: qwen-7b
             vidur_profile:
-              model_name: meta-llama/Llama-2-13b-hf
+              model_name: Qwen/Qwen-7B
               device: A40
               network_device: A40_PAIRWISE_NVLINK
               tensor_parallel: 1
               pipeline_parallel: 1
               scheduler: sarathi
               chunk_size: 512
-          regional_mid:
+          qwen_a40_low:
             hardware: A40
-            model_name: llama-7b-draft
+            model_name: qwen-7b
             vidur_profile:
-              model_name: meta-llama/Llama-2-7b-hf
-              device: A40
-              network_device: A40_PAIRWISE_NVLINK
-              tensor_parallel: 1
-              pipeline_parallel: 1
-              scheduler: sarathi
-              chunk_size: 512
-          regional_low:
-            hardware: A40
-            model_name: phi-2
-            vidur_profile:
-              model_name: microsoft/phi-2
+              model_name: Qwen/Qwen-7B
               device: A40
               network_device: A40_PAIRWISE_NVLINK
               tensor_parallel: 1
@@ -264,93 +247,16 @@ auto_topology:
               chunk_size: 512
       connectivity:
         fanout_per_draft: 4
-        fanout_override:
-          regional_low: 3
         net_ms_ranges:
-          regional_mix: [6.0, 12.0]
+          qwen_a100: [7.0, 12.5]
+          qwen_h100: [5.4, 9.4]
         acceptance_by_tier:
-          "0": {regional_mix: 0.90}
-          "1": {regional_mix: 0.85}
-          "2": {regional_mix: 0.78}
-        link_jitter_pct: 0.10
+          "0":
+            qwen_a100: 0.79
+            qwen_h100: 0.83
+          "1":
+            qwen_a100: 0.73
+            qwen_h100: 0.78
+        link_jitter_pct: 0.14
         drop_rate:
-          regional_low: 0.006
-    - name: edge
-      router: random
-      router_params: {}
-      targets:
-        count: 2
-        tiers:
-          - name: edge_heavy
-            count: 1
-            model: llama-2-70b
-            gpu: A40
-            weight: 0.75
-            batch_window_ms: 1.8
-            batch_size: 10
-            vidur:
-              model_name: meta-llama/Llama-2-70b-hf
-              device: A40
-              network_device: A40_PAIRWISE_NVLINK
-              tensor_parallel: 1
-              pipeline_parallel: 1
-              scheduler: sarathi
-              chunk_size: 512
-          - name: edge_mid
-            count: 1
-            model: codellama-34b
-            gpu: A40
-            weight: 0.65
-            batch_window_ms: 1.6
-            batch_size: 12
-            vidur:
-              model_name: codellama/CodeLlama-34b-Instruct-hf
-              device: A40
-              network_device: A40_PAIRWISE_NVLINK
-              tensor_parallel: 1
-              pipeline_parallel: 1
-              scheduler: sarathi
-              chunk_size: 512
-      drafts:
-        count: 25
-        capability_map:
-          0: 0.34
-          1: 0.22
-        draft_bucket_labels: [edge_mid, edge_low]
-        reliability:
-          edge_mid: 0.960
-          edge_low: 0.935
-        metadata_by_label:
-          edge_mid:
-            hardware: A40
-            model_name: codellama-34b
-            vidur_profile:
-              model_name: meta-llama/Llama-2-13b-hf
-              device: A40
-              network_device: A40_PAIRWISE_NVLINK
-              tensor_parallel: 1
-              pipeline_parallel: 1
-              scheduler: sarathi
-              chunk_size: 512
-          edge_low:
-            hardware: A40
-            model_name: phi-2
-            vidur_profile:
-              model_name: microsoft/phi-2
-              device: A40
-              network_device: A40_PAIRWISE_NVLINK
-              tensor_parallel: 1
-              pipeline_parallel: 1
-              scheduler: sarathi
-              chunk_size: 512
-      connectivity:
-        fanout_per_draft: 3
-        net_ms_ranges:
-          edge_gpu: [18.0, 28.0]
-          edge_cpu: [25.0, 38.0]
-        acceptance_by_tier:
-          "0": {edge_gpu: 0.70, edge_cpu: 0.62}
-          "1": {edge_gpu: 0.60, edge_cpu: 0.55}
-        link_jitter_pct: 0.18
-        drop_rate:
-          edge_low: 0.015
+          qwen_a40_low: 0.008
