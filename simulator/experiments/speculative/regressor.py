@@ -37,6 +37,12 @@ from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
 from sklearn.metrics import accuracy_score, mean_squared_error
 from sklearn.model_selection import train_test_split
 
+from simulator.experiments.speculative.metrics import (
+    classification_metrics,
+    positive_class_probabilities,
+    regression_metrics,
+)
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -202,6 +208,7 @@ def train_models(
     reg.fit(Xc_train, yc_train)
     yc_pred = reg.predict(Xc_test)
     reg_mse = mean_squared_error(yc_test, yc_pred)
+    reg_diagnostics = regression_metrics(yc_test, yc_pred)
 
     # Acceptance classifier
     Xa_train, Xa_test, ya_train, ya_test = train_test_split(
@@ -217,10 +224,18 @@ def train_models(
         n_jobs=-1,
     )
     clf.fit(Xa_train, ya_train)
-    ya_pred = clf.predict(Xa_test)
+    ya_proba = clf.predict_proba(Xa_test)
+    ya_prob = positive_class_probabilities(clf, ya_proba)
+    if len(getattr(clf, "classes_", [])) == 1:
+        ya_pred = np.full(len(Xa_test), clf.classes_[0], dtype=np.int32)
+    else:
+        ya_pred = (ya_prob >= 0.5).astype(np.int32)
     clf_acc = accuracy_score(ya_test, ya_pred)
+    clf_diagnostics = classification_metrics(ya_test, ya_pred, ya_prob, ece_bins=10)
 
     metrics = {
+        "count_regression": reg_diagnostics,
+        "accept_classification": clf_diagnostics,
         "count_mse": float(reg_mse),
         "accept_accuracy": float(clf_acc),
         "train_iterations": int(len(X_count)),
@@ -268,8 +283,24 @@ def main() -> None:
 
     if args.print_report:
         print("Acceptance regressor training report")
-        for key, value in metrics.items():
-            print(f"  {key}: {value}")
+        print(
+            f"  iterations={metrics['train_iterations']} positions={metrics['train_positions']}"
+        )
+        count = metrics["count_regression"]
+        print(
+            "  Count regression: "
+            f"MSE={count['mse']:.4f} MAE={count['mae']:.4f} "
+            f"bias={count['bias']:.4f} p95_abs={count['p95_abs_error']:.4f}"
+        )
+        accept = metrics["accept_classification"]
+        calib = accept.get("calibration")
+        calib_str = f" ECE={calib['ece']:.4f}" if calib else ""
+        print(
+            "  Accept classifier: "
+            f"accuracy={accept['accuracy']:.4f} precision={accept['precision']:.4f} "
+            f"recall={accept['recall']:.4f} f1={accept['f1']:.4f} "
+            f"brier={accept['brier']:.4f}{calib_str}"
+        )
 
 
 if __name__ == "__main__":
