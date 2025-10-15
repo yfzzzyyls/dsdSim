@@ -716,6 +716,17 @@ Keep this subsection updated as new acceptance checkpoints are produced so downs
   - `simulator/profiling_assets/vidur/profiling/compute/h100/**`
 - **README update:** Supported-model table now lists `Qwen/Qwen-7B` with coverage for A100 DGX, 4×A100 pairwise, and 8×A40 pairwise nodes. Consume these assets via the VIDUR real-time provider or LUT loader when configuring Qwen drafts on A40/A100.
 
+#### 5.4.3 Baseline Scenario — Family-Aligned Targets (Oct 15 2025)
+
+- **Config:** `simulator/experiments/configs/explorer/baseline.yaml` now models two independent clusters (`llama`, `qwen`). Each hosts 10 verifier targets (5×A100 + 5×H100) with aligned drafter pools (A40 + 7B variants) and restricts connectivity so drafts only talk to targets sharing the tokenizer (LLaMA↔LLaMA, Qwen↔Qwen).
+- **Motivation:** We only vendor VIDUR profiles for the LLaMA-2 and Qwen families, so the baseline avoids cross-family routing. This layout prepares the ground for future framework modes (vanilla/eagle; fused/distributed) while keeping tokenizer compatibility explicit.
+
+#### 5.4.4 Vanilla Fused Execution (Oct 15 2025)
+
+- **Configuration knobs:** `speculation.framework: vanilla` (default) with `speculation.execution_mode: fused` routes prompts directly to the verifier. The draft uploads the prompt once; the target then performs drafter + verifier work locally, using an optional `fused_draft_profile` block on each target tier to describe the small-model VIDUR profile.
+  When no explicit `fused_draft_profile` is provided we default to the matching 7B model in the same family (LLaMA‑2 or Qwen) with the target’s hardware metadata.
+- **Runtime behaviour:** Draft servers skip speculative generation latency and network hops; `TargetServer` calls into VIDUR twice per round (first with the fused drafter profile, then with the verifier profile) to simulate sequential execution. Decode-time network transfer is suppressed, reflecting “prompt once, local conversation” semantics.
+
 ### 5.5 Policy Configuration Schema
 
 Scenario `speculation`, `scheduler`, and `planner` sections bind to the following configuration structures:

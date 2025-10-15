@@ -3,6 +3,10 @@ seed: 123
 verbose: false
 debug: false
 
+speculation:
+  framework: vanilla
+  execution_mode: distributed
+
 execution_mode: blocking
 gamma: 4
 

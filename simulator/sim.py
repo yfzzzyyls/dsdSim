@@ -78,6 +78,36 @@ class WorkloadCfg:
     interarrival_ms: float = 12.0     # used if deterministic
     rate_rps: float = 100.0           # used if poisson: mean rate
 
+
+_FUSED_MODEL_DEFAULTS = {
+    "meta-llama/Llama-2-70b-hf": "meta-llama/Llama-2-7b-hf",
+    "meta-llama/Meta-Llama-3-70B": "meta-llama/Meta-Llama-3-8B",
+    "Qwen/Qwen-72B": "Qwen/Qwen-7B",
+}
+
+
+def _default_fused_profile(entry: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
+    info = entry.get("vidur") or entry.get("vidur_profile")
+    if not info:
+        return None
+    model_name = info.get("model_name") or info.get("model")
+    if not model_name:
+        return None
+    draft_model = _FUSED_MODEL_DEFAULTS.get(model_name)
+    if not draft_model:
+        return None
+    profile: Dict[str, Any] = {"model_name": draft_model}
+    device = info.get("device") or entry.get("gpu")
+    if device:
+        profile["device"] = device
+    network_device = info.get("network_device") or entry.get("network_device")
+    if network_device:
+        profile["network_device"] = network_device
+    for key in ("tensor_parallel", "pipeline_parallel", "scheduler", "chunk_size"):
+        if key in info:
+            profile[key] = info[key]
+    return profile
+
 @dataclass
 class ThinkTimeConfig:
     enabled: bool = True
@@ -124,6 +154,9 @@ class Config:
     burn_in_ms: float = 0.0           # Ignore first X ms for stats
     verbose: bool = True               # Print progress updates
     debug: bool = False                # Print detailed batch formation
+    speculation_framework: str = "vanilla"
+    speculation_execution_mode: str = "distributed"
+    speculation_config: Dict[str, Any] = field(default_factory=dict)
     network_config: Dict[str, Any] = field(default_factory=dict)
     network_enabled: bool = True
 
@@ -572,7 +605,10 @@ class TargetServer:
         self.performance = performance_provider
         self.kv_manager = kv_manager
         self.kv_capacity_tokens = getattr(params, "kv_capacity_tokens", None)
-        
+        self.execution_mode = getattr(self.cfg, "speculation_execution_mode", "distributed").lower()
+        self.framework = getattr(self.cfg, "speculation_framework", "vanilla").lower()
+        self.fused_draft_profile = dict(params.fused_draft_profile or {})
+
         # CRITICAL FIX: Add Resource to enforce single-server processing
         # This ensures batch collection and processing cannot overlap
         self.server = simpy.Resource(env, capacity=1)
@@ -718,6 +754,52 @@ class TargetServer:
             context_per_request=tuple(context_lengths),
             extra_metadata=metadata,
         )
+
+    def _fused_phase_latency(self, job: Job, phase: str) -> float:
+        profile = self.fused_draft_profile
+        if not profile or self.performance is None:
+            return 0.0
+        model_name = profile.get("model_name") or profile.get("model")
+        hardware = profile.get("device") or profile.get("hardware") or self.p.gpu
+        if not model_name or not hardware:
+            return 0.0
+        request = PhaseRequest(
+            phase=phase,
+            model=model_name,
+            hardware=hardware,
+            batch_size=1,
+            microbatch_size=1,
+            fanout=1,
+            sequence_length=job.context_len if phase != "prefill" else job.token_count,
+            tokens_to_generate=job.token_count if phase != "prefill" else 0,
+            context_length=job.context_len,
+            request_id=job.request_id,
+            target_id=self.p.id,
+            draft_id=job.draft_id,
+        )
+        metrics = self.performance.get_metrics(request)
+        return metrics.latency_ms if metrics else 0.0
+
+    def fused_execute(self, job: Job) -> simpy.Event:
+        event = job.completion_event or self.env.event()
+
+        def _run():
+            job.started_ms = self.env.now
+            total_latency = 0.0
+            phase = "prefill" if job.job_type == "prefill" else "decode"
+            if self.fused_draft_profile:
+                total_latency += self._fused_phase_latency(job, phase)
+            total_latency += self._estimate_job_latency(job)
+            if total_latency > 0:
+                yield self.env.timeout(total_latency)
+            job.finished_ms = self.env.now
+            if self.metrics:
+                self.metrics.add(job)
+            if not event.triggered:
+                event.succeed(job)
+
+        self.env.process(_run())
+        return event
 
     def work_left_score(self) -> float:
         # Better ETA-based scoring
@@ -897,6 +979,8 @@ class DraftServer:
         self.metrics = metrics  # Reference to global metrics
         self.performance = performance_provider
         self.metadata = params.metadata
+        self.execution_mode = getattr(cfg, "speculation_execution_mode", "distributed").lower()
+        self.framework = getattr(cfg, "speculation_framework", "vanilla").lower()
         self._workload_enabled = bool(cfg.workload.rate_rps > 0) if cfg and cfg.workload else False
         self._trace_records = list(trace_records) if trace_records else None
         self._trace_index = 0
@@ -1279,8 +1363,15 @@ class DraftServer:
             ttft_breakdown["prefill_forward_ms"] += self.env.now - fwd_start
             prefill_job.created_ms = self.env.now
 
-            if self.scheduler is None:
-                target_server = self._target_lookup.get(target_id)
+            target_server = self._target_lookup.get(target_id)
+            fused_mode = self.framework == "vanilla" and self.execution_mode == "fused"
+
+            if fused_mode:
+                if target_server is None:
+                    print(f"Warning: Target {target_id} not found for draft {self.id}", flush=True)
+                    continue
+                wait_event = target_server.fused_execute(prefill_job)
+            elif self.scheduler is None:
                 if target_server is None:
                     print(f"Warning: Target {target_id} not found for draft {self.id}", flush=True)
                     continue
@@ -1338,7 +1429,10 @@ class DraftServer:
 
                     current_context = prompt_length + tokens_generated_in_conversation
                     # Generate draft tokens using performance provider latency
-                    generation_latency = self._predict_generation_latency(tokens_this_round, current_context)
+                    if fused_mode:
+                        generation_latency = 0.0
+                    else:
+                        generation_latency = self._predict_generation_latency(tokens_this_round, current_context)
                 if generation_latency > 0:
                     yield self.env.timeout(generation_latency)
                 decode_breakdown["generation_ms"] += generation_latency
@@ -1372,24 +1466,31 @@ class DraftServer:
 
                     # Send chunk to target (forward latency)
                 decode_payload = self._estimate_payload_bytes(tokens_this_round, self._decode_overhead_bytes)
-                fwd_chunk_start = self.env.now
-                yield self._network_transfer(
-                    self.id,
-                    target_id,
-                    conn.forward_latency_ms,
-                    payload_bytes=decode_payload,
-                    link_key=conn.network_forward_key,
-                )
-                forward_elapsed = self.env.now - fwd_chunk_start
+                if fused_mode:
+                    forward_elapsed = 0.0
+                else:
+                    fwd_chunk_start = self.env.now
+                    yield self._network_transfer(
+                        self.id,
+                        target_id,
+                        conn.forward_latency_ms,
+                        payload_bytes=decode_payload,
+                        link_key=conn.network_forward_key,
+                    )
+                    forward_elapsed = self.env.now - fwd_chunk_start
                 decode_breakdown["forward_ms"] += forward_elapsed
                 if ttft_pending:
                     ttft_breakdown["decode_forward_ms"] += forward_elapsed
 
-                    # Job arrives at target after network delay
+                    # Job arrives at target after network delay (or immediately in fused mode)
                     job.created_ms = self.env.now
 
-                    if self.scheduler is None:
-                        target_server = self._target_lookup.get(target_id)
+                    if fused_mode:
+                        if target_server is None:
+                            print(f"Warning: Target {target_id} not found for draft {self.id}", flush=True)
+                            break
+                        wait_event = target_server.fused_execute(job)
+                    elif self.scheduler is None:
                         if target_server is None:
                             print(f"Warning: Target {target_id} not found for draft {self.id}", flush=True)
                             break
@@ -1403,15 +1504,18 @@ class DraftServer:
 
                 # Wait for response to travel back
                 response_payload = self._estimate_payload_bytes(tokens_this_round, self._response_overhead_bytes)
-                rsp_chunk_start = self.env.now
-                yield self._network_transfer(
-                    target_id,
-                    self.id,
-                    conn.response_latency_ms,
-                    payload_bytes=response_payload,
-                    link_key=conn.network_response_key,
-                )
-                response_elapsed = self.env.now - rsp_chunk_start
+                if fused_mode:
+                    response_elapsed = 0.0
+                else:
+                    rsp_chunk_start = self.env.now
+                    yield self._network_transfer(
+                        target_id,
+                        self.id,
+                        conn.response_latency_ms,
+                        payload_bytes=response_payload,
+                        link_key=conn.network_response_key,
+                    )
+                    response_elapsed = self.env.now - rsp_chunk_start
                 decode_breakdown["response_ms"] += response_elapsed
                 if ttft_pending:
                     ttft_breakdown["decode_response_ms"] += response_elapsed
@@ -2435,6 +2539,10 @@ def _expand_auto_topology(raw: Dict[str, Any]) -> Dict[str, Any]:
                     entry["vidur_profile"] = dict(tier["vidur_profile"])
                 if tier.get("draft_vidur"):
                     entry["fused_draft_profile"] = dict(tier["draft_vidur"])
+                elif cfg.speculation_execution_mode == "fused":
+                    fused_profile = _default_fused_profile(entry)
+                    if fused_profile is not None:
+                        entry["fused_draft_profile"] = fused_profile
                 if "metadata" in tier:
                     entry["metadata"] = dict(tier["metadata"])
                 cluster_devices.append(entry)
@@ -2671,6 +2779,9 @@ def load_config(path: str) -> Config:
     pm = PerformanceModelConfig(**(raw.get("performance_model", {}) or {}))
     network_cfg = dict(raw.get("network", {}) or {})
     network_enabled = bool(network_cfg.get("enabled", True))
+    spec_cfg = dict(raw.get("speculation", {}) or {})
+    framework = str(spec_cfg.get("framework", "vanilla")).lower()
+    execution_mode = str(spec_cfg.get("execution_mode", "distributed")).lower()
     cfg = Config(
         sim_time_ms=raw.get("sim_time_ms", 10_000),
         seed=raw.get("seed", 0),
@@ -2706,6 +2817,9 @@ def load_config(path: str) -> Config:
         debug=raw.get("debug", False),
         network_config=network_cfg,
         network_enabled=network_enabled,
+        speculation_framework=framework,
+        speculation_execution_mode=execution_mode,
+        speculation_config=spec_cfg,
     )
     return cfg
 
