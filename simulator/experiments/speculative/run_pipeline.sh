@@ -45,6 +45,13 @@ profile_split() {
   local prompts_file="$2"
   local metrics_file="$3"
   local details_file="$4"
+
+  if [[ -f "${details_file}" ]]; then
+    echo ">>> Profiling ${split_name} prompts (${prompts_file})"
+    echo "    cached results detected (${details_file}); skipping (delete file to regenerate)"
+    return
+  fi
+
   echo ">>> Profiling ${split_name} prompts (${prompts_file})"
   # Source conda directly for real-time output (conda run buffers aggressively)
   bash -c "
