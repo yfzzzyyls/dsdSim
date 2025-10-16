@@ -1047,6 +1047,8 @@ class DraftServer:
         self.performance = performance_provider
         self.metadata = params.metadata
         self._acceptance_model = acceptance_model
+        if self._acceptance_model is None:
+            raise RuntimeError("Acceptance model must be provided; fallbacks are not permitted")
         self.execution_mode = getattr(cfg, "speculation_execution_mode", "distributed").lower()
         self.framework = getattr(cfg, "speculation_framework", "vanilla").lower()
         self._workload_enabled = bool(cfg.workload.rate_rps > 0) if cfg and cfg.workload else False
@@ -1211,53 +1213,53 @@ class DraftServer:
         return target_id, self.connections[target_id]
     
     def _effective_acceptance_rate(self, conn: ConnectionParams, context_length: int, depth: int) -> float:
-        fallback = conn.acceptance_rate if conn.acceptance_rate is not None else 0.6
-        try:
-            fallback = float(fallback)
-        except (TypeError, ValueError):
-            fallback = 0.6
-        fallback = max(1e-6, min(0.999, fallback))
-        if self._acceptance_model is None or depth <= 0:
-            return fallback
-        try:
-            expected = self._acceptance_model.expected_accepts(float(context_length))
-            if expected > 0 and depth > 0:
-                rate = expected / max(1.0, float(depth))
-                return max(1e-6, min(0.999, rate))
-        except Exception:
-            pass
-        return fallback
+        if depth <= 0:
+            return 0.0
+        if self._acceptance_model is None:
+            raise RuntimeError("Acceptance model is required but was not initialised")
+        expected = self._acceptance_model.expected_accepts(float(context_length))
+        depth_f = max(1.0, float(depth))
+        rate = expected / depth_f if depth_f > 0 else 0.0
+        return max(0.0, min(1.0, float(rate)))
+
 
     def _simulate_verification(self, tokens: int, conn: ConnectionParams, context_length: int) -> VerifyResult:
         """Simulate target verification of draft tokens."""
         tokens = max(0, int(tokens))
         if tokens == 0:
             return VerifyResult(chunk_id=self.chunks_sent, accepted_tokens=0, rejected_tokens=0, total_tokens=0)
+        if self._acceptance_model is None:
+            raise RuntimeError("Acceptance model is required but was not initialised")
         accepted = 0
-        probabilities = None
-        if self._acceptance_model is not None:
-            try:
-                probabilities = self._acceptance_model.position_probabilities(
-                    context_length=float(context_length),
-                    depth=tokens,
-                    default=self._effective_acceptance_rate(conn, context_length, tokens),
-                )
-            except Exception:
-                probabilities = None
-        if probabilities:
-            for prob in probabilities:
-                prob = max(0.0, min(1.0, float(prob)))
-                if random.random() < prob:
-                    accepted += 1
-                else:
-                    break
-        else:
-            fallback = self._effective_acceptance_rate(conn, context_length, tokens)
-            for _ in range(tokens):
-                if random.random() < fallback:
-                    accepted += 1
-                else:
-                    break
+        default_rate = self._effective_acceptance_rate(conn, context_length, tokens)
+        try:
+            probabilities = self._acceptance_model.position_probabilities(
+                context_length=float(context_length),
+                depth=tokens,
+                default=default_rate,
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                f"Acceptance model failed for chunk {self.chunks_sent} (ctx={context_length}, tokens={tokens})"
+            ) from exc
+        if not probabilities:
+            raise RuntimeError(
+                f"Acceptance model returned no probabilities for chunk {self.chunks_sent} (ctx={context_length}, tokens={tokens})"
+            )
+        if self.cfg.verbose:
+            sample = probabilities[: min(len(probabilities), 8)]
+            sample_str = ", ".join(f"{p:.3f}" for p in sample)
+            ellipsis = ", ..." if len(probabilities) > len(sample) else ""
+            print(
+                f"[{self.env.now:.1f}ms] Draft {self.id}: acceptance probs for chunk {self.chunks_sent} (ctx={context_length}, tokens={tokens}) => [{sample_str}{ellipsis}] (baseline={default_rate:.3f})",
+                flush=True,
+            )
+        for prob in probabilities:
+            prob = max(0.0, min(1.0, float(prob)))
+            if random.random() < prob:
+                accepted += 1
+            else:
+                break
         rejected = tokens - accepted
         return VerifyResult(
             chunk_id=self.chunks_sent,
@@ -3223,6 +3225,11 @@ def load_config(path: str) -> Config:
         acceptance_model_path=str(acceptance_model) if acceptance_model else None,
         acceptance_config=acceptance_cfg,
     )
+    if not cfg.think_time.enabled:
+        raise ValueError("Think time must be enabled for closed-loop operation")
+    if str(cfg.execution_mode).lower() != 'blocking':
+        raise ValueError("Execution mode must be 'blocking' for closed-loop operation")
+
     return cfg
 
 def heartbeat_monitor(env: simpy.Environment, metrics: Metrics, targets: List[TargetServer], cfg, interval_ms: float = 1000):
@@ -3312,16 +3319,15 @@ def build(env: simpy.Environment, cfg: Config):
             if d.get("id"):
                 draft_cluster_map[str(d["id"])] = str(d.get("cluster", "default"))
 
-    acceptance_model = None
-    if cfg.acceptance_model_path:
-        try:
-            acceptance_model = AcceptanceRegressor.from_file(cfg.acceptance_model_path)
-            if cfg.verbose:
-                meta = getattr(acceptance_model, 'metadata', {}).get('name') or cfg.acceptance_model_path
-                print(f"Loaded acceptance model: {meta}", flush=True)
-        except Exception as exc:
-            print("Warning: failed to load acceptance model '{}': {}. Falling back to default acceptance heuristics.".format(cfg.acceptance_model_path, exc), flush=True)
-            acceptance_model = None
+    if not cfg.acceptance_model_path:
+        raise RuntimeError('Acceptance model path is required for simulation')
+    try:
+        acceptance_model = AcceptanceRegressor.from_file(cfg.acceptance_model_path)
+        if cfg.verbose:
+            meta = getattr(acceptance_model, 'metadata', {}).get('name') or cfg.acceptance_model_path
+            print(f"Loaded acceptance model: {meta}", flush=True)
+    except Exception as exc:
+        raise RuntimeError(f"Failed to load acceptance model '{cfg.acceptance_model_path}': {exc}") from exc
 
     draft_ids: List[str] = []
     drafts_by_tier: Dict[str, List[str]] = defaultdict(list)

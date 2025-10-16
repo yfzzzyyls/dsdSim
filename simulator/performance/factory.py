@@ -6,7 +6,6 @@ from dataclasses import dataclass, field
 from typing import Dict, Optional
 
 from .base import PerformanceProvider
-from .default_provider import DefaultPerformanceProvider
 from .vidur_provider import VidurPerformanceProvider, VidurProviderConfig
 
 
@@ -18,21 +17,23 @@ class PerformanceModelConfig:
 
 def create_performance_provider(config: PerformanceModelConfig) -> PerformanceProvider:
     provider_type = (config.type or "default").lower()
-    if provider_type == "vidur":
-        vidur_cfg = VidurProviderConfig(
-            binary=_optional_str(config.vidur.get("binary")),
-            cache_path=_optional_path(config.vidur.get("cache_path")),
-            default_dtype=str(config.vidur.get("dtype", "fp16")),
-            table_path=_optional_path(config.vidur.get("table_path")),
-            default_latency_ms=_optional_float(config.vidur.get("default_latency_ms"), 50.0),
-            neighbors=_optional_int(config.vidur.get("neighbors"), 3),
-            prefer_exact=_optional_bool(config.vidur.get("prefer_exact"), True),
-            bootstrap_defaults=_optional_bool(config.vidur.get("bootstrap_defaults"), True),
-            realtime_enabled=_optional_bool(config.vidur.get("realtime_enabled"), False),
-            realtime_cache_dir=_optional_path(config.vidur.get("realtime_cache_dir")),
-        )
-        return VidurPerformanceProvider(vidur_cfg)
-    return DefaultPerformanceProvider()
+    if provider_type != "vidur":
+        raise ValueError("Performance model must be VIDUR with realtime enabled; fallbacks are disallowed")
+    vidur_cfg = VidurProviderConfig(
+        binary=_optional_str(config.vidur.get("binary")),
+        cache_path=_optional_path(config.vidur.get("cache_path")),
+        default_dtype=str(config.vidur.get("dtype", "fp16")),
+        table_path=_optional_path(config.vidur.get("table_path")),
+        default_latency_ms=_optional_float(config.vidur.get("default_latency_ms"), 50.0),
+        neighbors=_optional_int(config.vidur.get("neighbors"), 3),
+        prefer_exact=_optional_bool(config.vidur.get("prefer_exact"), True),
+        bootstrap_defaults=_optional_bool(config.vidur.get("bootstrap_defaults"), True),
+        realtime_enabled=_optional_bool(config.vidur.get("realtime_enabled"), False),
+        realtime_cache_dir=_optional_path(config.vidur.get("realtime_cache_dir")),
+    )
+    if not vidur_cfg.realtime_enabled:
+        raise ValueError("VIDUR realtime predictions must be enabled; synthetic fallbacks are not permitted")
+    return VidurPerformanceProvider(vidur_cfg)
 
 
 def _optional_str(value):

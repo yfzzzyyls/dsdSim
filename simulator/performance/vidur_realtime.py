@@ -45,23 +45,23 @@ else:
 
 
 _DEVICE_ALIAS = {
-    "a40": "DeviceSKUType.A40",
-    "a100": "DeviceSKUType.A100",
-    "h100": "DeviceSKUType.H100",
+    "a40": "a40",
+    "a100": "a100",
+    "h100": "h100",
 }
 
 _NODE_ALIAS = {
-    "a40_pairwise_nvlink": "NodeSKUType.A40_PAIRWISE_NVLINK",
-    "a100_pairwise_nvlink": "NodeSKUType.A100_PAIRWISE_NVLINK",
-    "h100_pairwise_nvlink": "NodeSKUType.H100_PAIRWISE_NVLINK",
-    "a100_dgx": "NodeSKUType.A100_DGX",
-    "h100_dgx": "NodeSKUType.H100_DGX",
+    "a40_pairwise_nvlink": "a40_pairwise_nvlink",
+    "a100_pairwise_nvlink": "a100_pairwise_nvlink",
+    "h100_pairwise_nvlink": "h100_pairwise_nvlink",
+    "a100_dgx": "a100_dgx",
+    "h100_dgx": "h100_dgx",
 }
 
 _DEFAULT_NODE = {
-    "DeviceSKUType.A40": "NodeSKUType.A40_PAIRWISE_NVLINK",
-    "DeviceSKUType.A100": "NodeSKUType.A100_PAIRWISE_NVLINK",
-    "DeviceSKUType.H100": "NodeSKUType.H100_PAIRWISE_NVLINK",
+    "a40": "a40_pairwise_nvlink",
+    "a100": "a100_pairwise_nvlink",
+    "h100": "h100_pairwise_nvlink",
 }
 
 
@@ -105,7 +105,7 @@ class VidurRealtimeRunner:
         predictor = self._get_predictor(profile)
         batch = self._build_batch(request, profile)
         if batch is None:
-            return None
+            raise RuntimeError("VIDUR realtime runner could not build a batch for the given request")
 
         execution_time = predictor.get_execution_time(batch, pipeline_stage=0)
         latency_ms = execution_time.total_time * 1000.0
@@ -116,6 +116,20 @@ class VidurRealtimeRunner:
     # ------------------------------------------------------------------
     # Predictor initialisation helpers
     # ------------------------------------------------------------------
+
+    def validate_profile(self, profile: Mapping[str, Any]) -> None:
+        device = self._resolve_device(profile.get('device'))
+        node = self._resolve_node(profile.get('network_device'), profile.get('device'))
+        model_name = str(profile.get('model_name') or '').strip()
+        if not model_name:
+            raise ValueError('vidur profile must include `model_name`')
+        ReplicaConfig(
+            model_name=model_name,
+            tensor_parallel_size=int(profile.get('tensor_parallel', 1)),
+            num_pipeline_stages=int(profile.get('pipeline_parallel', 1)),
+            device=device,
+            network_device=node,
+        )
 
     def _extract_profile(self, target_info: Mapping[str, Any]) -> Optional[Mapping[str, Any]]:
         if isinstance(target_info, dict):
@@ -164,18 +178,18 @@ class VidurRealtimeRunner:
         scheduler_config = SarathiSchedulerConfig(chunk_size=key.chunk_size)
 
         predictor_config = RandomForrestExecutionTimePredictorConfig(
-            compute_input_file=self._format_path("data/profiling/compute/{DEVICE}/{MODEL}/mlp.csv"),
+            compute_input_file=self._format_path(f"data/profiling/compute/{key.device}/{key.model}/mlp.csv"),
             attention_input_file=self._format_path(
-                "data/profiling/compute/{DEVICE}/{MODEL}/attention.csv"
+                f"data/profiling/compute/{key.device}/{key.model}/attention.csv"
             ),
             all_reduce_input_file=self._format_path(
-                "data/profiling/network/{NETWORK_DEVICE}/all_reduce.csv"
+                f"data/profiling/network/{key.node}/all_reduce.csv"
             ),
             send_recv_input_file=self._format_path(
-                "data/profiling/network/{NETWORK_DEVICE}/send_recv.csv"
+                f"data/profiling/network/{key.node}/send_recv.csv"
             ),
             cpu_overhead_input_file=self._format_path(
-                "data/profiling/cpu_overhead/{NETWORK_DEVICE}/{MODEL}/cpu_overheads.csv"
+                f"data/profiling/cpu_overhead/{key.node}/{key.model}/cpu_overheads.csv"
             ),
             no_cache=False,
         )
@@ -203,17 +217,34 @@ class VidurRealtimeRunner:
         return predictor
 
     def _format_path(self, relative: str) -> str:
-        return str(self._vidur_root / relative)
+        primary = self._vidur_root / relative
+        alt_root = self._vidur_root.parents[1] / 'profiling_assets' / 'vidur'
+        if relative.startswith('data/'):
+            alt_rel = relative[len('data/'):]
+        else:
+            alt_rel = relative
+        alternate = alt_root / alt_rel
+        if primary.exists():
+            return str(primary)
+        if alternate.exists():
+            return str(alternate)
+        if 'cpu_overhead' in relative:
+            # Optional in many profiles; allow downstream skip logic to handle it
+            return str(alternate if relative.startswith('data/') else primary)
+        raise FileNotFoundError(f"VIDUR profiling asset missing: {primary} (also checked {alternate})")
+
 
     def _resolve_device(self, value: Any) -> str:
         if value is None:
             raise ValueError("vidur profile must include a `device`")
         text = str(value).strip()
         if text.startswith("DeviceSKUType."):
-            return text
-        alias = _DEVICE_ALIAS.get(text.lower())
-        if alias:
-            return alias
+            text = text.split(".", 1)[1]
+        normalized = text.lower()
+        if normalized in _DEVICE_ALIAS:
+            return _DEVICE_ALIAS[normalized]
+        if normalized in _DEVICE_ALIAS.values():
+            return normalized
         raise ValueError(f"Unsupported VIDUR device alias: {value}")
 
     def _resolve_node(self, value: Any, device_hint: Any) -> str:
@@ -224,10 +255,12 @@ class VidurRealtimeRunner:
             raise ValueError("Unable to infer VIDUR network device; specify `network_device` explicitly")
         text = str(value).strip()
         if text.startswith("NodeSKUType."):
-            return text
-        alias = _NODE_ALIAS.get(text.lower())
-        if alias:
-            return alias
+            text = text.split(".", 1)[1]
+        normalized = text.lower()
+        if normalized in _NODE_ALIAS:
+            return _NODE_ALIAS[normalized]
+        if normalized in _NODE_ALIAS.values():
+            return normalized
         raise ValueError(f"Unsupported VIDUR network alias: {value}")
 
     # ------------------------------------------------------------------

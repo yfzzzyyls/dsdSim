@@ -1,13 +1,13 @@
 # Trace-driven variant of baseline.yaml for GSM8K workloads
 sim_time_ms: 150000
 seed: 123
-verbose: false
+verbose: true
 debug: false
 
 speculation:
   framework: vanilla
   execution_mode: distributed
-  acceptance_model: simulator/acceptance/llama2_7b_vs_70b.joblib
+  acceptance_model: acceptance/llama2_7b_vs_70b.joblib
 
 execution_mode: blocking
 gamma: 4
@@ -55,7 +55,6 @@ scheduler:
     global_pool:
       clusters:
         - llama
-        - qwen
   prefill:
     pool: global_pool
     queue_policy: priority
@@ -102,10 +101,10 @@ auto_topology:
       router: semi_clairvoyant
       router_params: {}
       targets:
-        count: 10
+        count: 20
         tiers:
           - name: llama_a100
-            count: 5
+            count: 10
             model: llama-2-70b
             gpu: A100
             weight: 1.6
@@ -120,7 +119,7 @@ auto_topology:
               scheduler: sarathi
               chunk_size: 512
           - name: llama_h100
-            count: 5
+            count: 10
             model: llama-2-70b
             gpu: H100
             weight: 1.9
@@ -174,79 +173,3 @@ auto_topology:
         link_jitter_pct: 0.12
         drop_rate:
           llama_a40_slow: 0.006
-    - name: qwen
-      router: semi_clairvoyant
-      router_params: {}
-      targets:
-        count: 10
-        tiers:
-          - name: qwen_a100
-            count: 5
-            model: qwen-72b
-            gpu: A100
-            weight: 1.5
-            batch_window_ms: 0.36
-            batch_size: 12
-            vidur:
-              model_name: Qwen/Qwen-72B
-              device: A100
-              network_device: A100_PAIRWISE_NVLINK
-              tensor_parallel: 1
-              pipeline_parallel: 1
-              scheduler: sarathi
-              chunk_size: 512
-          - name: qwen_h100
-            count: 5
-            model: qwen-72b
-            gpu: H100
-            weight: 1.8
-            batch_window_ms: 0.31
-            batch_size: 14
-            vidur:
-              model_name: Qwen/Qwen-72B
-              device: H100
-              network_device: H100_DGX
-              tensor_parallel: 1
-              pipeline_parallel: 1
-              scheduler: sarathi
-              chunk_size: 512
-      drafts:
-        count: 40
-        capability_map:
-          0: 0.58
-          1: 0.42
-        draft_bucket_labels: [qwen_a40_high, qwen_a40_low]
-        reliability:
-          qwen_a40_high: 0.982
-          qwen_a40_low: 0.960
-        metadata_by_label:
-          qwen_a40_high:
-            hardware: A40
-            model_name: qwen-7b
-            vidur_profile:
-              model_name: Qwen/Qwen-7B
-              device: A40
-              network_device: A40_PAIRWISE_NVLINK
-              tensor_parallel: 1
-              pipeline_parallel: 1
-              scheduler: sarathi
-              chunk_size: 512
-          qwen_a40_low:
-            hardware: A40
-            model_name: qwen-7b
-            vidur_profile:
-              model_name: Qwen/Qwen-7B
-              device: A40
-              network_device: A40_PAIRWISE_NVLINK
-              tensor_parallel: 1
-              pipeline_parallel: 1
-              scheduler: sarathi
-              chunk_size: 512
-      connectivity:
-        fanout_per_draft: 4
-        net_ms_ranges:
-          qwen_a100: [7.0, 12.5]
-          qwen_h100: [5.4, 9.4]
-        link_jitter_pct: 0.14
-        drop_rate:
-          qwen_a40_low: 0.008

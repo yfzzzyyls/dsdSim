@@ -191,24 +191,12 @@ class VidurPerformanceProvider(PerformanceProvider):
             if config.realtime_enabled
             else None
         )
+        if self._realtime_runner is None:
+            raise RuntimeError("VIDUR realtime runner is required but was not initialised")
         if config.cache_path:
             config.cache_path.parent.mkdir(parents=True, exist_ok=True)
 
         oracle = config.oracle
-        if oracle is None and _VidurOracle is not None and (config.table_path or config.bootstrap_defaults):
-            try:
-                oracle = _VidurOracle(
-                    table_path=str(config.table_path) if config.table_path else None,
-                    default_latency_ms=config.default_latency_ms,
-                    neighbors=max(1, config.neighbors),
-                    prefer_exact=config.prefer_exact,
-                    bootstrap_defaults=config.bootstrap_defaults,
-                )
-            except FileNotFoundError:
-                oracle = None
-
-        if oracle is None:
-            oracle = SyntheticVidurOracle(default_latency_ms=config.default_latency_ms)
         self._oracle = oracle
 
     def register_target(
@@ -223,14 +211,17 @@ class VidurPerformanceProvider(PerformanceProvider):
             "model": model,
             "hardware": hardware,
         }
-        if metadata:
-            record["metadata"] = dict(metadata)
-            vidur_profile = metadata.get("vidur") or metadata.get("vidur_profile")
-            if vidur_profile:
-                record["vidur_profile"] = dict(vidur_profile)
-            draft_profile = metadata.get("fused_draft_profile")
-            if draft_profile:
-                record["fused_draft_profile"] = dict(draft_profile)
+        if not metadata:
+            raise ValueError(f"Target {target_id} metadata must include VIDUR profiling information")
+        record["metadata"] = dict(metadata)
+        vidur_profile = metadata.get("vidur") or metadata.get("vidur_profile")
+        if not isinstance(vidur_profile, Mapping):
+            raise ValueError(f"Target {target_id} metadata must include a `vidur` or `vidur_profile` mapping")
+        record["vidur_profile"] = dict(vidur_profile)
+        self._realtime_runner.validate_profile(record["vidur_profile"])
+        draft_profile = metadata.get("fused_draft_profile")
+        if draft_profile:
+            record["fused_draft_profile"] = dict(draft_profile)
         self._targets[target_id] = record
 
     def get_metrics(self, request: PhaseRequest) -> Optional[PhaseMetrics]:
@@ -282,30 +273,18 @@ class VidurPerformanceProvider(PerformanceProvider):
     # ------------------------------------------------------------------
 
     def _invoke_vidur(self, request: PhaseRequest) -> Optional[PhaseMetrics]:
+        if self._realtime_runner is None:
+            raise RuntimeError("VIDUR realtime runner is required but unavailable")
         target_info = self._targets.get(request.target_id or "")
-        if self._realtime_runner is not None and target_info is not None:
-            try:
-                realtime_metrics = self._realtime_runner.predict(request, target_info)
-            except Exception as exc:  # pragma: no cover - diagnostic path
-                logger.debug("VIDUR realtime prediction failed: %s", exc, exc_info=logger.isEnabledFor(logging.DEBUG))
-            else:
-                if realtime_metrics is not None:
-                    return realtime_metrics
-
-        if isinstance(self._oracle, SyntheticVidurOracle):
-            return self._oracle.predict(request, target_info)  # type: ignore[arg-type]
-
-        if self._oracle is not None:
-            metrics = self._call_vidur_oracle(request)
-            if metrics is not None:
-                return metrics
-        if vidur is not None:
-            return self._call_vidur_python(request)
-        if self._config.binary:
-            return self._call_vidur_cli(request)
-        raise RuntimeError(
-            "VIDUR provider requires either the `vidur` Python package, vidur_integration oracle, or a CLI binary."
-        )
+        if target_info is None:
+            raise RuntimeError("VIDUR target metadata missing for realtime prediction; ensure targets register VIDUR profiles")
+        try:
+            metrics = self._realtime_runner.predict(request, target_info)
+        except Exception as exc:  # pragma: no cover - escalate for visibility
+            raise RuntimeError("VIDUR realtime prediction failed") from exc
+        if metrics is None:
+            raise RuntimeError("VIDUR realtime prediction returned no metrics")
+        return metrics
 
     def _call_vidur_python(self, request: PhaseRequest) -> Optional[PhaseMetrics]:
         if request.phase == "prefill":
