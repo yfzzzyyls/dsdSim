@@ -82,6 +82,7 @@ class SyntheticTraceConfig:
     assign_request_ids: bool = True
     request_id_prefix: str = "req"
     assign_request_seeds: bool = True
+    assign_draft_ids: bool = True
     seed: Optional[int] = None
 
     def __post_init__(self) -> None:
@@ -142,7 +143,7 @@ class SyntheticTraceGenerator:
                 arrival_ms=arrival,
                 prompt_tokens=prompt_tokens,
                 target_tokens=target_tokens,
-                draft_id=device.draft_id,
+                draft_id=device.draft_id if cfg.assign_draft_ids else None,
                 device_tier=device.device_tier,
                 slo_class=cfg.default_slo_class,
                 mode_hint=cfg.default_mode_hint,
@@ -205,7 +206,26 @@ def build_device_mix_from_specs(
         if not math.isfinite(weight) or weight <= 0:
             weight = default_weight
 
-        mix.append(DeviceClassWeight(weight=weight, draft_id=draft_id))
+        tier = (
+            spec.get("device_tier")
+            or spec.get("tier")
+            or spec.get("label")
+            or spec.get("bucket")
+        )
+        meta = spec.get("metadata") if isinstance(spec.get("metadata"), Mapping) else {}
+        if tier is None and meta:
+            tier = (
+                meta.get("device_tier")
+                or meta.get("tier")
+                or meta.get("bucket")
+                or meta.get("label")
+                or meta.get("model_name")
+                or meta.get("model")
+                or meta.get("hardware")
+            )
+        device_tier = str(tier) if tier is not None else None
+
+        mix.append(DeviceClassWeight(weight=weight, draft_id=draft_id, device_tier=device_tier))
 
     if not mix:
         raise ValueError("no draft devices found while building device mix")

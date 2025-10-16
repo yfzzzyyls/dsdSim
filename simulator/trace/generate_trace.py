@@ -111,6 +111,7 @@ def main() -> None:
     parser.add_argument("--default-slo", default=None, help="Default SLO class to embed in trace records")
     parser.add_argument("--default-mode", default=None, help="Default mode hint to embed in trace records")
     parser.add_argument("--metadata", nargs="*", default=[], help="Additional metadata entries (KEY=VALUE)")
+    parser.add_argument("--omit-draft-ids", action="store_true", help="Emit device tiers without binding records to specific draft IDs.")
 
     args = parser.parse_args()
 
@@ -156,6 +157,7 @@ def main() -> None:
         assign_request_ids=not args.no_request_ids,
         request_id_prefix=args.request_prefix,
         assign_request_seeds=not args.no_assign_seeds,
+        assign_draft_ids=not args.omit_draft_ids,
         seed=args.seed if args.seed is not None else cfg.seed,
     )
 

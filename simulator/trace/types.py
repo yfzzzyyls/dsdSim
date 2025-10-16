@@ -103,6 +103,11 @@ class TraceRecord:
             merged.setdefault(key, value)
         return TraceRecord.from_dict(merged)
 
+    def with_draft(self, draft_id: str) -> "TraceRecord":
+        payload = self.to_dict()
+        payload["draft_id"] = draft_id
+        return TraceRecord.from_dict(payload)
+
 
 def _coerce_float(value: Any, field_name: str) -> float:
     if value is None:

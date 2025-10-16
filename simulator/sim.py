@@ -18,6 +18,7 @@ from network.topology import build_latency_lookup, NetworkModelError
 from network.fabric import NetworkFabric
 from trace.trace_loader import iter_trace_records
 from trace.types import TraceRecord, TraceParseError
+from acceptance.regressor import AcceptanceRegressor
 
 # ---------- Config & Types ----------
 
@@ -50,7 +51,7 @@ class ConnectionParams:
     target_id: str
     forward_latency_ms: float         # draft -> target latency
     response_latency_ms: float        # target -> draft latency
-    acceptance_rate: float            # probability each token is accepted
+    acceptance_rate: Optional[float] = None  # fallback acceptance probability when no model
     cluster: str = "default"
     network_forward_key: Optional[Tuple[str, str]] = None
     network_response_key: Optional[Tuple[str, str]] = None
@@ -165,6 +166,8 @@ class Config:
     speculation_framework: str = "vanilla"
     speculation_execution_mode: str = "distributed"
     speculation_config: Dict[str, Any] = field(default_factory=dict)
+    acceptance_model_path: Optional[str] = None
+    acceptance_config: Dict[str, Any] = field(default_factory=dict)
     network_config: Dict[str, Any] = field(default_factory=dict)
     network_enabled: bool = True
 
@@ -575,20 +578,75 @@ def get_typical_verify_ms(target_config: dict, gamma: int = 4) -> float:
 class TraceSchedule:
     """Distribute trace records across drafts for replay."""
 
-    def __init__(self, records: Sequence[TraceRecord], known_drafts: Sequence[str]):
+    _COHORT_META_KEYS = ("client_id", "user_id", "session_id", "session", "cohort", "trace_client", "device_id")
+
+    def __init__(
+        self,
+        records: Sequence[TraceRecord],
+        known_drafts: Sequence[str],
+        *,
+        drafts_by_tier: Optional[Mapping[str, Sequence[str]]] = None,
+    ) -> None:
         self._by_draft: Dict[str, List[TraceRecord]] = defaultdict(list)
+        self._cohort_assignments: Dict[str, str] = {}
         self.max_arrival_ms = 0.0
-        known = set(known_drafts)
-        for record in records:
+
+        ordered_known = list(dict.fromkeys(known_drafts))
+        known_set = set(ordered_known)
+
+        tier_candidates: Dict[str, List[str]] = {}
+        if drafts_by_tier:
+            for tier, drafts in drafts_by_tier.items():
+                filtered = [draft for draft in drafts if draft in known_set]
+                if filtered:
+                    tier_candidates[str(tier)] = list(filtered)
+
+        tier_rr: Dict[str, int] = {}
+        fallback_candidates = ordered_known
+
+        for idx, record in enumerate(records):
+            resolved = record
             draft_id = record.draft_id
             if draft_id is None:
-                raise TraceParseError("trace playback requires draft_id for each record")
-            if draft_id not in known:
-                raise TraceParseError(f"trace references unknown draft_id '{draft_id}'")
-            self._by_draft[draft_id].append(record)
-            self.max_arrival_ms = max(self.max_arrival_ms, record.arrival_ms)
+                tier = record.device_tier
+                if tier is None:
+                    raise TraceParseError("trace playback requires draft_id or device_tier for each record")
+                tier_str = str(tier)
+                candidates = tier_candidates.get(tier_str)
+                if candidates is None:
+                    candidates = fallback_candidates
+                    if not candidates:
+                        raise TraceParseError("trace playback has no drafts to assign records to")
+                cohort_key = self._cohort_key(tier_str, record, idx)
+                assigned = self._cohort_assignments.get(cohort_key)
+                if assigned is None:
+                    pos = tier_rr.get(tier_str, 0)
+                    assigned = candidates[pos % len(candidates)]
+                    tier_rr[tier_str] = pos + 1
+                    self._cohort_assignments[cohort_key] = assigned
+                draft_id = assigned
+                resolved = record.with_draft(draft_id)
+            else:
+                if draft_id not in known_set:
+                    raise TraceParseError(f"trace references unknown draft_id '{draft_id}'")
+            self._by_draft[draft_id].append(resolved)
+            self.max_arrival_ms = max(self.max_arrival_ms, resolved.arrival_ms)
+
         for recs in self._by_draft.values():
             recs.sort(key=lambda r: r.arrival_ms)
+
+    @classmethod
+    def _cohort_key(cls, tier: str, record: TraceRecord, index: int) -> str:
+        meta = record.metadata or {}
+        if isinstance(meta, Mapping):
+            for key in cls._COHORT_META_KEYS:
+                if key in meta and meta[key] is not None:
+                    return f"{tier}:{meta[key]}"
+        if record.request_id:
+            return f"{tier}:{record.request_id}"
+        if record.seed is not None:
+            return f"{tier}:seed:{record.seed}"
+        return f"{tier}:rr:{index}"
 
     def for_draft(self, draft_id: str) -> Sequence[TraceRecord]:
         return list(self._by_draft.get(draft_id, []))
@@ -972,7 +1030,8 @@ class DraftServer:
                  connections: Dict[str, ConnectionParams] = None, total_capability: float = 1.0,
                  metrics: Metrics = None, scheduler: Optional["Scheduler"] = None,
                  trace_records: Optional[Sequence[TraceRecord]] = None,
-                 performance_provider=None, network: Optional[NetworkFabric] = None):
+                 performance_provider=None, network: Optional[NetworkFabric] = None,
+                 acceptance_model: Optional[AcceptanceRegressor] = None):
         self.env = env
         self.p = params
         self.id = params.id
@@ -987,6 +1046,7 @@ class DraftServer:
         self.metrics = metrics  # Reference to global metrics
         self.performance = performance_provider
         self.metadata = params.metadata
+        self._acceptance_model = acceptance_model
         self.execution_mode = getattr(cfg, "speculation_execution_mode", "distributed").lower()
         self.framework = getattr(cfg, "speculation_framework", "vanilla").lower()
         self._workload_enabled = bool(cfg.workload.rate_rps > 0) if cfg and cfg.workload else False
@@ -1150,22 +1210,60 @@ class DraftServer:
         target_id = target.p.id
         return target_id, self.connections[target_id]
     
-    def _simulate_verification(self, tokens: int, acceptance_rate: float) -> VerifyResult:
-        """Simulate target verification of draft tokens"""
+    def _effective_acceptance_rate(self, conn: ConnectionParams, context_length: int, depth: int) -> float:
+        fallback = conn.acceptance_rate if conn.acceptance_rate is not None else 0.6
+        try:
+            fallback = float(fallback)
+        except (TypeError, ValueError):
+            fallback = 0.6
+        fallback = max(1e-6, min(0.999, fallback))
+        if self._acceptance_model is None or depth <= 0:
+            return fallback
+        try:
+            expected = self._acceptance_model.expected_accepts(float(context_length))
+            if expected > 0 and depth > 0:
+                rate = expected / max(1.0, float(depth))
+                return max(1e-6, min(0.999, rate))
+        except Exception:
+            pass
+        return fallback
+
+    def _simulate_verification(self, tokens: int, conn: ConnectionParams, context_length: int) -> VerifyResult:
+        """Simulate target verification of draft tokens."""
+        tokens = max(0, int(tokens))
+        if tokens == 0:
+            return VerifyResult(chunk_id=self.chunks_sent, accepted_tokens=0, rejected_tokens=0, total_tokens=0)
         accepted = 0
-        for i in range(tokens):
-            if random.random() < acceptance_rate:
-                accepted += 1
-            else:
-                # First rejection stops acceptance
-                break
-        
+        probabilities = None
+        if self._acceptance_model is not None:
+            try:
+                probabilities = self._acceptance_model.position_probabilities(
+                    context_length=float(context_length),
+                    depth=tokens,
+                    default=self._effective_acceptance_rate(conn, context_length, tokens),
+                )
+            except Exception:
+                probabilities = None
+        if probabilities:
+            for prob in probabilities:
+                prob = max(0.0, min(1.0, float(prob)))
+                if random.random() < prob:
+                    accepted += 1
+                else:
+                    break
+        else:
+            fallback = self._effective_acceptance_rate(conn, context_length, tokens)
+            for _ in range(tokens):
+                if random.random() < fallback:
+                    accepted += 1
+                else:
+                    break
         rejected = tokens - accepted
         return VerifyResult(
             chunk_id=self.chunks_sent,
             accepted_tokens=accepted,
             rejected_tokens=rejected,
-            total_tokens=tokens
+            total_tokens=tokens,
         )
 
     def _predict_generation_latency(self, tokens: int, context_length: int) -> float:
@@ -1255,8 +1353,8 @@ class DraftServer:
             fallback_latency_ms=float(latency_ms),
         )
 
-    def _estimate_branch_score(self, depth: int, conn: ConnectionParams) -> float:
-        base = max(1e-6, min(0.999, float(conn.acceptance_rate)))
+    def _estimate_branch_score(self, depth: int, conn: ConnectionParams, context_length: int) -> float:
+        base = self._effective_acceptance_rate(conn, context_length, depth)
         return base ** max(1, depth)
 
     def _run_eagle_conversation(
@@ -1383,7 +1481,7 @@ class DraftServer:
                 if generation_latency > 0:
                     yield self.env.timeout(generation_latency)
                 generation_latency_total += generation_latency
-                score = self._estimate_branch_score(branch_depth, conn)
+                score = self._estimate_branch_score(branch_depth, conn, current_context_len)
                 candidates.append(BranchCandidate(idx, branch_depth, score))
                 self.total_tokens_generated += branch_depth
                 tokens_generated += branch_depth
@@ -1456,7 +1554,10 @@ class DraftServer:
                 if ttft_pending:
                     ttft_breakdown["decode_response_ms"] += response_elapsed
 
-                result = self._simulate_verification(candidate.depth, conn.acceptance_rate)
+                result = self._simulate_verification(
+                    candidate.depth,
+                    conn,
+                    prompt_length + tokens_generated + candidate.depth)
                 self.total_tokens_accepted += result.accepted_tokens
                 self.total_tokens_rejected += result.rejected_tokens
 
@@ -1718,11 +1819,11 @@ class DraftServer:
                         generation_latency = 0.0
                     else:
                         generation_latency = self._predict_generation_latency(tokens_this_round, current_context)
-                if generation_latency > 0:
-                    yield self.env.timeout(generation_latency)
-                decode_breakdown["generation_ms"] += generation_latency
-                if ttft_pending:
-                    ttft_breakdown["decode_generation_ms"] += generation_latency
+                    if generation_latency > 0:
+                        yield self.env.timeout(generation_latency)
+                    decode_breakdown["generation_ms"] += generation_latency
+                    if ttft_pending:
+                        ttft_breakdown["decode_generation_ms"] += generation_latency
 
                     self.chunks_sent += 1
                     self.total_tokens_generated += tokens_this_round
@@ -1750,22 +1851,22 @@ class DraftServer:
                     )
 
                     # Send chunk to target (forward latency)
-                decode_payload = self._estimate_payload_bytes(tokens_this_round, self._decode_overhead_bytes)
-                if fused_mode:
-                    forward_elapsed = 0.0
-                else:
-                    fwd_chunk_start = self.env.now
-                    yield self._network_transfer(
-                        self.id,
-                        target_id,
-                        conn.forward_latency_ms,
-                        payload_bytes=decode_payload,
-                        link_key=conn.network_forward_key,
-                    )
-                    forward_elapsed = self.env.now - fwd_chunk_start
-                decode_breakdown["forward_ms"] += forward_elapsed
-                if ttft_pending:
-                    ttft_breakdown["decode_forward_ms"] += forward_elapsed
+                    decode_payload = self._estimate_payload_bytes(tokens_this_round, self._decode_overhead_bytes)
+                    if fused_mode:
+                        forward_elapsed = 0.0
+                    else:
+                        fwd_chunk_start = self.env.now
+                        yield self._network_transfer(
+                            self.id,
+                            target_id,
+                            conn.forward_latency_ms,
+                            payload_bytes=decode_payload,
+                            link_key=conn.network_forward_key,
+                        )
+                        forward_elapsed = self.env.now - fwd_chunk_start
+                    decode_breakdown["forward_ms"] += forward_elapsed
+                    if ttft_pending:
+                        ttft_breakdown["decode_forward_ms"] += forward_elapsed
 
                     # Job arrives at target after network delay (or immediately in fused mode)
                     job.created_ms = self.env.now
@@ -1773,11 +1874,13 @@ class DraftServer:
                     if fused_mode:
                         if target_server is None:
                             print(f"Warning: Target {target_id} not found for draft {self.id}", flush=True)
+                            conversation_completed = True
                             break
                         wait_event = target_server.fused_execute(job)
                     elif self.scheduler is None:
                         if target_server is None:
                             print(f"Warning: Target {target_id} not found for draft {self.id}", flush=True)
+                            conversation_completed = True
                             break
                         target_server.enqueue(job)
                         wait_event = decode_completion
@@ -1785,41 +1888,44 @@ class DraftServer:
                         wait_event = self.scheduler.submit_job(job)
 
                     # Wait for actual job completion instead of synthetic sleep
-                yield wait_event
+                    yield wait_event
 
-                # Wait for response to travel back
-                response_payload = self._estimate_payload_bytes(tokens_this_round, self._response_overhead_bytes)
-                if fused_mode:
-                    response_elapsed = 0.0
-                else:
-                    rsp_chunk_start = self.env.now
-                    yield self._network_transfer(
-                        target_id,
-                        self.id,
-                        conn.response_latency_ms,
-                        payload_bytes=response_payload,
-                        link_key=conn.network_response_key,
-                    )
-                    response_elapsed = self.env.now - rsp_chunk_start
-                decode_breakdown["response_ms"] += response_elapsed
-                if ttft_pending:
-                    ttft_breakdown["decode_response_ms"] += response_elapsed
+                    # Wait for response to travel back
+                    response_payload = self._estimate_payload_bytes(tokens_this_round, self._response_overhead_bytes)
+                    if fused_mode:
+                        response_elapsed = 0.0
+                    else:
+                        rsp_chunk_start = self.env.now
+                        yield self._network_transfer(
+                            target_id,
+                            self.id,
+                            conn.response_latency_ms,
+                            payload_bytes=response_payload,
+                            link_key=conn.network_response_key,
+                        )
+                        response_elapsed = self.env.now - rsp_chunk_start
+                    decode_breakdown["response_ms"] += response_elapsed
+                    if ttft_pending:
+                        ttft_breakdown["decode_response_ms"] += response_elapsed
 
-                # Mark RTT end after response received
-                job.rtt_end_ms = self.env.now
+                    # Mark RTT end after response received
+                    job.rtt_end_ms = self.env.now
 
-                # Queue wait and compute durations
-                job_started = job.started_ms if job.started_ms is not None else job.created_ms
-                queue_wait = max(0.0, (job_started - job.created_ms) if job_started is not None else 0.0)
-                compute_ms = max(0.0, (job.finished_ms - job_started) if job_started is not None and job.finished_ms is not None else 0.0)
-                decode_breakdown["queue_ms"] += queue_wait
-                decode_breakdown["compute_ms"] += compute_ms
-                if ttft_pending:
-                    ttft_breakdown["decode_queue_ms"] += queue_wait
-                    ttft_breakdown["decode_compute_ms"] += compute_ms
+                    # Queue wait and compute durations
+                    job_started = job.started_ms if job.started_ms is not None else job.created_ms
+                    queue_wait = max(0.0, (job_started - job.created_ms) if job_started is not None else 0.0)
+                    compute_ms = max(0.0, (job.finished_ms - job_started) if job_started is not None and job.finished_ms is not None else 0.0)
+                    decode_breakdown["queue_ms"] += queue_wait
+                    decode_breakdown["compute_ms"] += compute_ms
+                    if ttft_pending:
+                        ttft_breakdown["decode_queue_ms"] += queue_wait
+                        ttft_breakdown["decode_compute_ms"] += compute_ms
 
                     # Simulate verification result
-                    result = self._simulate_verification(tokens_this_round, conn.acceptance_rate)
+                    result = self._simulate_verification(
+                        tokens_this_round,
+                        conn,
+                        current_context + tokens_this_round)
                     job.accepted_tokens = result.accepted_tokens
                     self.total_tokens_accepted += result.accepted_tokens
                     self.total_tokens_rejected += result.rejected_tokens
@@ -1829,27 +1935,31 @@ class DraftServer:
                     rtt = self.env.now - round_start
                     self.total_round_trip_time += rtt
 
-                if result.accepted_tokens > 0:
-                    per_token = rtt / max(1, result.accepted_tokens)
-                    conversation_tpot_samples.extend([per_token] * result.accepted_tokens)
-                    if first_token_time_ms is None:
-                        first_token_time_ms = self.env.now
-                        ttft_pending = False
-
-                    # Update progress for Semi-Clairvoyant router with actual acceptance
-                    if hasattr(self.router, 'update_progress'):
-                        self.router.update_progress(self.id, tokens_generated_in_conversation,
-                                                   tokens_accepted_in_conversation, answer_length)
-
-                    # Update global token metrics (only count after burn-in)
                     if self.env.now >= self.cfg.burn_in_ms:
                         self.metrics.token_metrics.total_generated_tokens += tokens_this_round
                         self.metrics.token_metrics.total_accepted_tokens += result.accepted_tokens
                         self.metrics.token_metrics.total_rejected_tokens += result.rejected_tokens
 
-                    if self.cfg.debug:
-                        print(f"[{self.env.now:.1f}ms] Draft {self.id}: Round {round_num+1} result: "
-                              f"{result.accepted_tokens}/{tokens_this_round} accepted, RTT={rtt:.1f}ms", flush=True)
+                    if result.accepted_tokens > 0:
+                        per_token = rtt / max(1, result.accepted_tokens)
+                        conversation_tpot_samples.extend([per_token] * result.accepted_tokens)
+                        if first_token_time_ms is None:
+                            first_token_time_ms = self.env.now
+                            ttft_pending = False
+
+                        # Update progress for Semi-Clairvoyant router with actual acceptance
+                        if hasattr(self.router, 'update_progress'):
+                            self.router.update_progress(self.id, tokens_generated_in_conversation,
+                                                   tokens_accepted_in_conversation, answer_length)
+
+                        if self.cfg.debug:
+                            print(f"[{self.env.now:.1f}ms] Draft {self.id}: Round {round_num+1} result: "
+                                  f"{result.accepted_tokens}/{tokens_this_round} accepted, RTT={rtt:.1f}ms", flush=True)
+
+                        if tokens_accepted_in_conversation >= answer_length:
+                            conversation_completed = True
+                            break
+
                 else:
                     conversation_completed = True
             finally:
@@ -2759,6 +2869,9 @@ def _expand_auto_topology(raw: Dict[str, Any]) -> Dict[str, Any]:
 
     spec = raw["auto_topology"]
     rng = random.Random(raw.get("seed", 0))
+    spec_exec_mode = str(raw.get("speculation", {}).get("execution_mode", "distributed")).lower()
+    network_cfg = dict(raw.get("network", {}) or {})
+    network_enabled = bool(network_cfg.get("enabled", True))
 
     def _sanitize_prefix(name: str) -> str:
         return str(name).replace(" ", "_")
@@ -2824,7 +2937,7 @@ def _expand_auto_topology(raw: Dict[str, Any]) -> Dict[str, Any]:
                     entry["vidur_profile"] = dict(tier["vidur_profile"])
                 if tier.get("draft_vidur"):
                     entry["fused_draft_profile"] = dict(tier["draft_vidur"])
-                elif cfg.speculation_execution_mode == "fused":
+                elif spec_exec_mode == "fused":
                     fused_profile = _default_fused_profile(entry)
                     if fused_profile is not None:
                         entry["fused_draft_profile"] = fused_profile
@@ -2923,18 +3036,18 @@ def _expand_auto_topology(raw: Dict[str, Any]) -> Dict[str, Any]:
         jitter_pct = float(
             conn_spec.get(
                 "link_jitter_pct",
-                cfg.network_config.get("jitter_pct", 0.0),
+                network_cfg.get("jitter_pct", 0.0),
             )
             or 0.0
         )
         drop_tbl = conn_spec.get("drop_rate", {})
         network_model_spec = None
-        if cfg.network_enabled:
+        if network_enabled:
             network_model_spec = conn_spec.get("network_model")
             if not network_model_spec:
-                network_model_spec = cfg.network_config.get("model")
+                network_model_spec = network_cfg.get("model")
         latency_lookup = None
-        if cfg.network_enabled and network_model_spec:
+        if network_enabled and network_model_spec:
             try:
                 latency_lookup = build_latency_lookup(
                     drafts=draft_entries,
@@ -3067,6 +3180,8 @@ def load_config(path: str) -> Config:
     spec_cfg = dict(raw.get("speculation", {}) or {})
     framework = str(spec_cfg.get("framework", "vanilla")).lower()
     execution_mode = str(spec_cfg.get("execution_mode", "distributed")).lower()
+    acceptance_cfg = dict(spec_cfg.get("acceptance", {}) or {})
+    acceptance_model = spec_cfg.get("acceptance_model") or acceptance_cfg.get("model") or acceptance_cfg.get("file")
     cfg = Config(
         sim_time_ms=raw.get("sim_time_ms", 10_000),
         seed=raw.get("seed", 0),
@@ -3105,6 +3220,8 @@ def load_config(path: str) -> Config:
         speculation_framework=framework,
         speculation_execution_mode=execution_mode,
         speculation_config=spec_cfg,
+        acceptance_model_path=str(acceptance_model) if acceptance_model else None,
+        acceptance_config=acceptance_cfg,
     )
     return cfg
 
@@ -3195,12 +3312,43 @@ def build(env: simpy.Environment, cfg: Config):
             if d.get("id"):
                 draft_cluster_map[str(d["id"])] = str(d.get("cluster", "default"))
 
+    acceptance_model = None
+    if cfg.acceptance_model_path:
+        try:
+            acceptance_model = AcceptanceRegressor.from_file(cfg.acceptance_model_path)
+            if cfg.verbose:
+                meta = getattr(acceptance_model, 'metadata', {}).get('name') or cfg.acceptance_model_path
+                print(f"Loaded acceptance model: {meta}", flush=True)
+        except Exception as exc:
+            print("Warning: failed to load acceptance model '{}': {}. Falling back to default acceptance heuristics.".format(cfg.acceptance_model_path, exc), flush=True)
+            acceptance_model = None
+
+    draft_ids: List[str] = []
+    drafts_by_tier: Dict[str, List[str]] = defaultdict(list)
+    for spec in draft_configs:
+        did = spec.get('id')
+        if not isinstance(did, str):
+            continue
+        draft_ids.append(did)
+        tier = (spec.get('device_tier') or spec.get('tier') or spec.get('label') or spec.get('bucket'))
+        meta = spec.get('metadata') if isinstance(spec.get('metadata'), Mapping) else {}
+        if tier is None and meta:
+            tier = (meta.get('device_tier') or meta.get('tier') or meta.get('bucket') or meta.get('label')
+                    or meta.get('model_name') or meta.get('model') or meta.get('hardware'))
+        tier_str = str(tier) if tier is not None else 'default'
+        drafts_by_tier[tier_str].append(did)
+
     if cfg.trace_path:
         records = list(iter_trace_records(cfg.trace_path, defaults=cfg.trace_defaults))
-        draft_ids = [d.get("id") for d in draft_configs]
+        if not draft_ids:
+            raise ValueError("At least one draft device is required when replaying traces")
         if not all(isinstance(x, str) for x in draft_ids):
             raise ValueError("All draft devices must have an 'id' when replaying traces")
-        trace_schedule = TraceSchedule(records, [x for x in draft_ids if isinstance(x, str)])
+        trace_schedule = TraceSchedule(
+            records,
+            [x for x in draft_ids if isinstance(x, str)],
+            drafts_by_tier=dict(drafts_by_tier) if drafts_by_tier else None,
+        )
         if trace_schedule.max_arrival_ms > cfg.sim_time_ms:
             cfg.sim_time_ms = max(cfg.sim_time_ms, trace_schedule.max_arrival_ms + 5_000)
         if cfg.verbose:
@@ -3387,6 +3535,7 @@ def build(env: simpy.Environment, cfg: Config):
                 trace_records=trace_records,
                 performance_provider=performance_provider,
                 network=network_fabric,
+                acceptance_model=acceptance_model,
             )
         )
 

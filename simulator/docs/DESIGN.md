@@ -247,6 +247,19 @@ We track exploratory experiment setups here so future contributors can reproduce
 - Configs can point `trace_path` at recorded traffic to replay heterogeneous arrival patterns; when traces run longer than `sim_time_ms` the builder extends the horizon automatically.
 - Helper script `simulator/scripts/generate_trace.py` exports synthetic workloads for benchmarking or regression suites.
 
+##### Canonical Trace Mapping for Draft Sweeps *(Oct 2025)*
+
+- **Draft-agnostic storage.** Persist workload traces once with `arrival_ms`, `prompt_tokens`, `target_tokens`, and a cohort label (e.g., `device_tier` or `client_id`) instead of concrete draft IDs. This canonical JSONL remains identical across experiments while still capturing per-user behaviour.
+- **Runtime binding.** During `TraceSchedule` construction we gather the active drafts grouped by tier and lazily assign cohorts to drafts using a deterministic policy (round-robin by default, capability-weighted when configured). Records that already include `draft_id` continue to work unchanged; tier-only rows get mapped on the fly and cached so follow-up requests from the same cohort reuse the chosen draft, preserving closed-loop semantics.
+- **Closed-loop think time.** Because drafts still sample post-conversation think time, each cohort waits for `completion + think_time` before the next request. When the roster is smaller than the number of cohorts, multiple cohorts share a draft and naturally serialize through it.
+- **Draft sweeps without trace churn.** Experiments like `baseline_draft_sweep.py` now reuse the same canonical trace for every roster size. Only the config changes per run; the runtime mapping adapts automatically to added or removed drafts, eliminating the need to regenerate per-sweep JSONLs while keeping workloads identical.
+
+###### Acceptance Profiling Artifacts *(Oct 2025)*
+
+- Each JSONL record emitted by `speculative.py --details-jsonl` already preserves per-iteration metadata: context length before/after, proposed token IDs/strings, acceptance flags, accepted token counts, mismatch IDs, and timing breakdowns.
+- Top-level prompt entries include generation parameters (`temperature`, `top_p`, `top_k`, repetition penalty), prompt/output truncation limits, total generated tokens, and EOS markers; the accompanying metrics JSONL captures aggregate TTFT/TPOT and throughput.
+- Because the raw training data stores both the drafter settings and token-level acceptance outcomes, new regressors can be retrained offline without rerunning profiling—engineer additional features (e.g., prompt length, temperature, drafter tier) straight from the existing logs.
+
 #### Co-Simulation Verification Pipeline
 
 - `simulator/scripts/verify_cosim.py` loads measured metrics from vLLM (or another runtime), runs the simulator with the same configuration, and prints side-by-side latency/throughput comparisons.
