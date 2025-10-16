@@ -1,8 +1,8 @@
 # Trace-driven variant of baseline.yaml for GSM8K workloads
-sim_time_ms: 150000
+sim_time_ms: 10000
 seed: 123
 verbose: true
-debug: false
+debug: true
 
 speculation:
   framework: vanilla
@@ -12,7 +12,7 @@ speculation:
 execution_mode: blocking
 gamma: 4
 
-trace_path: traces/gsm8k_trace.jsonl
+trace_path: ../traces/gsm8k_trace.jsonl
 trace_defaults:
   slo_class: hetero_baseline
 

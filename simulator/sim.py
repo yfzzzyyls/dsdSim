@@ -699,6 +699,12 @@ class TargetServer:
     # queue helpers
     def enqueue(self, job: Job):
         self._enqueued_count += 1
+        draft_id = (job.draft_id or "").strip()
+        if self.p.id == "llama_t01" or draft_id in {"llama_d001", "llama_d011", "llama_d017", "llama_d031"}:
+            print(
+                f"[{self.env.now:.1f}ms] Target {self.p.id}: enqueue {job.job_type} from {draft_id} (queue={self._enqueued_count})",
+                flush=True,
+            )
         self.q.put(job)
         # Debug: print if queue is getting very large
         if self._enqueued_count > 100 and self._enqueued_count % 50 == 0:
@@ -904,6 +910,12 @@ class TargetServer:
                 
                 first = yield self.q.get()              # wait for first job
                 self._enqueued_count -= 1
+                first_draft = (first.draft_id or "").strip()
+                if self.p.id == "llama_t01" or first_draft in {"llama_d001", "llama_d011", "llama_d017", "llama_d031"}:
+                    print(
+                        f"[{self.env.now:.1f}ms] Target {self.p.id}: picked first job {first.job_type} from {first_draft} (queue={self._enqueued_count})",
+                        flush=True,
+                    )
                 
                 # JIQ: Mark as busy when we get first job
                 if self.router and hasattr(self.router, 'mark_busy'):
@@ -956,10 +968,22 @@ class TargetServer:
                         # SCHEDULER LOGIC: Decode-first
                         if max_prefills is not None and job.job_type == "prefill":
                             if prefill_count >= max_prefills:
+                                draft_id = (job.draft_id or "").strip()
+                                if self.p.id == "llama_t01" or draft_id in {"llama_d001", "llama_d011", "llama_d017", "llama_d031"}:
+                                    print(
+                                        f"[{self.env.now:.1f}ms] Target {self.p.id}: deferring prefill from {draft_id} (prefill_count={prefill_count})",
+                                        flush=True,
+                                    )
                                 deferred_prefills.append(job)
                                 continue  # Skip this prefill for now
                         
                         batch.append(job)
+                        draft_id = (job.draft_id or "").strip()
+                        if self.p.id == "llama_t01" or draft_id in {"llama_d001", "llama_d011", "llama_d017", "llama_d031"}:
+                            print(
+                                f"[{self.env.now:.1f}ms] Target {self.p.id}: added {job.job_type} from {draft_id} (batch={len(batch)})",
+                                flush=True,
+                            )
                         if job.job_type == "prefill":
                             prefill_count += 1
                     else:
@@ -1010,6 +1034,12 @@ class TargetServer:
                     if self.kv_manager:
                         self.kv_manager.release(self.p.id, max(0, j.kv_tokens))
                     self.metrics.add(j)
+                    draft_id = (j.draft_id or "").strip()
+                    if self.p.id == "llama_t01" or draft_id in {"llama_d001", "llama_d011", "llama_d017", "llama_d031"}:
+                        print(
+                            f"[{self.env.now:.1f}ms] Target {self.p.id}: completed {j.job_type} from {draft_id} (accepted={getattr(j, 'accepted_tokens', 0)}, retry={j.retry_count})",
+                            flush=True,
+                        )
                     # Signal completion to waiting draft
                     if j.completion_event and not j.completion_event.triggered:
                         j.completion_event.succeed()
@@ -1629,12 +1659,18 @@ class DraftServer:
 
         conversation_count = 0
         records = self._trace_records or []
+        if self.id in ["llama_d000", "llama_d001"] and records:
+            print(f"[{self.env.now:.1f}ms] Draft {self.id}: Starting with {len(records)} trace records", flush=True)
 
         while self.env.now < self.cfg.sim_time_ms:
             trace_record: Optional[TraceRecord] = None
             if self._trace_mode:
                 if self._trace_index >= len(records):
+                    if self.id in ["llama_d000", "llama_d001"]:
+                        print(f"[{self.env.now:.1f}ms] Draft {self.id}: No more trace records (index={self._trace_index})", flush=True)
                     break
+                if self.id in ["llama_d000", "llama_d001"]:
+                    print(f"[{self.env.now:.1f}ms] Draft {self.id}: fetching trace record #{self._trace_index}", flush=True)
                 record = records[self._trace_index]
                 self._trace_index += 1
                 if record.draft_id and record.draft_id != self.id:
@@ -1651,6 +1687,8 @@ class DraftServer:
                 answer_length = max(1, record.target_tokens)
                 request_id = record.request_id
                 trace_record = record
+                if self.id in ["llama_d000", "llama_d001"]:
+                    print(f"[{self.env.now:.1f}ms] Draft {self.id}: Starting conversation with prompt={prompt_length}, answer={answer_length}", flush=True)
             else:
                 scheduled = max(self._next_available_ms, self.env.now)
                 if scheduled > self.env.now:
@@ -1680,6 +1718,10 @@ class DraftServer:
                 )
                 if not self._trace_mode:
                     self._schedule_next_arrival(self.env.now)
+                elif self._trace_mode and self._think_enabled:
+                    # In trace mode with think time, update _next_available_ms for the next trace record
+                    think_time = self._sample_think_time()
+                    self._next_available_ms = self.env.now + think_time
                 continue
 
             ttft_breakdown = {
@@ -1797,6 +1839,8 @@ class DraftServer:
 
             # Phase 2: Generate answer with multiple speculation rounds
             rounds_needed = (answer_length + self.gamma - 1) // self.gamma  # ceiling division
+            if self.id in ["llama_d000", "llama_d001"]:
+                print(f"[{self.env.now:.1f}ms] Draft {self.id}: rounds_needed={rounds_needed} (answer={answer_length}, gamma={self.gamma})", flush=True)
             tokens_generated_in_conversation = 0
             tokens_accepted_in_conversation = 0
             first_token_time_ms = None  # Track TTFT
@@ -1814,6 +1858,8 @@ class DraftServer:
                     # Determine how many tokens to generate in this round
                     tokens_remaining = answer_length - tokens_generated_in_conversation
                     tokens_this_round = min(self.gamma, tokens_remaining)
+                    if self.id in ["llama_d000", "llama_d001"]:
+                        print(f"[{self.env.now:.1f}ms] Draft {self.id}: Round {round_num+1}/{rounds_needed}, tokens_this_round={tokens_this_round}", flush=True)
 
                     current_context = prompt_length + tokens_generated_in_conversation
                     # Generate draft tokens using performance provider latency
@@ -2003,6 +2049,14 @@ class DraftServer:
             # Schedule next arrival for both think_enabled and workload-driven modes
             if not self._trace_mode:
                 self._schedule_next_arrival(self.env.now)
+            elif self._trace_mode and self._think_enabled:
+                # In trace mode with think time, update _next_available_ms for the next trace record
+                think_time = self._sample_think_time()
+                self._next_available_ms = self.env.now + think_time
+                if self.id in ["llama_d000", "llama_d001"]:
+                    print(f"[{self.env.now:.1f}ms] Draft {self.id}: Conversation {conversation_count} done, "
+                          f"trace_index={self._trace_index}/{len(records)}, think_time={think_time:.1f}ms, "
+                          f"next_available={self._next_available_ms:.1f}ms", flush=True)
 
         # Final statistics
         if self.chunks_sent > 0:
@@ -2148,6 +2202,10 @@ class PhaseScheduler:
         self.metrics = metrics
         self.dynamic_policy = dict(settings.dynamic_policy or {})
         self._pending_enqueues = 0
+        self._debug_sample = 0
+        self._debug_enqueued = defaultdict(int)
+        self._debug_dequeued = defaultdict(int)
+        self._debug_batch_add = 0
         self.proc = env.process(self._run())
 
     def submit(self, job: Job) -> simpy.Event:
@@ -2224,11 +2282,26 @@ class PhaseScheduler:
 
     def _enqueue_job(self, job: Job) -> None:
         self._seq += 1
+        draft_id = (job.draft_id or "").strip()
+        target_id = (job.target_id or "").strip()
+        self._debug_enqueued[draft_id] += 1
+        if target_id == "llama_t01" or draft_id in {"llama_d001", "llama_d011", "llama_d017", "llama_d031"}:
+            print(
+                f"[{self.env.now:.1f}ms] Scheduler {self.name}: enqueue {job.job_type} {draft_id}->{target_id} "
+                f"(priority_class={job.priority_class}, priority={job.priority}, kv_tokens={job.kv_tokens})",
+                flush=True,
+            )
         if self.settings.queue_policy == "fifo":
             sort_key: Tuple[float, int] = (float(self._seq),)
         else:
             sort_key = (float(job.priority), self._seq)
         item = QueueItem(sort_key, job)
+
+        if target_id == "llama_t01" or draft_id in {"llama_d001", "llama_d011", "llama_d017", "llama_d031"}:
+            print(
+                f"[{self.env.now:.1f}ms] Scheduler {self.name}: queue key={sort_key} depth={len(self.store.items)} pending={self._pending_enqueues}",
+                flush=True,
+            )
 
         if self.settings.max_queue_depth and self.settings.max_queue_depth > 0:
             if len(self.store.items) + self._pending_enqueues >= self.settings.max_queue_depth:
@@ -2236,10 +2309,53 @@ class PhaseScheduler:
                 return
 
         self.store.put(item)
+        if self._seq <= 50:
+            print(
+                f"[{self.env.now:.1f}ms] Scheduler {self.name}: sample enqueue seq={self._seq} draft={draft_id}->{target_id} priority={job.priority} class={job.priority_class} depth={len(self.store.items)}",
+                flush=True,
+            )
+        if target_id == "llama_t01" or draft_id in {"llama_d001", "llama_d011", "llama_d017", "llama_d031"}:
+            print(
+                f"[{self.env.now:.1f}ms] Scheduler {self.name}: queue depth after put={len(self.store.items)} pending={self._pending_enqueues}",
+                flush=True,
+            )
+
+            def _check_pending(item_ref: QueueItem, delay_ms: float, label: str):
+                yield self.env.timeout(delay_ms)
+                still_present = item_ref in self.store.items
+                enq = self._debug_enqueued.get(draft_id, 0)
+                deq = self._debug_dequeued.get(draft_id, 0)
+                snapshot = [getattr(q, 'sort_key', None) for q in self.store.items]
+                print(
+                    f"[{self.env.now:.1f}ms] Scheduler {self.name}: pending check ({label}) for {draft_id}->{target_id} still_present={still_present} depth={len(self.store.items)} enq={enq} deq={deq} batch_add={self._debug_batch_add} snapshot={snapshot}",
+                    flush=True,
+                )
+
+            self.env.process(_check_pending(item, 1.0, 'early'))
+            self.env.process(_check_pending(item, 200.0, 'late'))
 
     def _run(self):
         while True:
             item = yield self.store.get()
+            draft_id = (item.job.draft_id or "").strip()
+            target_id = (item.job.target_id or "").strip()
+            self._debug_dequeued[draft_id] += 1
+            self._debug_sample += 1
+            if self.name == "prefill" and self._debug_sample <= 80:
+                print(
+                    f"[{self.env.now:.1f}ms] Scheduler {self.name}: sample dequeue draft={draft_id!r} target={target_id!r} type={item.job.job_type} sample_idx={self._debug_sample}",
+                    flush=True,
+                )
+            if draft_id in {"llama_d001", "llama_d011", "llama_d017", "llama_d031"}:
+                print(
+                    f"[{self.env.now:.1f}ms] Scheduler {self.name}: debug dequeue candidate {item.job.job_type} {draft_id!r}->{target_id!r}",
+                    flush=True,
+                )
+            if target_id == "llama_t01" or draft_id in {"llama_d001", "llama_d011", "llama_d017", "llama_d031"}:
+                print(
+                    f"[{self.env.now:.1f}ms] Scheduler {self.name}: dequeued {item.job.job_type} {draft_id}->{target_id}",
+                    flush=True,
+                )
             batch = [item.job]
             token_total = item.job.token_count
 
@@ -2263,13 +2379,29 @@ class PhaseScheduler:
                 result = yield get_ev | timeout_ev
                 if get_ev in result:
                     next_job = result[get_ev].job
+                    self._debug_batch_add += 1
+                    if (next_job.draft_id in {"llama_d001", "llama_d011", "llama_d017", "llama_d031"}
+                            or (next_job.target_id or "").strip() == "llama_t01"
+                            or self._debug_batch_add <= 40):
+                        print(
+                            f"[{self.env.now:.1f}ms] Scheduler {self.name}: batch add {next_job.job_type} {next_job.draft_id!r}->{next_job.target_id!r} key={result[get_ev].sort_key} queue_left={len(self.store.items)}",
+                            flush=True,
+                        )
                     batch.append(next_job)
                     token_total += next_job.token_count
                     if self.settings.max_batch_tokens and token_total >= self.settings.max_batch_tokens:
                         break
                 else:
+                    if hasattr(get_ev, 'cancel'):
+                        get_ev.cancel()
                     break
 
+            if any((job.draft_id or '').strip() in {"llama_d001", "llama_d011", "llama_d017", "llama_d031"} or (job.target_id or '').strip() == "llama_t01" for job in batch):
+                batch_ids = [(job.draft_id, job.target_id, job.job_type) for job in batch]
+                print(
+                    f"[{self.env.now:.1f}ms] Scheduler {self.name}: dispatching batch with items={batch_ids}",
+                    flush=True,
+                )
             yield self.env.process(self._dispatch_batch_proc(batch))
 
     def _dynamic_batch_params(self, queue_depth: int) -> Tuple[float, int, float]:
@@ -2326,6 +2458,13 @@ class PhaseScheduler:
                 wait = max(0.0, self.settings.backpressure_wait_ms)
                 yield self.env.timeout(wait)
             self._pending_enqueues -= 1
+            draft_id = (item.job.draft_id or "").strip()
+            target_id = (item.job.target_id or "").strip()
+            if self.name == "prefill" and (target_id == "llama_t01" or draft_id in {"llama_d001", "llama_d011", "llama_d017", "llama_d031"}):
+                print(
+                    f"[{self.env.now:.1f}ms] Scheduler {self.name}: deferred enqueue {item.job.job_type} {draft_id}->{target_id} (pending={self._pending_enqueues})",
+                    flush=True,
+                )
             self.store.put(item)
 
         self.env.process(_deferred_enqueue())
@@ -2338,12 +2477,24 @@ class PhaseScheduler:
             groups.setdefault(target.p.id, []).append(job)
 
         for target_id, jobs in groups.items():
+            target_name = (target_id or "").strip()
             target = self.pool_map.get(target_id) or self.target_lookup.get(target_id)
             if target is None:
+                if target_name == "llama_t01":
+                    print(
+                        f"[{self.env.now:.1f}ms] Scheduler {self.name}: no target entry for {target_name}",
+                        flush=True,
+                    )
                 continue
             accepted: List[Job] = []
             max_penalty = 0.0
             for job in jobs:
+                draft_id = (job.draft_id or "").strip()
+                if draft_id in {"llama_d001", "llama_d011", "llama_d017", "llama_d031"}:
+                    print(
+                        f"[{self.env.now:.1f}ms] Scheduler {self.name}: group {draft_id}->{target_name} (job_type={job.job_type})",
+                        flush=True,
+                    )
                 if job.kv_tokens <= 0:
                     job.kv_tokens = self._estimate_kv_tokens(job)
                 if self.kv_manager is None:
@@ -2351,6 +2502,11 @@ class PhaseScheduler:
                     continue
                 success, penalty = self.kv_manager.reserve(target_id, job.kv_tokens)
                 if not success:
+                    if target_name == "llama_t01" or draft_id in {"llama_d001", "llama_d011", "llama_d017", "llama_d031"}:
+                        print(
+                            f"[{self.env.now:.1f}ms] Scheduler {self.name}: KV reject {job.job_type} job from {draft_id} -> {target_name} (retry_count={job.retry_count})",
+                            flush=True,
+                        )
                     self._schedule_retry(job)
                     continue
                 max_penalty = max(max_penalty, penalty)
@@ -2364,6 +2520,12 @@ class PhaseScheduler:
 
             for job in accepted:
                 job.created_ms = self.env.now
+                draft_id = (job.draft_id or "").strip()
+                if target_name == "llama_t01" or draft_id in {"llama_d001", "llama_d011", "llama_d017", "llama_d031"}:
+                    print(
+                        f"[{self.env.now:.1f}ms] Scheduler {self.name}: dispatching {job.job_type} job {draft_id}->{target_name} (priority={job.priority}, tokens={job.token_count})",
+                        flush=True,
+                    )
                 target.enqueue(job)
 
     def _schedule_retry(self, job: Job) -> None:
@@ -2377,6 +2539,13 @@ class PhaseScheduler:
                 job.completion_event.fail(RuntimeError("KV admission rejected job"))
             return
 
+        draft_id = (job.draft_id or "").strip()
+        target_id = (job.target_id or "").strip()
+        if target_id == "llama_t01" or draft_id in {"llama_d001", "llama_d011", "llama_d017", "llama_d031"}:
+            print(
+                f"[{self.env.now:.1f}ms] Scheduler {self.name}: scheduling retry {job.job_type} {draft_id}->{target_id} (retry_count={job.retry_count + 1})",
+                flush=True,
+            )
         job.retry_count += 1
 
         def _retry_proc():
@@ -2387,18 +2556,34 @@ class PhaseScheduler:
 
     def _choose_target(self, job: Job) -> TargetServer:
         if job.target_id and job.target_id in self.pool_map:
+            if job.draft_id in {"llama_d001", "llama_d011", "llama_d017", "llama_d031"}:
+                print(
+                    f"[{self.env.now:.1f}ms] Scheduler {self.name}: using sticky target {job.target_id} for {job.draft_id}",
+                    flush=True,
+                )
             return self.pool_map[job.target_id]
 
         allowed_ids = list(self.pool_map.keys())
         chosen = None
         if self.global_router is not None:
             chosen = self.global_router.choose(job.draft_id, allowed_ids)
+            if job.draft_id in {"llama_d001", "llama_d011", "llama_d017", "llama_d031"}:
+                print(
+                    f"[{self.env.now:.1f}ms] Scheduler {self.name}: global router choice {chosen} for {job.draft_id} among {allowed_ids}",
+                    flush=True,
+                )
 
         if chosen is not None:
             return chosen
 
         # Fall back to least work-left among pool
-        return min(self.pool_targets, key=lambda t: t.work_left_score())
+        target = min(self.pool_targets, key=lambda t: t.work_left_score())
+        if job.draft_id in {"llama_d001", "llama_d011", "llama_d017", "llama_d031"}:
+            print(
+                f"[{self.env.now:.1f}ms] Scheduler {self.name}: fallback target {target.p.id} for {job.draft_id}",
+                flush=True,
+            )
+        return target
 
     def _estimate_kv_tokens(self, job: Job) -> int:
         if job.phase == "prefill":
