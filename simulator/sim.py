@@ -1570,12 +1570,30 @@ class DraftServer:
         target_id = target.p.id
         return target_id, self.connections[target_id]
     
+    def _build_acceptance_feature_context(self, target_id: str, spec_tokens: int) -> Dict[str, Any]:
+        target = self._target_lookup.get(target_id)
+        verifier_metadata = getattr(target.p, "metadata", {}) if target is not None else {}
+        verifier_model = None
+        if target is not None:
+            verifier_model = target.p.model or verifier_metadata.get("model") or verifier_metadata.get("model_name")
+        drafter_metadata = self.metadata or {}
+        drafter_model = drafter_metadata.get("model") or drafter_metadata.get("model_name") or self.id
+        return {
+            "spec_tokens": int(max(1, spec_tokens)),
+            "drafter_model": drafter_model,
+            "verifier_model": verifier_model or target_id,
+        }
+
     def _effective_acceptance_rate(self, conn: ConnectionParams, context_length: int, depth: int) -> float:
         if depth <= 0:
             return 0.0
         if self._acceptance_model is None:
             raise RuntimeError("Acceptance model is required but was not initialised")
-        expected = self._acceptance_model.expected_accepts(float(context_length))
+        feature_context = self._build_acceptance_feature_context(conn.target_id, depth)
+        expected = self._acceptance_model.expected_accepts(
+            float(context_length),
+            feature_context=feature_context,
+        )
         depth_f = max(1.0, float(depth))
         rate = expected / depth_f if depth_f > 0 else 0.0
         return max(0.0, min(1.0, float(rate)))
@@ -1589,12 +1607,14 @@ class DraftServer:
         if self._acceptance_model is None:
             raise RuntimeError("Acceptance model is required but was not initialised")
         accepted = 0
+        feature_context = self._build_acceptance_feature_context(conn.target_id, tokens)
         default_rate = self._effective_acceptance_rate(conn, context_length, tokens)
         try:
             probabilities = self._acceptance_model.position_probabilities(
                 context_length=float(context_length),
                 depth=tokens,
                 default=default_rate,
+                feature_context=feature_context,
             )
         except Exception as exc:
             raise RuntimeError(
@@ -2192,11 +2212,13 @@ class DraftServer:
             if candidate_depth and candidate_depth > 0:
                 candidate_depth = max(1, min(candidate_depth, 512))
                 try:
+                    feature_context = self._build_acceptance_feature_context(target_id, candidate_depth)
                     default_rate = self._effective_acceptance_rate(conn, prompt_length, candidate_depth)
                     probs = self._acceptance_model.position_probabilities(
                         context_length=float(prompt_length),
                         depth=candidate_depth,
                         default=default_rate,
+                        feature_context=feature_context,
                     )
                     acceptance_probs = tuple(max(0.0, min(1.0, float(p))) for p in probs)
                 except Exception as exc:

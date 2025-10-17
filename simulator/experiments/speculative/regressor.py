@@ -28,9 +28,10 @@ from __future__ import annotations
 
 import argparse
 import json
+from collections import defaultdict
 from pathlib import Path
 import sys
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Dict, Iterable, List, Mapping, Optional, Tuple
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = SCRIPT_DIR.parent.parent.parent
@@ -138,38 +139,91 @@ def parse_metadata(pairs: Iterable[str]) -> Dict[str, str]:
     return metadata
 
 
+
+COUNT_FEATURES = ["context_length", "spec_tokens", "drafter_model", "verifier_model"]
+ACCEPT_FEATURES = COUNT_FEATURES + ["position"]
+CATEGORICAL_FEATURES = {"drafter_model", "verifier_model"}
+_UNKNOWN_CATEGORY = "__UNKNOWN__"
+
 def build_datasets(
     records: Iterable[dict],
     spec_tokens: int,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    metadata: Optional[Mapping[str, str]] = None,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, Dict[str, Dict[str, int]]]:
     """
     Returns:
         X_count (n_iterations, n_features),
         y_count (accepted_count),
         X_accept (n_position_attempts, n_features),
-        y_accept (0/1 acceptance)
+        y_accept (0/1 acceptance),
+        categorical_maps (feature -> category -> index)
     """
     count_features: List[List[float]] = []
     count_targets: List[int] = []
     accept_features: List[List[float]] = []
     accept_targets: List[int] = []
+    category_maps: Dict[str, Dict[str, int]] = defaultdict(dict)
+    metadata = metadata or {}
+
+    def encode_category(feature: str, value: Optional[str]) -> float:
+        key = str(value) if value is not None else _UNKNOWN_CATEGORY
+        mapping = category_maps[feature]
+        if key not in mapping:
+            mapping[key] = len(mapping)
+        return float(mapping[key])
+
+    def feature_value(
+        name: str,
+        base: Dict[str, object],
+        position: Optional[int],
+    ) -> float:
+        if name == "context_length":
+            return float(base.get("context_length", 0.0))
+        if name == "position":
+            return float(position if position is not None else 0)
+        if name == "spec_tokens":
+            return float(base.get("spec_tokens", spec_tokens))
+        if name in CATEGORICAL_FEATURES:
+            return encode_category(name, base.get(name))
+        value = base.get(name)
+        if value is None:
+            return 0.0
+        return float(value)
 
     for record in records:
-        prompt_idx = record.get("prompt_index", 0)
+        record_meta = dict(metadata)
+        record_meta.update({k: v for k, v in (record.get("metadata") or {}).items() if v is not None})
+        drafter_model = record_meta.get("drafter_model")
+        verifier_model = record_meta.get("verifier_model")
+        record_spec_tokens = record_meta.get("spec_tokens")
+        try:
+            record_spec_tokens = int(record_spec_tokens) if record_spec_tokens is not None else spec_tokens
+        except (TypeError, ValueError):
+            record_spec_tokens = spec_tokens
+
         for iteration in record.get("iterations", []):
             context_len = float(iteration.get("context_length_before", 0))
             accepted_flags: List[bool] = list(iteration.get("accepted_flags", []))
             draft_token_ids: List[int] = list(iteration.get("draft_token_ids", []))
-            spec_len = min(spec_tokens, len(draft_token_ids))
+            spec_len = min(record_spec_tokens, len(draft_token_ids)) if record_spec_tokens else len(draft_token_ids)
             accepted_count = sum(1 for flag in accepted_flags if flag)
 
-            count_features.append([context_len])
+            base_values: Dict[str, object] = {
+                "context_length": context_len,
+                "spec_tokens": record_spec_tokens or spec_tokens,
+                "drafter_model": drafter_model,
+                "verifier_model": verifier_model,
+            }
+
+            count_row = [feature_value(name, base_values, None) for name in COUNT_FEATURES]
+            count_features.append(count_row)
             count_targets.append(accepted_count)
 
-            for pos in range(min(spec_len, spec_tokens)):
+            for pos in range(min(spec_len, record_spec_tokens or spec_tokens)):
                 if pos < len(accepted_flags):
                     flag = 1 if accepted_flags[pos] else 0
-                    accept_features.append([context_len, float(pos)])
+                    accept_row = [feature_value(name, base_values, pos) for name in ACCEPT_FEATURES]
+                    accept_features.append(accept_row)
                     accept_targets.append(flag)
 
     if not count_features or not accept_features:
@@ -179,8 +233,9 @@ def build_datasets(
     y_count = np.array(count_targets, dtype=np.float32)
     X_accept = np.array(accept_features, dtype=np.float32)
     y_accept = np.array(accept_targets, dtype=np.int32)
+    categorical_maps = {feature: dict(mapping) for feature, mapping in category_maps.items()}
 
-    return X_count, y_count, X_accept, y_accept
+    return X_count, y_count, X_accept, y_accept, categorical_maps
 
 
 def train_models(
@@ -255,9 +310,10 @@ def main() -> None:
     records = load_records(args.details_jsonl)
     metadata = parse_metadata(args.metadata)
 
-    X_count, y_count, X_accept, y_accept = build_datasets(
+    X_count, y_count, X_accept, y_accept, categorical_maps = build_datasets(
         records,
         spec_tokens=args.spec_tokens,
+        metadata=metadata,
     )
 
     reg_model, clf_model, metrics = train_models(
@@ -275,9 +331,10 @@ def main() -> None:
         "metadata": metadata,
         "spec_tokens": args.spec_tokens,
         "feature_columns": {
-            "count": ["context_length"],
-            "accept": ["context_length", "position"],
+            "count": COUNT_FEATURES,
+            "accept": ACCEPT_FEATURES,
         },
+        "categorical_maps": categorical_maps,
         "regressor": reg_model,
         "classifier": clf_model,
         "metrics": metrics,

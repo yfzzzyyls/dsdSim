@@ -787,6 +787,15 @@ def main() -> None:
                 "prompt_index": idx,
                 "prompt": prompt,
                 "generated_text": prompt_log.generated_text,
+                "metadata": {
+                    "drafter_model": args.drafter_model,
+                    "verifier_model": args.verifier_model,
+                    "temperature": args.temperature,
+                    "top_p": args.top_p,
+                    "top_k": args.top_k,
+                    "repetition_penalty": args.repetition_penalty,
+                    "spec_tokens": args.spec_tokens,
+                },
                 "iterations": [
                     {
                         "context_length_before": log.context_length_before,
