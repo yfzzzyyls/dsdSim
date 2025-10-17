@@ -80,7 +80,7 @@ class TraceRecord:
             raise TraceParseError("metadata must be a mapping")
 
         if draft_id is None and device_tier is None:
-            raise TraceParseError("trace record must include draft_id or device_tier")
+            device_tier = "default"
         if arrival_ms < 0:
             raise TraceParseError("arrival_ms must be non-negative")
 

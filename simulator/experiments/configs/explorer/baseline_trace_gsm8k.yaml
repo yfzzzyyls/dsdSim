@@ -8,11 +8,19 @@ speculation:
   framework: eagle
   execution_mode: fused
   acceptance_model: acceptance/llama2_7b_vs_70b.joblib
+  vanilla:
+    # Vanilla-specific knobs go here (leave empty for defaults)
+  eagle:
+    beam_width: 4
+    max_depth: 4
+    min_depth: 1
 
 execution_mode: blocking
 gamma: 4
 
-trace_path: ../traces/gsm8k_trace_10s.jsonl
+trace_path: traces/gsm8k_trace_10s.jsonl
+trace_replay:
+  per_draft_rps: 3.5
 trace_defaults:
   slo_class: hetero_baseline
 

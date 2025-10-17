@@ -1,7 +1,7 @@
 # sim.py v1 minimal distributed speculative-decoding simulator
 # deps: pip install simpy pyyaml
 
-import argparse, random, simpy, yaml, math, json
+import argparse, random, simpy, yaml, math, json, itertools
 import time
 from collections import deque, defaultdict
 from types import MappingProxyType
@@ -44,6 +44,13 @@ class DraftParams:
     reliability: float = 0.99         # connection reliability (0-1)
     cluster: str = "default"
     metadata: Dict[str, Any] = field(default_factory=dict)
+
+@dataclass(frozen=True)
+class ReplayDraftSpec:
+    """Metadata used to distribute trace arrivals across drafts."""
+    draft_id: str
+    capability: float = 1.0
+    tier: str = "default"
 
 @dataclass
 class ConnectionParams:
@@ -157,6 +164,7 @@ class Config:
     global_router_params: Dict[str, Any] = field(default_factory=dict)
     trace_path: Optional[str] = None
     trace_defaults: Dict[str, Any] = field(default_factory=dict)
+    trace_replay: Dict[str, Any] = field(default_factory=dict)
     performance_model: PerformanceModelConfig = field(default_factory=PerformanceModelConfig)
     workload: WorkloadCfg = field(default_factory=WorkloadCfg)
     think_time: ThinkTimeConfig = field(default_factory=ThinkTimeConfig)
@@ -590,6 +598,78 @@ def get_typical_verify_ms(target_config: dict, gamma: int = 4) -> float:
     return gamma * decode_per_token
 
 
+def _prepare_trace_records(records: Sequence[TraceRecord], draft_specs: Sequence[ReplayDraftSpec], cfg: "Config") -> Sequence[TraceRecord]:
+    if not records or not draft_specs:
+        return records
+    horizon_ms = max(1.0, float(getattr(cfg, "sim_time_ms", 0.0) or 0.0))
+    replay_cfg = dict(getattr(cfg, "trace_replay", {}) or {})
+    per_conv = replay_cfg.get("per_draft_conversations")
+    per_rps = replay_cfg.get("per_draft_rps")
+
+    def _filtered(rs: Sequence[TraceRecord]) -> List[TraceRecord]:
+        filtered = [r for r in rs if r.arrival_ms <= horizon_ms]
+        return filtered if filtered else list(rs)
+
+    if per_conv is None and per_rps is None:
+        return _filtered(records)
+
+    total_cap = sum(max(spec.capability, 0.0) for spec in draft_specs)
+    if total_cap <= 0:
+        total_cap = float(len(draft_specs)) or 1.0
+
+    if per_conv is not None:
+        required = int(math.ceil(float(per_conv) * total_cap))
+    else:
+        horizon_sec = horizon_ms / 1000.0
+        required = int(math.ceil(float(per_rps) * horizon_sec * total_cap))
+
+    required = max(required, len(draft_specs))
+
+    template = _filtered(records)
+    if not template:
+        raise TraceParseError("trace template is empty after filtering")
+
+    seed = getattr(cfg, "seed", 0)
+    generated = _generate_scaled_trace(template, required, horizon_ms, seed)
+    return generated
+
+
+def _generate_scaled_trace(template: Sequence[TraceRecord], count: int, horizon_ms: float, seed: int) -> List[TraceRecord]:
+    if count <= 0:
+        return []
+    rng = random.Random(seed ^ 0xC0FFEE)
+    intervals = [rng.expovariate(1.0) for _ in range(count)]
+    cumulative = list(itertools.accumulate(intervals))
+    total_time = cumulative[-1] if cumulative else 1.0
+    scale = horizon_ms / max(total_time, 1e-9)
+    arrivals = [min(horizon_ms, t * scale) for t in cumulative]
+
+    generated: List[TraceRecord] = []
+    template_len = len(template)
+    for idx in range(count):
+        src = template[idx % template_len]
+        meta = src.metadata if isinstance(src.metadata, Mapping) else {}
+        new_meta = dict(meta) if meta else {}
+        if "client_id" in new_meta:
+            new_meta["client_id"] = f"{new_meta['client_id']}_{idx:05d}"
+        else:
+            new_meta["client_id"] = f"trace_client_{idx:05d}"
+        record = TraceRecord(
+            arrival_ms=arrivals[idx],
+            prompt_tokens=src.prompt_tokens,
+            target_tokens=src.target_tokens,
+            draft_id=None,
+            device_tier=src.device_tier or "default",
+            slo_class=src.slo_class,
+            mode_hint=src.mode_hint,
+            seed=src.seed,
+            metadata=new_meta,
+            request_id=src.request_id or f"trace_{idx:05d}",
+        )
+        generated.append(record)
+    return generated
+
+
 class TraceSchedule:
     """Distribute trace records across drafts for replay."""
 
@@ -598,57 +678,20 @@ class TraceSchedule:
     def __init__(
         self,
         records: Sequence[TraceRecord],
-        known_drafts: Sequence[str],
+        draft_specs: Sequence[ReplayDraftSpec],
         *,
-        drafts_by_tier: Optional[Mapping[str, Sequence[str]]] = None,
+        horizon_ms: Optional[float] = None,
     ) -> None:
-        self._by_draft: Dict[str, List[TraceRecord]] = defaultdict(list)
-        self._cohort_assignments: Dict[str, str] = {}
-        self.max_arrival_ms = 0.0
+        if not draft_specs:
+            raise TraceParseError("trace playback requires at least one draft device")
+        self._by_draft: Dict[str, List[TraceRecord]] = {spec.draft_id: [] for spec in draft_specs}
 
-        ordered_known = list(dict.fromkeys(known_drafts))
-        known_set = set(ordered_known)
-
-        tier_candidates: Dict[str, List[str]] = {}
-        if drafts_by_tier:
-            for tier, drafts in drafts_by_tier.items():
-                filtered = [draft for draft in drafts if draft in known_set]
-                if filtered:
-                    tier_candidates[str(tier)] = list(filtered)
-
-        tier_rr: Dict[str, int] = {}
-        fallback_candidates = ordered_known
-
-        for idx, record in enumerate(records):
-            resolved = record
-            draft_id = record.draft_id
-            if draft_id is None:
-                tier = record.device_tier
-                if tier is None:
-                    raise TraceParseError("trace playback requires draft_id or device_tier for each record")
-                tier_str = str(tier)
-                candidates = tier_candidates.get(tier_str)
-                if candidates is None:
-                    candidates = fallback_candidates
-                    if not candidates:
-                        raise TraceParseError("trace playback has no drafts to assign records to")
-                cohort_key = self._cohort_key(tier_str, record, idx)
-                assigned = self._cohort_assignments.get(cohort_key)
-                if assigned is None:
-                    pos = tier_rr.get(tier_str, 0)
-                    assigned = candidates[pos % len(candidates)]
-                    tier_rr[tier_str] = pos + 1
-                    self._cohort_assignments[cohort_key] = assigned
-                draft_id = assigned
-                resolved = record.with_draft(draft_id)
-            else:
-                if draft_id not in known_set:
-                    raise TraceParseError(f"trace references unknown draft_id '{draft_id}'")
-            self._by_draft[draft_id].append(resolved)
-            self.max_arrival_ms = max(self.max_arrival_ms, resolved.arrival_ms)
-
-        for recs in self._by_draft.values():
+        assigner = _ReplayAssigner(draft_specs, self._COHORT_META_KEYS)
+        assigned = assigner.assign(records, horizon_ms=horizon_ms)
+        for draft_id, recs in assigned.items():
             recs.sort(key=lambda r: r.arrival_ms)
+            self._by_draft[draft_id] = recs
+        self.max_arrival_ms = assigner.max_arrival_ms
 
     @classmethod
     def _cohort_key(cls, tier: str, record: TraceRecord, index: int) -> str:
@@ -666,6 +709,122 @@ class TraceSchedule:
     def for_draft(self, draft_id: str) -> Sequence[TraceRecord]:
         return list(self._by_draft.get(draft_id, []))
 
+
+class _ReplayAssigner:
+    """Assign draft-agnostic trace arrivals to concrete drafts."""
+
+    def __init__(self, drafts: Sequence[ReplayDraftSpec], session_keys: Sequence[str]):
+        self._drafts = list(drafts)
+        self._session_keys = tuple(session_keys)
+        self._session_map: Dict[str, str] = {}
+        self.max_arrival_ms: float = 0.0
+
+    def assign(
+        self,
+        records: Sequence[TraceRecord],
+        *,
+        horizon_ms: Optional[float] = None,
+    ) -> Dict[str, List[TraceRecord]]:
+        by_draft: Dict[str, List[TraceRecord]] = {spec.draft_id: [] for spec in self._drafts}
+        spec_map = {spec.draft_id: spec for spec in self._drafts}
+        groups: Dict[str, List[tuple[int, TraceRecord]]] = defaultdict(list)
+
+        for idx, record in enumerate(records):
+            if horizon_ms is not None and record.arrival_ms > horizon_ms:
+                continue
+            self.max_arrival_ms = max(self.max_arrival_ms, record.arrival_ms)
+            if record.draft_id and record.draft_id in spec_map:
+                by_draft[record.draft_id].append(record)
+                continue
+            tier = str(record.device_tier) if record.device_tier is not None else "__all__"
+            groups[tier].append((idx, record))
+
+        for tier, entries in groups.items():
+            candidates = [spec for spec in self._drafts if spec.tier == tier]
+            if not candidates:
+                candidates = self._drafts
+            if not candidates:
+                continue
+            for draft_id, rec in self._assign_group(tier, entries, candidates):
+                by_draft[draft_id].append(rec)
+
+        return by_draft
+
+    def _assign_group(
+        self,
+        tier: str,
+        entries: Sequence[tuple[int, TraceRecord]],
+        candidates: Sequence[ReplayDraftSpec],
+    ) -> Iterable[tuple[str, TraceRecord]]:
+        items = sorted(entries, key=lambda x: (x[1].arrival_ms, x[0]))
+        if not items:
+            return []
+        slots = self._build_slots(len(items), candidates)
+        spec_ids = {spec.draft_id for spec in candidates}
+        assignments = []
+        position = 0
+        for original_idx, record in items:
+            cohort_key = TraceSchedule._cohort_key(tier, record, original_idx)
+            assigned = None
+            if cohort_key in self._session_map:
+                candidate_id = self._session_map[cohort_key]
+                if candidate_id in spec_ids:
+                    assigned = candidate_id
+            if assigned is None:
+                assigned = slots[position % len(slots)]
+                position += 1
+                self._session_map[cohort_key] = assigned
+            assignments.append((assigned, record.with_draft(assigned)))
+        return assignments
+
+    def _build_slots(self, count: int, candidates: Sequence[ReplayDraftSpec]) -> List[str]:
+        if count <= 0:
+            return [candidates[0].draft_id]
+        weights = [max(spec.capability, 0.0) for spec in candidates]
+        total = sum(weights)
+        if total <= 0:
+            weights = [1.0] * len(candidates)
+            total = float(len(candidates))
+        raw = [count * w / total for w in weights]
+        shares = [max(0, int(math.floor(r))) for r in raw]
+        assigned = sum(shares)
+        fractional = [r - math.floor(r) for r in raw]
+        if assigned < count:
+            order = sorted(range(len(candidates)), key=lambda i: (-fractional[i], i))
+            idx_iter = iter(order)
+            while assigned < count:
+                try:
+                    idx = next(idx_iter)
+                except StopIteration:
+                    idx_iter = iter(order)
+                    idx = next(idx_iter)
+                shares[idx] += 1
+                assigned += 1
+        elif assigned > count:
+            order = sorted(range(len(candidates)), key=lambda i: (fractional[i], i))
+            idx_iter = iter(order)
+            while assigned > count and order:
+                try:
+                    idx = next(idx_iter)
+                except StopIteration:
+                    idx_iter = iter(order)
+                    idx = next(idx_iter)
+                if shares[idx] > 0:
+                    shares[idx] -= 1
+                    assigned -= 1
+                else:
+                    break
+        if sum(shares) == 0:
+            shares[0] = 1
+        slots: List[str] = []
+        max_share = max(shares) if shares else 0
+        for round_idx in range(max_share):
+            for spec, share in zip(candidates, shares):
+                if round_idx < share:
+                    slots.append(spec.draft_id)
+        if not slots:
+            slots = [candidates[0].draft_id]
+        return slots
 # ---------- Servers ----------
 
 class TargetServer:
@@ -3428,6 +3587,7 @@ def load_config(path: str) -> Config:
         global_router_params=dict(raw.get("global_router_params", {}) or {}),
         trace_path=raw.get("trace_path"),
         trace_defaults=dict(raw.get("trace_defaults", {}) or {}),
+        trace_replay=dict(raw.get("trace_replay", {}) or {}),
         performance_model=pm,
         workload=wl,
         think_time=ThinkTimeConfig(**(raw.get("think_time", {}) or {})),
@@ -3546,31 +3706,31 @@ def build(env: simpy.Environment, cfg: Config):
     except Exception as exc:
         raise RuntimeError(f"Failed to load acceptance model '{cfg.acceptance_model_path}': {exc}") from exc
 
-    draft_ids: List[str] = []
-    drafts_by_tier: Dict[str, List[str]] = defaultdict(list)
+    draft_specs: List[ReplayDraftSpec] = []
     for spec in draft_configs:
         did = spec.get('id')
         if not isinstance(did, str):
             continue
-        draft_ids.append(did)
         tier = (spec.get('device_tier') or spec.get('tier') or spec.get('label') or spec.get('bucket'))
         meta = spec.get('metadata') if isinstance(spec.get('metadata'), Mapping) else {}
         if tier is None and meta:
             tier = (meta.get('device_tier') or meta.get('tier') or meta.get('bucket') or meta.get('label')
                     or meta.get('model_name') or meta.get('model') or meta.get('hardware'))
         tier_str = str(tier) if tier is not None else 'default'
-        drafts_by_tier[tier_str].append(did)
+        capability = float(spec.get('capability', 1.0))
+        draft_specs.append(ReplayDraftSpec(draft_id=did, capability=capability, tier=tier_str))
+
+    draft_ids: List[str] = [spec.draft_id for spec in draft_specs]
 
     if cfg.trace_path:
         records = list(iter_trace_records(cfg.trace_path, defaults=cfg.trace_defaults))
         if not draft_ids:
             raise ValueError("At least one draft device is required when replaying traces")
-        if not all(isinstance(x, str) for x in draft_ids):
-            raise ValueError("All draft devices must have an 'id' when replaying traces")
+        records = _prepare_trace_records(records, draft_specs, cfg)
         trace_schedule = TraceSchedule(
             records,
-            [x for x in draft_ids if isinstance(x, str)],
-            drafts_by_tier=dict(drafts_by_tier) if drafts_by_tier else None,
+            draft_specs,
+            horizon_ms=cfg.sim_time_ms,
         )
         if trace_schedule.max_arrival_ms > cfg.sim_time_ms:
             cfg.sim_time_ms = max(cfg.sim_time_ms, trace_schedule.max_arrival_ms + 5_000)
