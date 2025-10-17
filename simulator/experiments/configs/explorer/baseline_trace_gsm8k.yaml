@@ -12,12 +12,8 @@ speculation:
     type: specpp
     min_gamma: 2
     max_gamma: 8
-    queue_low: 2
-    queue_high: 10
-    acceptance_target: 0.45
-    acceptance_gain: 1.1
-    waste_penalty: 0.7
-    efficiency_weight: 0.35
+    stop_threshold: 0.7
+    fallback_gamma: 4
   vanilla:
     # Vanilla-specific knobs go here (leave empty for defaults)
   eagle:

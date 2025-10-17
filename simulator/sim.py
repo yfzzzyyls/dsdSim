@@ -86,25 +86,21 @@ class ConstantGammaPolicy(GammaPolicy):
         return self._default
 
 
+
 class SpecPPGammaPolicy(GammaPolicy):
-    """Adaptive policy inspired by SPEC++ heuristics."""
+    """Implements SpecDec++-style adaptive gamma selection."""
 
     def __init__(self, default_gamma: int, config: Mapping[str, Any]) -> None:
         self._default = max(1, int(default_gamma))
         self._min = max(1, int(config.get("min_gamma", 1)))
         self._max = max(self._min, int(config.get("max_gamma", self._default)))
-        self._waste_penalty = max(0.0, float(config.get("waste_penalty", 0.7)))
-        self._queue_low = max(0.0, float(config.get("queue_low", 1.0)))
-        self._queue_high = max(self._queue_low + 1.0, float(config.get("queue_high", self._queue_low + 5.0)))
-        self._queue_gain = max(0.0, float(config.get("queue_gain", 2.0)))
-        self._accept_target = max(0.0, min(1.0, float(config.get("acceptance_target", 0.45))))
-        self._accept_gain = max(0.0, float(config.get("acceptance_gain", 1.2)))
-        self._efficiency_weight = max(0.0, float(config.get("efficiency_weight", 0.35)))
-        self._ema_beta = float(config.get("ema_beta", 0.35))
-        self._ema: Dict[str, float] = {}
+        self._threshold = float(config.get("stop_threshold", 0.7))
+        if not 0.0 <= self._threshold <= 1.0:
+            raise ValueError("stop_threshold must be within [0, 1]")
+        self._fallback = max(1, int(config.get("fallback_gamma", self._default)))
 
     def required_depth(self, default_gamma: int) -> int:
-        return max(self._max, default_gamma)
+        return max(self._max, default_gamma, self._fallback)
 
     def select_gamma(
         self,
@@ -113,56 +109,39 @@ class SpecPPGammaPolicy(GammaPolicy):
         context: Optional[GammaContext] = None,
     ) -> int:
         if context is None:
-            return self._default
+            return self._fallback
 
         probabilities = list(context.acceptance_probabilities or [])
-        if len(probabilities) < self._max:
-            tail = probabilities[-1] if probabilities else self._accept_target
-            probabilities.extend([tail] * (self._max - len(probabilities)))
+        if not probabilities:
+            return self._fallback
 
-        queue_depth = max(0, context.queue_depth)
-        queue_span = max(1.0, self._queue_high - self._queue_low)
-        if queue_depth <= self._queue_low:
-            queue_factor = 0.0
-        else:
-            queue_factor = min(1.0, (queue_depth - self._queue_low) / queue_span)
+        while len(probabilities) < self._max:
+            probabilities.append(probabilities[-1])
 
-        ema = self._ema.get(draft_id, self._accept_target)
-        accept_shortfall = max(0.0, self._accept_target - ema)
-        accept_excess = max(0.0, ema - self._accept_target)
+        min_tokens = max(1, self._min)
+        max_tokens = max(min_tokens, self._max)
+        cum_accept = 1.0
+        selected = min_tokens
 
-        penalty_multiplier = 1.0 + (queue_factor * self._queue_gain) + (accept_shortfall * self._accept_gain)
-        reward_multiplier = 1.0 + (accept_excess * self._accept_gain)
-        penalty_multiplier = max(0.05, penalty_multiplier)
+        for idx in range(1, max_tokens + 1):
+            prob = float(probabilities[idx - 1])
+            prob = max(0.0, min(1.0, prob))
+            if idx == 1:
+                acc_prob = 1.0
+            else:
+                acc_prob = prob
+            cum_accept *= acc_prob
+            selected = idx
+            if idx < min_tokens:
+                continue
+            rejection = 1.0 - cum_accept
+            if rejection > self._threshold:
+                break
 
-        best_gamma = self._default
-        best_score = float('-inf')
-
-        for gamma in range(self._min, self._max + 1):
-            expected_accepts = sum(probabilities[:gamma])
-            expected_accepts = max(0.0, min(float(gamma), expected_accepts))
-            expected_waste = max(0.0, gamma - expected_accepts)
-            efficiency = expected_accepts / gamma if gamma > 0 else 0.0
-
-            score = (expected_accepts * reward_multiplier)
-            score += efficiency * self._efficiency_weight
-            score -= self._waste_penalty * penalty_multiplier * expected_waste
-            score -= queue_factor * self._waste_penalty * 0.1 * gamma
-
-            if score > best_score or (math.isclose(score, best_score) and gamma < best_gamma):
-                best_score = score
-                best_gamma = gamma
-
-        return max(self._min, min(self._max, best_gamma))
+        return max(min_tokens, min(max_tokens, selected))
 
     def update_gamma(self, draft_id: str, stats: GammaConversationStats) -> None:
-        beta = max(0.0, min(1.0, self._ema_beta))
-        current = float(max(0.0, min(1.0, stats.acceptance_ratio)))
-        previous = self._ema.get(draft_id)
-        if previous is None:
-            self._ema[draft_id] = current
-        else:
-            self._ema[draft_id] = (1.0 - beta) * previous + beta * current
+        return
 
 
 
