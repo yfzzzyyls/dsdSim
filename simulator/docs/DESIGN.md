@@ -95,6 +95,7 @@ This document lays out the core components and specifies the auxiliary design fi
 | Scheduler           | Token-level scheduling for draft and verify phases (EDF/least slack), adaptive fanout `k`, target vs fused mode choice, admission control. |
 | Planner             | DistServe-style goodput maximization: search pool sizes, microbatch sizes, draft-model choices, and speculation parameters. |
 | Acceptance Estimator| Load acceptance curves captured from offline drafter/verifier evaluations, expose per-request predictions, and optionally blend heuristic adjustments when calibration metadata is provided. |
+| Acceptance Models (2025-03)| Profiler logs now capture drafter/verifier metadata, speculation depth, and sampling knobs. Training pipeline supports RandomForest (default), Gradient-Boosted Trees, and mixture-of-experts GBDT; runtime dispatcher routes queries to per-group experts when available. |
 | Mode Selector       | Decide between distributed, fused, or hybrid execution per request/class using network/queue telemetry and acceptance forecasts. |
 | Queueing Model      | Maintain per-phase queues with LUT-derived service distributions; expose backpressure (wait, utilization) to policies and planner. |
 | Cold-Start Manager  | Track checkpoint warm/cold state, locality, and load costs for targets; inform mode selection and TTFT estimates. |
