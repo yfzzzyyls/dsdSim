@@ -44,8 +44,26 @@ class GammaConversationStats:
     tokens_accepted: int
 
 
+@dataclass(frozen=True)
+class GammaContext:
+    draft_id: str
+    target_id: str
+    context_length: int
+    queue_depth: int
+
+    acceptance_probabilities: Tuple[float, ...] = tuple()
+
+
 class GammaPolicy:
-    def select_gamma(self, draft_id: str, default_gamma: int) -> int:
+    def required_depth(self, default_gamma: int) -> int:
+        return default_gamma
+
+    def select_gamma(
+        self,
+        draft_id: str,
+        default_gamma: int,
+        context: Optional[GammaContext] = None,
+    ) -> int:
         return default_gamma
 
     def update_gamma(self, draft_id: str, stats: GammaConversationStats) -> None:
@@ -56,8 +74,96 @@ class ConstantGammaPolicy(GammaPolicy):
     def __init__(self, default_gamma: int) -> None:
         self._default = max(1, int(default_gamma))
 
-    def select_gamma(self, draft_id: str, default_gamma: int) -> int:
+    def required_depth(self, default_gamma: int) -> int:
+        return 0
+
+    def select_gamma(
+        self,
+        draft_id: str,
+        default_gamma: int,
+        context: Optional[GammaContext] = None,
+    ) -> int:
         return self._default
+
+
+class SpecPPGammaPolicy(GammaPolicy):
+    """Adaptive policy inspired by SPEC++ heuristics."""
+
+    def __init__(self, default_gamma: int, config: Mapping[str, Any]) -> None:
+        self._default = max(1, int(default_gamma))
+        self._min = max(1, int(config.get("min_gamma", 1)))
+        self._max = max(self._min, int(config.get("max_gamma", self._default)))
+        self._waste_penalty = max(0.0, float(config.get("waste_penalty", 0.7)))
+        self._queue_low = max(0.0, float(config.get("queue_low", 1.0)))
+        self._queue_high = max(self._queue_low + 1.0, float(config.get("queue_high", self._queue_low + 5.0)))
+        self._queue_gain = max(0.0, float(config.get("queue_gain", 2.0)))
+        self._accept_target = max(0.0, min(1.0, float(config.get("acceptance_target", 0.45))))
+        self._accept_gain = max(0.0, float(config.get("acceptance_gain", 1.2)))
+        self._efficiency_weight = max(0.0, float(config.get("efficiency_weight", 0.35)))
+        self._ema_beta = float(config.get("ema_beta", 0.35))
+        self._ema: Dict[str, float] = {}
+
+    def required_depth(self, default_gamma: int) -> int:
+        return max(self._max, default_gamma)
+
+    def select_gamma(
+        self,
+        draft_id: str,
+        default_gamma: int,
+        context: Optional[GammaContext] = None,
+    ) -> int:
+        if context is None:
+            return self._default
+
+        probabilities = list(context.acceptance_probabilities or [])
+        if len(probabilities) < self._max:
+            tail = probabilities[-1] if probabilities else self._accept_target
+            probabilities.extend([tail] * (self._max - len(probabilities)))
+
+        queue_depth = max(0, context.queue_depth)
+        queue_span = max(1.0, self._queue_high - self._queue_low)
+        if queue_depth <= self._queue_low:
+            queue_factor = 0.0
+        else:
+            queue_factor = min(1.0, (queue_depth - self._queue_low) / queue_span)
+
+        ema = self._ema.get(draft_id, self._accept_target)
+        accept_shortfall = max(0.0, self._accept_target - ema)
+        accept_excess = max(0.0, ema - self._accept_target)
+
+        penalty_multiplier = 1.0 + (queue_factor * self._queue_gain) + (accept_shortfall * self._accept_gain)
+        reward_multiplier = 1.0 + (accept_excess * self._accept_gain)
+        penalty_multiplier = max(0.05, penalty_multiplier)
+
+        best_gamma = self._default
+        best_score = float('-inf')
+
+        for gamma in range(self._min, self._max + 1):
+            expected_accepts = sum(probabilities[:gamma])
+            expected_accepts = max(0.0, min(float(gamma), expected_accepts))
+            expected_waste = max(0.0, gamma - expected_accepts)
+            efficiency = expected_accepts / gamma if gamma > 0 else 0.0
+
+            score = (expected_accepts * reward_multiplier)
+            score += efficiency * self._efficiency_weight
+            score -= self._waste_penalty * penalty_multiplier * expected_waste
+            score -= queue_factor * self._waste_penalty * 0.1 * gamma
+
+            if score > best_score or (math.isclose(score, best_score) and gamma < best_gamma):
+                best_score = score
+                best_gamma = gamma
+
+        return max(self._min, min(self._max, best_gamma))
+
+    def update_gamma(self, draft_id: str, stats: GammaConversationStats) -> None:
+        beta = max(0.0, min(1.0, self._ema_beta))
+        current = float(max(0.0, min(1.0, stats.acceptance_ratio)))
+        previous = self._ema.get(draft_id)
+        if previous is None:
+            self._ema[draft_id] = current
+        else:
+            self._ema[draft_id] = (1.0 - beta) * previous + beta * current
+
 
 
 class AcceptanceBackoffGammaPolicy(GammaPolicy):
@@ -69,7 +175,15 @@ class AcceptanceBackoffGammaPolicy(GammaPolicy):
         self._high = float(config.get("high_acceptance", 0.6))
         self._last_ratio: Dict[str, float] = {}
 
-    def select_gamma(self, draft_id: str, default_gamma: int) -> int:
+    def required_depth(self, default_gamma: int) -> int:
+        return 0
+
+    def select_gamma(
+        self,
+        draft_id: str,
+        default_gamma: int,
+        context: Optional[GammaContext] = None,
+    ) -> int:
         ratio = self._last_ratio.get(draft_id)
         if ratio is None:
             return self._default
@@ -2090,7 +2204,44 @@ class DraftServer:
                 print(f"[{self.env.now:.1f}ms] Draft {self.id}: Prefill completed for {prompt_length} tokens", flush=True)
 
             # Phase 2: Generate answer with multiple speculation rounds
-            gamma_value = max(1, int(self._gamma_policy.select_gamma(self.id, self.gamma)))
+            candidate_depth = self.gamma
+            try:
+                candidate_depth = int(self._gamma_policy.required_depth(self.gamma))
+            except Exception:
+                candidate_depth = self.gamma
+            acceptance_probs: Tuple[float, ...] = tuple()
+            if candidate_depth and candidate_depth > 0:
+                candidate_depth = max(1, min(candidate_depth, 512))
+                try:
+                    default_rate = self._effective_acceptance_rate(conn, prompt_length, candidate_depth)
+                    probs = self._acceptance_model.position_probabilities(
+                        context_length=float(prompt_length),
+                        depth=candidate_depth,
+                        default=default_rate,
+                    )
+                    acceptance_probs = tuple(max(0.0, min(1.0, float(p))) for p in probs)
+                except Exception as exc:
+                    if self.cfg.debug:
+                        print(
+                            f"[{self.env.now:.1f}ms] Draft {self.id}: gamma policy acceptance lookup failed: {exc}",
+                            flush=True,
+                        )
+                    acceptance_probs = tuple()
+            queue_depth = target_server.queue_len() if target_server is not None else 0
+            gamma_context = GammaContext(
+                draft_id=self.id,
+                target_id=target_id,
+                context_length=prompt_length,
+                queue_depth=queue_depth,
+                acceptance_probabilities=acceptance_probs,
+            )
+            try:
+                selected_gamma = self._gamma_policy.select_gamma(self.id, self.gamma, gamma_context)
+            except Exception as exc:
+                if self.cfg.debug:
+                    print(f"[{self.env.now:.1f}ms] Draft {self.id}: gamma policy select failed: {exc}", flush=True)
+                selected_gamma = self.gamma
+            gamma_value = max(1, int(selected_gamma or 0))
             rounds_needed = (answer_length + gamma_value - 1) // gamma_value  # ceiling division
             if self.id in ["llama_d000", "llama_d001"]:
                 print(
@@ -3701,6 +3852,8 @@ def _build_gamma_policy(cfg: Config) -> GammaPolicy:
     spec_cfg = dict(getattr(cfg, "speculation_config", {}) or {})
     policy_cfg = dict(spec_cfg.get("gamma_policy", {}) or {})
     policy_type = str(policy_cfg.get("type", "constant")).lower()
+    if policy_type in {"specpp", "spec++"}:
+        return SpecPPGammaPolicy(cfg.gamma, policy_cfg)
     if policy_type == "acceptance_backoff":
         return AcceptanceBackoffGammaPolicy(cfg.gamma, policy_cfg)
     return ConstantGammaPolicy(cfg.gamma)
