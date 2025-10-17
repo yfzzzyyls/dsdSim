@@ -476,6 +476,21 @@ class Metrics:
             if decode_count:
                 for k, total in decode_components.items():
                     result[f"decode_breakdown_{k}_avg"] = total / decode_count
+
+        decode_jobs = [j for j in filtered if j.job_type == "decode"]
+        if decode_jobs:
+            queue_vals = []
+            compute_vals = []
+            for job in decode_jobs:
+                created = job.created_ms or 0.0
+                started = job.started_ms if job.started_ms is not None else created
+                finished = job.finished_ms if job.finished_ms is not None else started
+                queue_vals.append(max(0.0, started - created))
+                compute_vals.append(max(0.0, finished - started))
+            if queue_vals:
+                result["decode_breakdown_queue_ms_avg"] = sum(queue_vals) / len(queue_vals)
+            if compute_vals:
+                result["decode_breakdown_compute_ms_avg"] = sum(compute_vals) / len(compute_vals)
         elif observed_entries:
             result["completed_conversation_count"] = 0
             result["conversation_completion_rate"] = 0.0
@@ -1570,6 +1585,18 @@ class DraftServer:
 
                 yield wait_event
 
+                queue_elapsed = 0.0
+                compute_elapsed = 0.0
+                if job.started_ms is not None and job.created_ms is not None:
+                    queue_elapsed = max(0.0, job.started_ms - job.created_ms)
+                if job.finished_ms is not None and job.started_ms is not None:
+                    compute_elapsed = max(0.0, job.finished_ms - job.started_ms)
+                decode_breakdown["queue_ms"] += queue_elapsed
+                decode_breakdown["compute_ms"] += compute_elapsed
+                if ttft_pending:
+                    ttft_breakdown["decode_queue_ms"] += queue_elapsed
+                    ttft_breakdown["decode_compute_ms"] += compute_elapsed
+
                 if not fused_mode:
                     rsp_start = self.env.now
                     yield self._network_transfer(
@@ -1592,6 +1619,11 @@ class DraftServer:
                     prompt_length + tokens_generated + candidate.depth)
                 self.total_tokens_accepted += result.accepted_tokens
                 self.total_tokens_rejected += result.rejected_tokens
+                if hasattr(self.metrics, 'token_metrics'):
+                    tm = self.metrics.token_metrics
+                    tm.total_generated_tokens += candidate.depth
+                    tm.total_accepted_tokens += result.accepted_tokens
+                    tm.total_rejected_tokens += result.rejected_tokens
 
                 rtt = self.env.now - branch_start
                 self.total_round_trip_time += rtt
@@ -1705,6 +1737,13 @@ class DraftServer:
             target_id = conversation_target_id
             conn = conversation_conn
 
+            priority_class = trace_record.slo_class if trace_record is not None else None
+            if not priority_class:
+                priority_class = (self.cfg.trace_defaults or {}).get("slo_class")
+            if not priority_class and self.scheduler is not None:
+                priority_class = self.scheduler.default_priority_class
+            priority_class = priority_class or "standard"
+
             if self.framework == "eagle":
                 yield from self._run_eagle_conversation(
                     conversation_id,
@@ -1754,13 +1793,6 @@ class DraftServer:
                     f" (prompt={prompt_length} tokens, answer={answer_length} tokens) with target {target_id}{label}",
                     flush=True,
                 )
-
-            priority_class = trace_record.slo_class if trace_record is not None else None
-            if not priority_class:
-                priority_class = (self.cfg.trace_defaults or {}).get("slo_class")
-            if not priority_class and self.scheduler is not None:
-                priority_class = self.scheduler.default_priority_class
-            priority_class = priority_class or "standard"
 
             prefill_rtt_start = self.env.now
             prefill_completion = self.env.event()

@@ -5,14 +5,14 @@ verbose: true
 debug: true
 
 speculation:
-  framework: vanilla
-  execution_mode: distributed
+  framework: eagle
+  execution_mode: fused
   acceptance_model: acceptance/llama2_7b_vs_70b.joblib
 
 execution_mode: blocking
 gamma: 4
 
-trace_path: ../traces/gsm8k_trace.jsonl
+trace_path: ../traces/gsm8k_trace_10s.jsonl
 trace_defaults:
   slo_class: hetero_baseline
 
