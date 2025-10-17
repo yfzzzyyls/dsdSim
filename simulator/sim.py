@@ -36,6 +36,53 @@ class TargetParams:
     mode: str = "distributed"         # distributed | fused
     fused_draft_profile: Optional[Dict[str, Any]] = None
 
+
+@dataclass(frozen=True)
+class GammaConversationStats:
+    acceptance_ratio: float
+    tokens_generated: int
+    tokens_accepted: int
+
+
+class GammaPolicy:
+    def select_gamma(self, draft_id: str, default_gamma: int) -> int:
+        return default_gamma
+
+    def update_gamma(self, draft_id: str, stats: GammaConversationStats) -> None:
+        return
+
+
+class ConstantGammaPolicy(GammaPolicy):
+    def __init__(self, default_gamma: int) -> None:
+        self._default = max(1, int(default_gamma))
+
+    def select_gamma(self, draft_id: str, default_gamma: int) -> int:
+        return self._default
+
+
+class AcceptanceBackoffGammaPolicy(GammaPolicy):
+    def __init__(self, default_gamma: int, config: Mapping[str, Any]) -> None:
+        self._default = max(1, int(default_gamma))
+        self._min = max(1, int(config.get("min_gamma", 1)))
+        self._max = max(self._min, int(config.get("max_gamma", self._default)))
+        self._low = float(config.get("low_acceptance", 0.3))
+        self._high = float(config.get("high_acceptance", 0.6))
+        self._last_ratio: Dict[str, float] = {}
+
+    def select_gamma(self, draft_id: str, default_gamma: int) -> int:
+        ratio = self._last_ratio.get(draft_id)
+        if ratio is None:
+            return self._default
+        if ratio <= self._low:
+            return self._min
+        if ratio >= self._high:
+            return self._max
+        return self._default
+
+    def update_gamma(self, draft_id: str, stats: GammaConversationStats) -> None:
+        self._last_ratio[draft_id] = max(0.0, min(1.0, stats.acceptance_ratio))
+
+
 @dataclass
 class DraftParams:
     id: str
@@ -204,6 +251,7 @@ class Job:
     parallelism_plan: Dict[str, Any] = field(default_factory=dict)
     retry_count: int = 0
     accepted_tokens: int = 0
+    gamma_override: int = 0
 
 
 class ChunkBarrier:
@@ -912,13 +960,15 @@ class TargetServer:
         if provider is None:
             return 0.0
         phase = "prefill" if job.job_type == "prefill" else "verify"
+        gamma_override = getattr(job, "gamma_override", 0)
+        fanout_value = gamma_override if (job.job_type != "prefill" and gamma_override > 0) else (self.cfg.gamma if job.job_type != "prefill" else 1)
         request = PhaseRequest(
             phase=phase,
             model=self.p.model,
             hardware=self.p.gpu,
             batch_size=1,
             microbatch_size=1,
-            fanout=max(1, self.cfg.gamma if job.job_type != "prefill" else 1),
+            fanout=max(1, fanout_value),
             sequence_length=job.context_len or job.token_count,
             tokens_to_generate=job.token_count if job.job_type != "prefill" else 0,
             context_length=job.context_len,
@@ -982,13 +1032,22 @@ class TargetServer:
             "max_context": max_context,
         })
 
+        if phase != "prefill":
+            gamma_values = []
+            for job in jobs:
+                override = getattr(job, "gamma_override", 0)
+                gamma_values.append(override if override > 0 else self.cfg.gamma)
+            fanout_value = max(1, int(max(gamma_values) if gamma_values else self.cfg.gamma))
+        else:
+            fanout_value = 1
+
         return PhaseRequest(
             phase=phase,
             model=self.p.model,
             hardware=self.p.gpu,
             batch_size=batch_size,
             microbatch_size=min(batch_size, self.p.batch_size),
-            fanout=self.cfg.gamma if phase != "prefill" else 1,
+            fanout=fanout_value,
             sequence_length=seq_length,
             tokens_to_generate=max_tokens if phase != "prefill" else 0,
             context_length=ctx_length,
@@ -1235,7 +1294,8 @@ class DraftServer:
                  metrics: Metrics = None, scheduler: Optional["Scheduler"] = None,
                  trace_records: Optional[Sequence[TraceRecord]] = None,
                  performance_provider=None, network: Optional[NetworkFabric] = None,
-                 acceptance_model: Optional[AcceptanceRegressor] = None):
+                 acceptance_model: Optional[AcceptanceRegressor] = None,
+                 gamma_policy: Optional[GammaPolicy] = None):
         self.env = env
         self.p = params
         self.id = params.id
@@ -1253,6 +1313,7 @@ class DraftServer:
         self._acceptance_model = acceptance_model
         if self._acceptance_model is None:
             raise RuntimeError("Acceptance model must be provided; fallbacks are not permitted")
+        self._gamma_policy = gamma_policy or ConstantGammaPolicy(self.gamma)
         self.execution_mode = getattr(cfg, "speculation_execution_mode", "distributed").lower()
         self.framework = getattr(cfg, "speculation_framework", "vanilla").lower()
         self._workload_enabled = bool(cfg.workload.rate_rps > 0) if cfg and cfg.workload else False
@@ -1491,7 +1552,7 @@ class DraftServer:
             hardware=hardware,
             batch_size=1,
             microbatch_size=1,
-            fanout=max(1, self.gamma),
+            fanout=max(1, tokens),
             sequence_length=max(1, context_length),
             tokens_to_generate=max(1, tokens),
             context_length=max(0, context_length),
@@ -2029,9 +2090,14 @@ class DraftServer:
                 print(f"[{self.env.now:.1f}ms] Draft {self.id}: Prefill completed for {prompt_length} tokens", flush=True)
 
             # Phase 2: Generate answer with multiple speculation rounds
-            rounds_needed = (answer_length + self.gamma - 1) // self.gamma  # ceiling division
+            gamma_value = max(1, int(self._gamma_policy.select_gamma(self.id, self.gamma)))
+            rounds_needed = (answer_length + gamma_value - 1) // gamma_value  # ceiling division
             if self.id in ["llama_d000", "llama_d001"]:
-                print(f"[{self.env.now:.1f}ms] Draft {self.id}: rounds_needed={rounds_needed} (answer={answer_length}, gamma={self.gamma})", flush=True)
+                print(
+                    f"[{self.env.now:.1f}ms] Draft {self.id}: rounds_needed={rounds_needed} "
+                    f"(answer={answer_length}, gamma={gamma_value})",
+                    flush=True,
+                )
             tokens_generated_in_conversation = 0
             tokens_accepted_in_conversation = 0
             first_token_time_ms = None  # Track TTFT
@@ -2048,7 +2114,7 @@ class DraftServer:
 
                     # Determine how many tokens to generate in this round
                     tokens_remaining = answer_length - tokens_generated_in_conversation
-                    tokens_this_round = min(self.gamma, tokens_remaining)
+                    tokens_this_round = min(gamma_value, tokens_remaining)
                     if self.id in ["llama_d000", "llama_d001"]:
                         print(f"[{self.env.now:.1f}ms] Draft {self.id}: Round {round_num+1}/{rounds_needed}, tokens_this_round={tokens_this_round}", flush=True)
 
@@ -2087,6 +2153,7 @@ class DraftServer:
                         target_id=target_id,
                         priority_class=priority_class,
                         phase="decode",
+                        gamma_override=gamma_value,
                     )
 
                     # Send chunk to target (forward latency)
@@ -2236,6 +2303,15 @@ class DraftServer:
                             ttft_breakdown=ttft_breakdown,
                             decode_breakdown=decode_breakdown,
                         )
+
+                    self._gamma_policy.update_gamma(
+                        self.id,
+                        GammaConversationStats(
+                            acceptance_ratio=conversation_acceptance,
+                            tokens_generated=tokens_generated_in_conversation,
+                            tokens_accepted=tokens_accepted_in_conversation,
+                        ),
+                    )
 
             # Schedule next arrival for both think_enabled and workload-driven modes
             if not self._trace_mode:
@@ -3619,6 +3695,17 @@ def heartbeat_monitor(env: simpy.Environment, metrics: Metrics, targets: List[Ta
         target_info = [f"{t.p.id}:{t.queue_len()}" for t in targets]
         print(f"[{env.now:.0f}ms] HB#{count}: completed={len(metrics.completed)} queues={target_info}", flush=True)
 
+
+
+def _build_gamma_policy(cfg: Config) -> GammaPolicy:
+    spec_cfg = dict(getattr(cfg, "speculation_config", {}) or {})
+    policy_cfg = dict(spec_cfg.get("gamma_policy", {}) or {})
+    policy_type = str(policy_cfg.get("type", "constant")).lower()
+    if policy_type == "acceptance_backoff":
+        return AcceptanceBackoffGammaPolicy(cfg.gamma, policy_cfg)
+    return ConstantGammaPolicy(cfg.gamma)
+
+
 def build(env: simpy.Environment, cfg: Config):
     random.seed(cfg.seed)
     metrics = Metrics(verbose=cfg.verbose, burn_in_ms=cfg.burn_in_ms)
@@ -3873,6 +3960,7 @@ def build(env: simpy.Environment, cfg: Config):
         )
     
     # Create draft servers with connections
+    gamma_policy = _build_gamma_policy(cfg)
 
     for d in draft_configs:
         cluster_name = draft_cluster_map.get(d.get("id"), str(d.get("cluster", "default")))
@@ -3919,6 +4007,7 @@ def build(env: simpy.Environment, cfg: Config):
                 performance_provider=performance_provider,
                 network=network_fabric,
                 acceptance_model=acceptance_model,
+                gamma_policy=gamma_policy,
             )
         )
 
