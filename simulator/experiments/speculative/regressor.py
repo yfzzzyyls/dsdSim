@@ -31,7 +31,7 @@ import json
 from collections import defaultdict
 from pathlib import Path
 import sys
-from typing import Dict, Iterable, List, Mapping, Optional, Tuple
+from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = SCRIPT_DIR.parent.parent.parent
@@ -40,7 +40,12 @@ if str(PROJECT_ROOT) not in sys.path:
 
 import joblib
 import numpy as np
-from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
+from sklearn.ensemble import (
+    HistGradientBoostingClassifier,
+    HistGradientBoostingRegressor,
+    RandomForestClassifier,
+    RandomForestRegressor,
+)
 from sklearn.metrics import accuracy_score, mean_squared_error
 from sklearn.model_selection import train_test_split
 
@@ -79,6 +84,18 @@ def parse_args() -> argparse.Namespace:
         nargs="*",
         default=[],
         help="Optional key=value metadata to store alongside the model.",
+    )
+    parser.add_argument(
+        "--algorithm",
+        choices=["random_forest", "gbdt", "moe_gbdt"],
+        default="random_forest",
+        help="Regressor family to train (default: random_forest).",
+    )
+    parser.add_argument(
+        "--min-group-samples",
+        type=int,
+        default=200,
+        help="Minimum samples per expert when using moe_gbdt.",
     )
     parser.add_argument(
         "--test-size",
@@ -143,13 +160,14 @@ def parse_metadata(pairs: Iterable[str]) -> Dict[str, str]:
 COUNT_FEATURES = ["context_length", "spec_tokens", "drafter_model", "verifier_model"]
 ACCEPT_FEATURES = COUNT_FEATURES + ["position"]
 CATEGORICAL_FEATURES = {"drafter_model", "verifier_model"}
+GROUP_FEATURES = ["drafter_model", "verifier_model", "spec_tokens"]
 _UNKNOWN_CATEGORY = "__UNKNOWN__"
 
 def build_datasets(
     records: Iterable[dict],
     spec_tokens: int,
     metadata: Optional[Mapping[str, str]] = None,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, Dict[str, Dict[str, int]]]:
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, Dict[str, Dict[str, int]], List[str], List[str], Dict[str, Dict[str, object]]]:
     """
     Returns:
         X_count (n_iterations, n_features),
@@ -162,6 +180,9 @@ def build_datasets(
     count_targets: List[int] = []
     accept_features: List[List[float]] = []
     accept_targets: List[int] = []
+    count_groups: List[str] = []
+    accept_groups: List[str] = []
+    group_metadata: Dict[str, Dict[str, object]] = {}
     category_maps: Dict[str, Dict[str, int]] = defaultdict(dict)
     metadata = metadata or {}
 
@@ -214,10 +235,22 @@ def build_datasets(
                 "drafter_model": drafter_model,
                 "verifier_model": verifier_model,
             }
+            group_key = "||".join([
+                str(drafter_model or _UNKNOWN_CATEGORY),
+                str(verifier_model or _UNKNOWN_CATEGORY),
+                str(record_spec_tokens or spec_tokens),
+            ])
+            if group_key not in group_metadata:
+                group_metadata[group_key] = {
+                    "drafter_model": drafter_model,
+                    "verifier_model": verifier_model,
+                    "spec_tokens": record_spec_tokens or spec_tokens,
+                }
 
             count_row = [feature_value(name, base_values, None) for name in COUNT_FEATURES]
             count_features.append(count_row)
             count_targets.append(accepted_count)
+            count_groups.append(group_key)
 
             for pos in range(min(spec_len, record_spec_tokens or spec_tokens)):
                 if pos < len(accepted_flags):
@@ -225,6 +258,7 @@ def build_datasets(
                     accept_row = [feature_value(name, base_values, pos) for name in ACCEPT_FEATURES]
                     accept_features.append(accept_row)
                     accept_targets.append(flag)
+                    accept_groups.append(group_key)
 
     if not count_features or not accept_features:
         raise ValueError("Insufficient data to train regressors.")
@@ -235,7 +269,7 @@ def build_datasets(
     y_accept = np.array(accept_targets, dtype=np.int32)
     categorical_maps = {feature: dict(mapping) for feature, mapping in category_maps.items()}
 
-    return X_count, y_count, X_accept, y_accept, categorical_maps
+    return X_count, y_count, X_accept, y_accept, categorical_maps, count_groups, accept_groups, group_metadata
 
 
 def train_models(
@@ -248,12 +282,77 @@ def train_models(
     max_depth: Optional[int],
     random_state: int,
     test_size: float,
-) -> Tuple[
-    RandomForestRegressor,
-    RandomForestClassifier,
-    Dict[str, float],
-]:
-    # Accepted-count regressor
+    algorithm: str,
+    count_groups: Sequence[str],
+    accept_groups: Sequence[str],
+    group_metadata: Mapping[str, Dict[str, object]],
+    min_group_samples: int,
+) -> Tuple[Dict[str, object], Dict[str, float]]:
+    algo = algorithm.lower()
+    if algo == "random_forest":
+        reg, clf, metrics = _train_random_forest(
+            X_count,
+            y_count,
+            X_accept,
+            y_accept,
+            n_estimators=n_estimators,
+            max_depth=max_depth,
+            random_state=random_state,
+            test_size=test_size,
+        )
+        model_bundle = {
+            "algorithm": "random_forest",
+            "regressor": reg,
+            "classifier": clf,
+        }
+        return model_bundle, metrics
+    if algo == "gbdt":
+        reg, clf, metrics = _train_hist_gradient_boosting(
+            X_count,
+            y_count,
+            X_accept,
+            y_accept,
+            n_estimators=n_estimators,
+            max_depth=max_depth,
+            random_state=random_state,
+            test_size=test_size,
+        )
+        model_bundle = {
+            "algorithm": "gbdt",
+            "regressor": reg,
+            "classifier": clf,
+        }
+        return model_bundle, metrics
+    if algo == "moe_gbdt":
+        bundle, metrics = _train_moe_hist_gradient_boosting(
+            X_count,
+            y_count,
+            X_accept,
+            y_accept,
+            n_estimators=n_estimators,
+            max_depth=max_depth,
+            random_state=random_state,
+            test_size=test_size,
+            count_groups=count_groups,
+            accept_groups=accept_groups,
+            group_metadata=group_metadata,
+            min_group_samples=min_group_samples,
+        )
+        return bundle, metrics
+    raise ValueError(f"Unsupported algorithm '{algorithm}'")
+
+
+def _train_random_forest(
+    X_count: np.ndarray,
+    y_count: np.ndarray,
+    X_accept: np.ndarray,
+    y_accept: np.ndarray,
+    *,
+    n_estimators: int,
+    max_depth: Optional[int],
+    random_state: int,
+    test_size: float,
+) -> Tuple[RandomForestRegressor, RandomForestClassifier, Dict[str, float]]:
     Xc_train, Xc_test, yc_train, yc_test = train_test_split(
         X_count,
         y_count,
@@ -268,10 +367,9 @@ def train_models(
     )
     reg.fit(Xc_train, yc_train)
     yc_pred = reg.predict(Xc_test)
-    reg_mse = mean_squared_error(yc_test, yc_pred)
     reg_diagnostics = regression_metrics(yc_test, yc_pred)
+    reg_mse = mean_squared_error(yc_test, yc_pred)
 
-    # Acceptance classifier
     Xa_train, Xa_test, ya_train, ya_test = train_test_split(
         X_accept,
         y_accept,
@@ -305,18 +403,172 @@ def train_models(
     return reg, clf, metrics
 
 
+def _train_hist_gradient_boosting(
+    X_count: np.ndarray,
+    y_count: np.ndarray,
+    X_accept: np.ndarray,
+    y_accept: np.ndarray,
+    *,
+    n_estimators: int,
+    max_depth: Optional[int],
+    random_state: int,
+    test_size: float,
+) -> Tuple[HistGradientBoostingRegressor, HistGradientBoostingClassifier, Dict[str, float]]:
+    Xc_train, Xc_test, yc_train, yc_test = train_test_split(
+        X_count,
+        y_count,
+        test_size=test_size,
+        random_state=random_state,
+    )
+    reg = HistGradientBoostingRegressor(
+        max_iter=n_estimators,
+        max_depth=max_depth,
+        random_state=random_state,
+    )
+    reg.fit(Xc_train, yc_train)
+    yc_pred = reg.predict(Xc_test)
+    reg_diagnostics = regression_metrics(yc_test, yc_pred)
+    reg_mse = mean_squared_error(yc_test, yc_pred)
+
+    Xa_train, Xa_test, ya_train, ya_test = train_test_split(
+        X_accept,
+        y_accept,
+        test_size=test_size,
+        random_state=random_state,
+    )
+    clf = HistGradientBoostingClassifier(
+        max_iter=n_estimators,
+        max_depth=max_depth,
+        random_state=random_state,
+    )
+    clf.fit(Xa_train, ya_train)
+    ya_proba = clf.predict_proba(Xa_test)
+    ya_prob = positive_class_probabilities(clf, ya_proba)
+    if len(getattr(clf, "classes_", [])) == 1:
+        ya_pred = np.full(len(Xa_test), clf.classes_[0], dtype=np.int32)
+    else:
+        ya_pred = (ya_prob >= 0.5).astype(np.int32)
+    clf_acc = accuracy_score(ya_test, ya_pred)
+    clf_diagnostics = classification_metrics(ya_test, ya_pred, ya_prob, ece_bins=10)
+
+    metrics = {
+        "count_regression": reg_diagnostics,
+        "accept_classification": clf_diagnostics,
+        "count_mse": float(reg_mse),
+        "accept_accuracy": float(clf_acc),
+        "train_iterations": int(len(X_count)),
+        "train_positions": int(len(X_accept)),
+    }
+    return reg, clf, metrics
+
+
+def _fit_hist_gradient_boosting_models(
+    X_count: np.ndarray,
+    y_count: np.ndarray,
+    X_accept: np.ndarray,
+    y_accept: np.ndarray,
+    *,
+    n_estimators: int,
+    max_depth: Optional[int],
+    random_state: int,
+) -> Tuple[HistGradientBoostingRegressor, HistGradientBoostingClassifier]:
+    reg = HistGradientBoostingRegressor(
+        max_iter=n_estimators,
+        max_depth=max_depth,
+        random_state=random_state,
+    )
+    reg.fit(X_count, y_count)
+    clf = HistGradientBoostingClassifier(
+        max_iter=n_estimators,
+        max_depth=max_depth,
+        random_state=random_state,
+    )
+    clf.fit(X_accept, y_accept)
+    return reg, clf
+
+
+def _train_moe_hist_gradient_boosting(
+    X_count: np.ndarray,
+    y_count: np.ndarray,
+    X_accept: np.ndarray,
+    y_accept: np.ndarray,
+    *,
+    n_estimators: int,
+    max_depth: Optional[int],
+    random_state: int,
+    test_size: float,
+    count_groups: Sequence[str],
+    accept_groups: Sequence[str],
+    group_metadata: Mapping[str, Dict[str, object]],
+    min_group_samples: int,
+) -> Tuple[Dict[str, object], Dict[str, float]]:
+    reg, clf, metrics = _train_hist_gradient_boosting(
+        X_count,
+        y_count,
+        X_accept,
+        y_accept,
+        n_estimators=n_estimators,
+        max_depth=max_depth,
+        random_state=random_state,
+        test_size=test_size,
+    )
+
+    count_groups_arr = np.array(count_groups)
+    accept_groups_arr = np.array(accept_groups)
+    experts: Dict[str, Dict[str, object]] = {}
+    unique_keys = sorted(set(count_groups_arr))
+    for key in unique_keys:
+        count_idx = np.where(count_groups_arr == key)[0]
+        accept_idx = np.where(accept_groups_arr == key)[0]
+        if len(count_idx) < min_group_samples or len(accept_idx) < min_group_samples:
+            continue
+        expert_reg, expert_clf = _fit_hist_gradient_boosting_models(
+            X_count[count_idx],
+            y_count[count_idx],
+            X_accept[accept_idx],
+            y_accept[accept_idx],
+            n_estimators=n_estimators,
+            max_depth=max_depth,
+            random_state=random_state + (hash(key) % 9973),
+        )
+        experts[key] = {
+            "regressor": expert_reg,
+            "classifier": expert_clf,
+        }
+
+    metrics["expert_count"] = len(experts)
+    model_bundle = {
+        "algorithm": "moe_gbdt",
+        "regressor": reg,
+        "classifier": clf,
+        "experts": experts,
+        "group_features": GROUP_FEATURES,
+        "group_info": dict(group_metadata),
+    }
+    return model_bundle, metrics
+
+
 def main() -> None:
     args = parse_args()
     records = load_records(args.details_jsonl)
     metadata = parse_metadata(args.metadata)
 
-    X_count, y_count, X_accept, y_accept, categorical_maps = build_datasets(
+    (
+        X_count,
+        y_count,
+        X_accept,
+        y_accept,
+        categorical_maps,
+        count_groups,
+        accept_groups,
+        group_metadata,
+    ) = build_datasets(
         records,
         spec_tokens=args.spec_tokens,
         metadata=metadata,
     )
 
-    reg_model, clf_model, metrics = train_models(
+    model_bundle, metrics = train_models(
         X_count,
         y_count,
         X_accept,
@@ -325,6 +577,11 @@ def main() -> None:
         max_depth=args.max_depth,
         random_state=args.random_state,
         test_size=args.test_size,
+        algorithm=args.algorithm,
+        count_groups=count_groups,
+        accept_groups=accept_groups,
+        group_metadata=group_metadata,
+        min_group_samples=args.min_group_samples,
     )
 
     bundle = {
@@ -335,11 +592,10 @@ def main() -> None:
             "accept": ACCEPT_FEATURES,
         },
         "categorical_maps": categorical_maps,
-        "regressor": reg_model,
-        "classifier": clf_model,
         "metrics": metrics,
         "details_source": str(args.details_jsonl),
     }
+    bundle.update(model_bundle)
 
     args.output_model.parent.mkdir(parents=True, exist_ok=True)
     joblib.dump(bundle, args.output_model)

@@ -21,6 +21,10 @@ class AcceptanceRegressor:
         feature_columns: Mapping[str, Sequence[str]],
         metadata: Mapping[str, object],
         categorical_maps: Optional[Mapping[str, Mapping[str, int]]] = None,
+        algorithm: str = "random_forest",
+        experts: Optional[Mapping[str, Mapping[str, Any]]] = None,
+        group_features: Optional[Sequence[str]] = None,
+        group_info: Optional[Mapping[str, Mapping[str, object]]] = None,
     ) -> None:
         if spec_tokens <= 0:
             spec_tokens = 1
@@ -34,6 +38,16 @@ class AcceptanceRegressor:
         self._categorical_maps: Dict[str, Dict[str, int]] = {
             key: dict(value) for key, value in (categorical_maps or {}).items()
         }
+        self.algorithm = str(algorithm or "random_forest").lower()
+        self._experts: Dict[str, Dict[str, Any]] = {}
+        for key, models in (experts or {}).items():
+            if isinstance(models, Mapping):
+                reg = models.get("regressor")
+                clf = models.get("classifier")
+                if reg is not None and clf is not None:
+                    self._experts[str(key)] = {"regressor": reg, "classifier": clf}
+        self._group_features = list(group_features or [])
+        self._group_info = {str(k): dict(v) for k, v in (group_info or {}).items()}
 
         classes = getattr(classifier, "classes_", None)
         positive_index: Optional[int] = None
@@ -69,6 +83,10 @@ class AcceptanceRegressor:
         feature_columns = bundle.get("feature_columns") or {}
         metadata = bundle.get("metadata") or {}
         categorical_maps = bundle.get("categorical_maps") or {}
+        algorithm = bundle.get("algorithm", "random_forest")
+        experts = bundle.get("experts") or {}
+        group_features = bundle.get("group_features") or []
+        group_info = bundle.get("group_info") or {}
         return cls(
             spec_tokens=spec_tokens,
             regressor=regressor,
@@ -76,6 +94,10 @@ class AcceptanceRegressor:
             feature_columns=feature_columns,
             metadata=metadata,
             categorical_maps=categorical_maps,
+            algorithm=algorithm,
+            experts=experts,
+            group_features=group_features,
+            group_info=group_info,
         )
 
     def expected_accepts(
@@ -88,7 +110,8 @@ class AcceptanceRegressor:
             [self._make_feature_row(self._count_features, context_length, None, feature_context)],
             dtype=np.float32,
         )
-        prediction = self._regressor.predict(row)
+        regressor = self._select_regressor(feature_context)
+        prediction = regressor.predict(row)
         return float(max(0.0, prediction[0]))
 
     def position_probabilities(
@@ -111,8 +134,9 @@ class AcceptanceRegressor:
         probs: List[float] = []
         if rows:
             arr = np.array(rows, dtype=np.float32)
-            if hasattr(self._classifier, "predict_proba"):
-                proba = self._classifier.predict_proba(arr)
+            classifier = self._select_classifier(feature_context)
+            if hasattr(classifier, "predict_proba"):
+                proba = classifier.predict_proba(arr)
                 if proba.ndim == 2:
                     if proba.shape[1] == 1:
                         if self._positive_class_value == 1:
@@ -129,7 +153,7 @@ class AcceptanceRegressor:
                 else:
                     probs.extend(0.0 for _ in rows)
             else:
-                predictions = self._classifier.predict(arr)
+                predictions = classifier.predict(arr)
                 probs.extend(1.0 if pred == self._positive_class_value else 0.0 for pred in predictions)
         if len(probs) < depth:
             tail = probs[-1] if probs else (default if default is not None else 0.0)
@@ -174,7 +198,43 @@ class AcceptanceRegressor:
 
     def _encode_category(self, feature: str, value: Any) -> int:
         mapping = self._categorical_maps.setdefault(feature, {})
-        key = str(value) if value is not None else _UNKNOWN_CATEGORY
+        key = str(value) if value is not None else UNKNOWN_CATEGORY
         if key not in mapping:
             mapping[key] = len(mapping)
         return mapping[key]
+
+    def _resolve_group_key(self, feature_context: Mapping[str, Any]) -> str:
+        if not self._group_features:
+            return ""
+        values: List[str] = []
+        for name in self._group_features:
+            value = feature_context.get(name)
+            if name == "spec_tokens":
+                try:
+                    value = int(value)
+                except (TypeError, ValueError):
+                    value = self.spec_tokens
+            if value is None:
+                value = UNKNOWN_CATEGORY
+            values.append(str(value))
+        return "||".join(values)
+
+    def _select_regressor(self, feature_context: Optional[Mapping[str, Any]]) -> Any:
+        if self.algorithm != "moe_gbdt":
+            return self._regressor
+        context = feature_context or {}
+        key = self._resolve_group_key(context)
+        expert = self._experts.get(key)
+        if expert and expert.get("regressor") is not None:
+            return expert["regressor"]
+        return self._regressor
+
+    def _select_classifier(self, feature_context: Optional[Mapping[str, Any]]) -> Any:
+        if self.algorithm != "moe_gbdt":
+            return self._classifier
+        context = feature_context or {}
+        key = self._resolve_group_key(context)
+        expert = self._experts.get(key)
+        if expert and expert.get("classifier") is not None:
+            return expert["classifier"]
+        return self._classifier
