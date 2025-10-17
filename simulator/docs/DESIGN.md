@@ -901,6 +901,7 @@ These knobs mirror the mechanisms used in ORCA, Sarathi-Serve, DistServe, Triton
   - Each tick drains completed work, re-evaluates queue slack, and forms new microbatches subject to TTFT SLO forecasts.
 - Batching: `max_batch` + `max_wait_ms`, ensuring predicted TTFT ≤ SLO using LUT latency plus network RTT.
 - Adaptive speculation: controllers combine verify queue depth, KV headroom, and acceptance predictions to adjust fanout `k` and draft depth every tick.
+  - EAGLE load controls: `prune_score_threshold` prunes low-confidence branches, and an optional `load_control` block (tokens_low/high, min_depth_scale, min_beam_width) scales branch depth/beam width based on verifier backlog. Targets expose `pending_decode_tokens()` and queue depth so drafters/routers can react to congestion.
   - Load-aware controller: shrink `k` or depth when verify queue wait or KV utilization crosses thresholds; expand when lightly loaded and acceptance confidence is high.
   - Network-aware guard: when outbound link utilization or RTT spikes, bias toward fused mode or lower `k` to avoid saturating slow paths.
 - Drafter portfolio: maintain multiple draft models (tiny/mid/large) and choose per request using prompt features, acceptance predictions, and escalation slack.

@@ -20,6 +20,13 @@ speculation:
     beam_width: 4
     max_depth: 4
     min_depth: 1
+    prune_score_threshold: 0.0  # drop branches when score < threshold; keep 0.0 to disable
+    load_control:
+      enabled: false            # set true to scale depth/beam with verifier backlog
+      tokens_low: 256           # backlog token count where full depth/beam is allowed
+      tokens_high: 1024         # backlog token count where we clamp to min depth/beam
+      min_depth_scale: 0.5      # minimum depth scale when congested (fraction of max_depth)
+      min_beam_width: 1         # minimum beam width under congestion
 
 execution_mode: blocking
 gamma: 4

@@ -1008,12 +1008,15 @@ class TargetServer:
         self._recent_batch_latencies = []  # Keep last N batch latencies
         self._max_latency_history = 20  # Track last 20 batches
         self._avg_batch_latency_ms = None  # Running average
+        self._pending_decode_tokens = 0  # Tokens awaiting verification (queued or inflight)
         
         self.proc = env.process(self._serve_loop())
 
     # queue helpers
     def enqueue(self, job: Job):
         self._enqueued_count += 1
+        if job.job_type != "prefill":
+            self._pending_decode_tokens += max(0, int(job.token_count or 0))
         draft_id = (job.draft_id or "").strip()
         if self.p.id == "llama_t01" or draft_id in {"llama_d001", "llama_d011", "llama_d017", "llama_d031"}:
             print(
@@ -1024,6 +1027,9 @@ class TargetServer:
         # Debug: print if queue is getting very large
         if self._enqueued_count > 100 and self._enqueued_count % 50 == 0:
             print(f"[{self.env.now:.1f}ms] WARNING: Target {self.p.id} queue size: {self._enqueued_count}", flush=True)
+
+    def pending_decode_tokens(self) -> int:
+        return max(0, int(self._pending_decode_tokens))
 
     def queue_len(self) -> int:
         # Include the job currently in service so JSQ sees busy targets
@@ -1182,6 +1188,9 @@ class TargetServer:
         event = job.completion_event or self.env.event()
 
         def _run():
+            if job.job_type != "prefill":
+                self._pending_decode_tokens += max(0, int(job.token_count or 0))
+
             job.started_ms = self.env.now
             total_latency = 0.0
             phase = "prefill" if job.job_type == "prefill" else "decode"
@@ -1193,6 +1202,9 @@ class TargetServer:
             job.finished_ms = self.env.now
             if self.metrics:
                 self.metrics.add(job)
+            if job.job_type != "prefill":
+                self._pending_decode_tokens = max(0, self._pending_decode_tokens - max(0, int(job.token_count or 0)))
+
             if not event.triggered:
                 event.succeed(job)
 
@@ -1366,6 +1378,9 @@ class TargetServer:
                             f"[{self.env.now:.1f}ms] Target {self.p.id}: completed {j.job_type} from {draft_id} (accepted={getattr(j, 'accepted_tokens', 0)}, retry={j.retry_count})",
                             flush=True,
                         )
+                    if j.job_type != "prefill":
+                        self._pending_decode_tokens = max(0, self._pending_decode_tokens - max(0, int(j.token_count or 0)))
+
                     # Signal completion to waiting draft
                     if j.completion_event and not j.completion_event.triggered:
                         j.completion_event.succeed()
@@ -1578,10 +1593,22 @@ class DraftServer:
             verifier_model = target.p.model or verifier_metadata.get("model") or verifier_metadata.get("model_name")
         drafter_metadata = self.metadata or {}
         drafter_model = drafter_metadata.get("model") or drafter_metadata.get("model_name") or self.id
+        pending_tokens = 0
+        queue_depth = 0
+        target = self._target_lookup.get(target_id)
+        if target is not None:
+            try:
+                pending_tokens = target.pending_decode_tokens()
+                queue_depth = target.queue_len()
+            except AttributeError:
+                pending_tokens = 0
+                queue_depth = 0
         return {
             "spec_tokens": int(max(1, spec_tokens)),
             "drafter_model": drafter_model,
             "verifier_model": verifier_model or target_id,
+            "pending_decode_tokens": int(pending_tokens),
+            "target_queue_depth": int(queue_depth),
         }
 
     def _effective_acceptance_rate(self, conn: ConnectionParams, context_length: int, depth: int) -> float:
@@ -1836,6 +1863,8 @@ class DraftServer:
         beam_width = max(1, int(self._get_eagle_param("beam_width", 4)))
         max_depth = max(1, int(self._get_eagle_param("max_depth", self.gamma)))
         min_depth = max(1, int(self._get_eagle_param("min_depth", 1)))
+        prune_threshold = float(self._get_eagle_param("prune_score_threshold", 0.0))
+        load_control_cfg = dict(self._eagle_cfg.get("load_control", {}) or {})
 
         tokens_generated = 0
         tokens_accepted = 0
@@ -1846,14 +1875,43 @@ class DraftServer:
         conversation_completed = False
 
         while tokens_accepted < answer_length and not conversation_completed:
+            beam_current = beam_width
+            max_depth_current = max_depth
+            pending_tokens = target_server.pending_decode_tokens() if target_server is not None else 0
+            queue_depth = target_server.queue_len() if target_server is not None else 0
+            depth_scale = 1.0
+            beam_ratio = 1.0
+            if load_control_cfg.get('enabled'):
+                tokens_low = float(load_control_cfg.get('tokens_low', 256.0))
+                tokens_high = float(load_control_cfg.get('tokens_high', max(tokens_low * 2.0, tokens_low + 1.0)))
+                min_depth_scale = float(load_control_cfg.get('min_depth_scale', 0.5))
+                min_depth_scale = max(0.0, min(1.0, min_depth_scale))
+                min_beam_width = max(1, int(load_control_cfg.get('min_beam_width', 1)))
+                if tokens_high <= tokens_low:
+                    beam_ratio = 0.0 if pending_tokens >= tokens_low else 1.0
+                else:
+                    if pending_tokens <= tokens_low:
+                        beam_ratio = 1.0
+                    elif pending_tokens >= tokens_high:
+                        beam_ratio = 0.0
+                    else:
+                        beam_ratio = (tokens_high - pending_tokens) / (tokens_high - tokens_low)
+                depth_scale = min_depth_scale + (1.0 - min_depth_scale) * beam_ratio
+                max_depth_current = max(min_depth, max(1, int(max_depth * depth_scale)))
+                if beam_width > min_beam_width:
+                    beam_current = max(min_beam_width, int(round(min_beam_width + (beam_width - min_beam_width) * beam_ratio)))
+                else:
+                    beam_current = beam_width
             tokens_remaining = answer_length - tokens_accepted
-            branch_depth = min(max_depth, tokens_remaining)
+            branch_depth = min(max_depth_current, tokens_remaining)
             if branch_depth < min_depth:
                 branch_depth = tokens_remaining
 
+            raw_candidates: List[BranchCandidate] = []
             candidates: List[BranchCandidate] = []
             generation_latency_total = 0.0
-            for idx in range(beam_width):
+            pruned_candidates = 0
+            for idx in range(beam_current):
                 if fused_mode:
                     generation_latency = 0.0
                 else:
@@ -1862,11 +1920,29 @@ class DraftServer:
                     yield self.env.timeout(generation_latency)
                 generation_latency_total += generation_latency
                 score = self._estimate_branch_score(branch_depth, conn, current_context_len)
-                candidates.append(BranchCandidate(idx, branch_depth, score))
+                branch = BranchCandidate(idx, branch_depth, score)
+                raw_candidates.append(branch)
+                if prune_threshold > 0.0 and score < prune_threshold:
+                    pruned_candidates += 1
+                else:
+                    candidates.append(branch)
                 self.total_tokens_generated += branch_depth
                 tokens_generated += branch_depth
+            if not candidates and raw_candidates:
+                fallback = max(raw_candidates, key=lambda c: c.score)
+                candidates.append(fallback)
+                if self.cfg.verbose or self.cfg.debug:
+                    print(
+                        f"[{self.env.now:.1f}ms] Draft {self.id}: pruning removed all candidates, using fallback branch (score={fallback.score:.4f})",
+                        flush=True,
+                    )
             decode_breakdown["generation_ms"] += generation_latency_total
             candidates.sort(key=lambda c: c.score, reverse=True)
+            if (self.cfg.verbose or self.cfg.debug) and pruned_candidates > 0:
+                print(
+                    f"[{self.env.now:.1f}ms] Draft {self.id}: pruned {pruned_candidates}/{beam_current} branches (pending_tokens={pending_tokens}, queue={queue_depth})",
+                    flush=True,
+                )
 
             branch_selected = False
             for candidate in candidates:
