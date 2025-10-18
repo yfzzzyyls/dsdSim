@@ -1,0 +1,68 @@
+experiment:
+  name: scheduler_search
+  description: "Small sweep over routing and batching knobs on the disaggregated topology."
+  runs:
+    - name: random_fifo
+      config: ../../configs/explorer/baseline.yaml
+      overrides:
+        router: random
+    - name: round_robin_fifo
+      config: ../../configs/explorer/baseline.yaml
+      overrides:
+        router: round_robin
+    - name: wjsq2_delay50us
+      config: ../../configs/explorer/baseline.yaml
+      overrides:
+        router: wjsq2
+        router_params:
+          d_choices: 2
+        scheduler:
+          decode:
+            max_wait_ms: 0.05
+          prefill:
+            max_wait_ms: 0.05
+    - name: wjsq2_delay100us_chunked
+      config: ../../configs/explorer/baseline.yaml
+      overrides:
+        router: wjsq2
+        router_params:
+          d_choices: 2
+        scheduler:
+          decode:
+            max_wait_ms: 0.10
+          prefill:
+            max_wait_ms: 0.10
+            chunk_tokens: 64
+    - name: dynamic_adaptive
+      config: ../../configs/explorer/baseline.yaml
+      overrides:
+        router: round_robin
+        scheduler:
+          prefill:
+            queue_policy: fifo
+            max_batch_requests: 4
+            max_wait_ms: 0.4
+            dynamic_policy:
+              enabled: true
+              low_queue_depth: 15
+              high_queue_depth: 120
+              low_wait_ms: 0.4
+              high_wait_ms: 2.8
+              low_batch_requests: 2
+              high_batch_requests: 12
+              low_delay_ms: 0.0
+              high_delay_ms: 0.5
+          decode:
+            queue_policy: fifo
+            max_batch_requests: 4
+            max_wait_ms: 0.35
+            dynamic_policy:
+              enabled: true
+              low_queue_depth: 10
+              high_queue_depth: 110
+              low_wait_ms: 0.3
+              high_wait_ms: 2.4
+              low_batch_requests: 2
+              high_batch_requests: 10
+              low_delay_ms: 0.0
+              high_delay_ms: 0.4
