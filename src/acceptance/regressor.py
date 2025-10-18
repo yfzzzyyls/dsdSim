@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+from collections import OrderedDict
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional, Sequence
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import joblib
 import numpy as np
@@ -48,6 +49,10 @@ class AcceptanceRegressor:
                     self._experts[str(key)] = {"regressor": reg, "classifier": clf}
         self._group_features = list(group_features or [])
         self._group_info = {str(k): dict(v) for k, v in (group_info or {}).items()}
+
+        # Memoisation cache for expensive probability lookups
+        self._prob_cache: "OrderedDict[Tuple[Any, ...], List[float]]" = OrderedDict()
+        self._prob_cache_limit = 2048  # configurable cap
 
         classes = getattr(classifier, "classes_", None)
         positive_index: Optional[int] = None
@@ -125,6 +130,12 @@ class AcceptanceRegressor:
         depth = int(max(0, depth))
         if depth == 0:
             return []
+        key = self._make_cache_key(context_length, depth, feature_context)
+        cached = self._prob_cache.get(key)
+        if cached is not None:
+            self._prob_cache.move_to_end(key)
+            return cached[:depth]
+
         limit = min(depth, self.spec_tokens)
         rows: List[List[float]] = []
         for pos in range(limit):
@@ -159,7 +170,43 @@ class AcceptanceRegressor:
             tail = probs[-1] if probs else (default if default is not None else 0.0)
             probs.extend([float(tail)] * (depth - len(probs)))
         clipped = [max(0.0, min(1.0, float(p))) for p in probs]
+        self._store_cache_entry(key, clipped)
         return clipped
+
+    def position_probabilities_batch(
+        self,
+        requests: Sequence[Tuple[float, int, Optional[Mapping[str, Any]]]],
+        *,
+        default: Optional[float] = None,
+    ) -> List[List[float]]:
+        results: List[List[float]] = []
+        missing: Dict[Tuple[Any, ...], Tuple[int, float, int, Optional[Mapping[str, Any]]]] = {}
+
+        for idx, (context_length, depth, feature_context) in enumerate(requests):
+            key = self._make_cache_key(context_length, depth, feature_context)
+            cached = self._prob_cache.get(key)
+            if cached is not None:
+                self._prob_cache.move_to_end(key)
+                results.append(cached[:depth])
+            else:
+                missing[key] = (idx, context_length, depth, feature_context)
+                results.append([])
+
+        # Compute missing entries one by one (still amortised through cache)
+        for key, (_, context_length, depth, feature_context) in missing.items():
+            self.position_probabilities(
+                context_length=context_length,
+                depth=depth,
+                default=default,
+                feature_context=feature_context,
+            )
+
+        # Populate results now that cache is filled
+        for i, (context_length, depth, feature_context) in enumerate(requests):
+            if not results[i]:
+                key = self._make_cache_key(context_length, depth, feature_context)
+                results[i] = self._prob_cache[key][:depth]
+        return results
 
     def _make_feature_row(
         self,
@@ -195,6 +242,35 @@ class AcceptanceRegressor:
                     except (TypeError, ValueError):
                         row.append(0.0)
         return row
+
+    def _make_cache_key(
+        self,
+        context_length: float,
+        depth: int,
+        feature_context: Optional[Mapping[str, Any]],
+    ) -> Tuple[Any, ...]:
+        ctx_items: Tuple[Any, ...] = ()
+        if feature_context:
+            ctx_items = tuple(
+                (str(k), self._normalise_value(v))
+                for k, v in sorted(feature_context.items())
+            )
+        return (round(float(context_length), 3), int(depth), ctx_items)
+
+    def _normalise_value(self, value: Any) -> Any:
+        if isinstance(value, float):
+            return round(value, 3)
+        if isinstance(value, (list, tuple)):
+            return tuple(self._normalise_value(v) for v in value)
+        if isinstance(value, dict):
+            return tuple((str(k), self._normalise_value(v)) for k, v in sorted(value.items()))
+        return value
+
+    def _store_cache_entry(self, key: Tuple[Any, ...], value: List[float]) -> None:
+        self._prob_cache[key] = list(value)
+        self._prob_cache.move_to_end(key)
+        if len(self._prob_cache) > self._prob_cache_limit:
+            self._prob_cache.popitem(last=False)
 
     def _encode_category(self, feature: str, value: Any) -> int:
         mapping = self._categorical_maps.setdefault(feature, {})
