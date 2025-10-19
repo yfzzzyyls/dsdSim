@@ -1,0 +1,226 @@
+sim_time_ms: 10000
+seed: 123
+verbose: true
+debug: true
+speculation:
+  framework: eagle
+  execution_mode: fused
+  gamma_policy:
+    type: specpp
+    min_gamma: 2
+    max_gamma: 8
+    stop_threshold: 0.7
+    fallback_gamma: 4
+  vanilla: null
+  eagle:
+    beam_width: 4
+    max_depth: 4
+    min_depth: 1
+    prune_score_threshold: 0.0
+    load_control:
+      enabled: false
+      tokens_low: 256
+      tokens_high: 1024
+      min_depth_scale: 0.5
+      min_beam_width: 1
+  acceptance:
+    disable_model: true
+    default_rate: 0.8
+execution_mode: blocking
+gamma: 4
+trace_path: traces/gsm8k_trace_10s.jsonl
+trace_replay:
+  per_draft_rps: 3.5
+trace_defaults:
+  slo_class: hetero_baseline
+prompt_length_min: 24
+prompt_length_max: 512
+prompt_scale_by_capability: true
+answer_length_mean: 420
+answer_length_std: 120
+answer_length_min: 96
+answer_length_max: 960
+use_answer_distribution: true
+mixed_batching: true
+router: semi_clairvoyant
+router_params: {}
+global_router: disabled
+workload:
+  arrival: poisson
+  rate_rps: 140.0
+think_time:
+  enabled: true
+  distribution: lognormal
+  mean_ms: 1700
+  cv: 0.6
+  min_ms: 220
+performance_model:
+  type: vidur
+  vidur:
+    table_path: null
+    bootstrap_defaults: false
+    realtime_enabled: true
+    realtime_cache_dir: data/vidur/cache
+scheduler:
+  type: baseline
+  pools:
+    global_pool:
+      clusters:
+      - llama
+  prefill:
+    pool: global_pool
+    queue_policy: priority
+    max_batch_requests: 6
+    max_wait_ms: 0.8
+    delayed_batch_ms: 0.3
+    max_queue_depth: 24
+    backpressure_wait_ms: 0.08
+    dynamic_policy:
+      enabled: true
+      low_queue_depth: 1
+      high_queue_depth: 6
+      low_wait_ms: 0.2
+      high_wait_ms: 1.4
+      low_batch_requests: 2
+      high_batch_requests: 6
+      low_delay_ms: 0.18
+      high_delay_ms: 0.55
+  decode:
+    pool: global_pool
+    queue_policy: priority
+    max_batch_requests: 6
+    max_wait_ms: 0.8
+    delayed_batch_ms: 0.28
+    max_queue_depth: 28
+    backpressure_wait_ms: 0.09
+    dynamic_policy:
+      enabled: true
+      low_queue_depth: 2
+      high_queue_depth: 8
+      low_wait_ms: 0.18
+      high_wait_ms: 0.95
+      low_batch_requests: 2
+      high_batch_requests: 6
+      low_delay_ms: 0.1
+      high_delay_ms: 0.5
+  kv:
+    default_capacity_tokens: 240000
+    max_utilization_pct: 82.0
+auto_topology:
+  clusters:
+  - name: llama
+    router: semi_clairvoyant
+    router_params: {}
+    targets:
+      count: 20
+      tiers:
+      - name: llama_a100
+        count: 10
+        model: llama-2-70b
+        gpu: A100
+        weight: 1.6
+        batch_window_ms: 0.35
+        batch_size: 12
+        vidur:
+          model_name: meta-llama/Llama-2-70b-hf
+          device: A100
+          network_device: A100_PAIRWISE_NVLINK
+          tensor_parallel: 1
+          pipeline_parallel: 1
+          scheduler: sarathi
+          chunk_size: 512
+      - name: qwen_h100
+        count: 10
+        model: qwen-72b
+        gpu: H100
+        weight: 1.9
+        batch_window_ms: 0.32
+        batch_size: 14
+        vidur:
+          model_name: Qwen/Qwen-72B
+          device: H100
+          network_device: H100_DGX
+          tensor_parallel: 1
+          pipeline_parallel: 1
+          scheduler: sarathi
+          chunk_size: 512
+    drafts:
+      count: 40
+      capability_map:
+        llama_a40_fast: 0.55
+        llama_a40_slow: 0.45
+        qwen_a40_fast: 0.55
+        qwen_a40_slow: 0.45
+      draft_bucket_labels:
+      - llama_a40_fast
+      - llama_a40_slow
+      - qwen_a40_fast
+      - qwen_a40_slow
+      count_by_label:
+        llama_a40_fast: 10
+        llama_a40_slow: 10
+        qwen_a40_fast: 10
+        qwen_a40_slow: 10
+      reliability:
+        llama_a40_fast: 0.985
+        llama_a40_slow: 0.965
+        qwen_a40_fast: 0.982
+        qwen_a40_slow: 0.96
+      metadata_by_label:
+        llama_a40_fast:
+          hardware: A40
+          model_name: llama-2-7b
+          vidur_profile:
+            model_name: meta-llama/Llama-2-7b-hf
+            device: A40
+            network_device: A40_PAIRWISE_NVLINK
+            tensor_parallel: 1
+            pipeline_parallel: 1
+            scheduler: sarathi
+            chunk_size: 512
+        llama_a40_slow:
+          hardware: A40
+          model_name: llama-2-7b
+          vidur_profile:
+            model_name: meta-llama/Llama-2-7b-hf
+            device: A40
+            network_device: A40_PAIRWISE_NVLINK
+            tensor_parallel: 1
+            pipeline_parallel: 1
+            scheduler: sarathi
+            chunk_size: 512
+        qwen_a40_fast:
+          hardware: A40
+          model_name: qwen-7b
+          vidur_profile:
+            model_name: Qwen/Qwen-7B
+            device: A40
+            network_device: A40_PAIRWISE_NVLINK
+            tensor_parallel: 1
+            pipeline_parallel: 1
+            scheduler: sarathi
+            chunk_size: 512
+        qwen_a40_slow:
+          hardware: A40
+          model_name: qwen-7b
+          vidur_profile:
+            model_name: Qwen/Qwen-7B
+            device: A40
+            network_device: A40_PAIRWISE_NVLINK
+            tensor_parallel: 1
+            pipeline_parallel: 1
+            scheduler: sarathi
+            chunk_size: 512
+    connectivity:
+      fanout_per_draft: 4
+      net_ms_ranges:
+        llama_a100:
+        - 6.5
+        - 11.0
+        qwen_h100:
+        - 5.2
+        - 9.2
+      link_jitter_pct: 0.12
+      drop_rate:
+        llama_a40_slow: 0.006
+        qwen_a40_slow: 0.006
