@@ -258,6 +258,40 @@ We track exploratory experiment setups here so future contributors can reproduce
 ###### Acceptance Profiling Artifacts *(Oct 2025)*
 
 - Each JSONL record emitted by `speculative.py --details-jsonl` already preserves per-iteration metadata: context length before/after, proposed token IDs/strings, acceptance flags, accepted token counts, mismatch IDs, and timing breakdowns.
+
+## 11. Recent Implementation Notes *(Oct 2024)*
+
+While iterating on the mixed LLaMA/Qwen scenario and the draft-sweep tooling we added a set of “quality of life” improvements worth capturing here:
+
+- **Acceptance regressor ready-to-load.** The simulator now ships a pre-trained acceptance bundle (`src/acceptance/llama2_7b_vs_70b.joblib`). When `disable_model: false` is set, the forests are loaded instantly instead of being fit inside the run.
+- **Memoised acceptance inference.** `AcceptanceRegressor.position_probabilities()` caches results for each feature context (draft model, target model, context-length bucket, queue depth, tokens). After the first call, successive speculative rounds return from cache, dramatically reducing CPU time.
+- **VIDUR realtime caches.** We rely on `data/vidur/cache/model_cache/` to persist trained VIDUR regressors. The repo keeps the raw profiling CSVs under `src/profiling_assets/vidur/…`; running the profiling scripts once repopulates the cache so sweeps avoid the multi-minute warm-up.
+- **Drain after horizon.** `run()` continues advancing the SimPy environment after `sim_time_ms` with arrivals disabled until scheduler queues and targets empty. Throughput/tokens-per-second therefore include the full drain tail instead of being clipped at the horizon.
+- **Plotting tweaks.** Gamma-sweep plots are regenerated from raw metrics (no running-max smoothing). We also emit `throughput_jobs_curve.png` and `throughput_tokens_curve.png` alongside the combined grid for quick inspection.
+
+Together these updates keep acceptance-regressor runs fast, ensure VIDUR latency predictions reuse cached models, and guarantee reported throughput reflects all queued work being drained.
+
+## 12. Paper Writing Guidelines *(MLSys Drafting Notes)*
+
+To streamline future publications on DSim we record the high-level outline agreed for MLSys submission. Each bullet mirrors reviewer expectations we encountered when surveying recent simulator papers.
+
+- **Abstract**: succinctly state why SD planning is difficult, introduce DSim, highlight innovations (acceptance joblib, drain, Vidur caches), and summarize key evaluation results (accuracy, policy insight, efficiency).
+- **Introduction**: motivate SD in large-scale serving, emphasize heterogeneity/acceptance challenges, present opportunity for simulation, list contributions (architecture, modeling improvements, evaluations, open-source).
+- **Background 	4 Problem Context**: recap speculative decoding workflow, describe heterogeneous deployments (mixed LLaMA/Qwen), outline acceptance modeling + Vidur LUTs, position against prior simulators.
+- **Design Goals**: enumerate accuracy, heterogeneity, policy flexibility, efficiency, reproducibility; discuss how DSim satisfies each goal.
+- **Architecture Overview**: present system diagram and components (scenario parser, LUT manager, acceptance estimator, scheduler, event engine, metrics); explain canonical trace binding, event-driven flow with post-horizon drain, pre-trained acceptance bundle, Vidur cache integration.
+- **Implementation Details**: detail code structure, trace/draft binding, gamma sweep tooling, acceptance joblib format + memoization, Vidur cache workflow, drain pseudocode, configuration toggles.
+- **Modeling 	4 Validation Strategy**: describe approach for verifying tail metrics, acceptance accuracy, drained vs truncated runs, and in-hardware comparisons.
+- **Evaluation (three pillars)**:
+  1. *Validation vs real hardware*: compare throughput/latency metrics between DSim and measured cluster runs.
+  2. *Bottleneck 	6 policy analysis*: use DSim to sweep gamma policies, routers, acceptance settings; highlight insights only possible in simulation.
+  3. *Efficiency 	6 scalability*: quantify runtime/resource savings relative to evaluating on hardware; note impact of memoization and caches.
+- **Discussion**: interpret throughput/tokens curves, mixed-cluster insights, policy tuning implications.
+- **Related Work**: cover inference simulators, speculative decoding systems, acceptance modeling, Vidur.
+- **Limitations 	6 Future Work**: document missing GPU sharing, simplified energy modeling, fused mode gaps, multi-tenant fairness plans.
+- **Conclusion**: restate contributions and takeaways, point to artifact release.
+
+Appendices can supply example configs, additional plots, and drain pseudocode.
 - Top-level prompt entries include generation parameters (`temperature`, `top_p`, `top_k`, repetition penalty), prompt/output truncation limits, total generated tokens, and EOS markers; the accompanying metrics JSONL captures aggregate TTFT/TPOT and throughput.
 - Because the raw training data stores both the drafter settings and token-level acceptance outcomes, new regressors can be retrained offline without rerunning profiling—engineer additional features (e.g., prompt length, temperature, drafter tier) straight from the existing logs.
 

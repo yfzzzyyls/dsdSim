@@ -24,7 +24,8 @@ speculation:
       min_depth_scale: 0.5
       min_beam_width: 1
   acceptance:
-    disable_model: true
+    disable_model: false
+    model: src/acceptance/llama2_7b_vs_70b.joblib
     default_rate: 0.8
 execution_mode: blocking
 gamma: 4

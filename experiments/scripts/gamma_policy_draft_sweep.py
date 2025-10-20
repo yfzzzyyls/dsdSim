@@ -283,11 +283,11 @@ def _plot_curves(results: Dict[str, Dict[int, Dict[str, float]]], output_dir: Pa
         return
 
     metrics = [
-        ("throughput_busy_jobs_s", "Throughput (jobs/s)", "throughput_curve.png", False, True, None),
+        ("throughput_busy_jobs_s", "Throughput (jobs/s)", "throughput_curve.png", False, False, None),
         ("target_tokens_per_s", "Throughput (tok/s)", "target_processing_tokens_curve.png", False, False, 5.0),
         ("ttft_avg_ms", "TTFT (ms)", "ttft_curve.png", False, False, None),
         ("tpot_avg_ms", "TPOT (ms)", "tpot_curve.png", False, False, None),
-        ("target_utilization_pct", "Target Capacity Utilization (%)", "target_capacity_curve.png", True, True, None),
+        ("target_utilization_pct", "Target Capacity Utilization (%)", "target_capacity_curve.png", True, False, None),
     ]
 
     metric_data: Dict[str, Dict[str, Tuple[list[int], list[float]]]] = {}

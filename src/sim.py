@@ -4272,14 +4272,17 @@ def build(env: simpy.Environment, cfg: Config):
     if cfg.verbose:
         env.process(heartbeat_monitor(env, metrics, targets, cfg))
     
-    return metrics, targets, drafts, performance_provider
+    return metrics, targets, drafts, performance_provider, scheduler
 
 def run(cfg: Config):
     env = simpy.Environment()
     result = build(env, cfg)
     perf_provider = None
+    scheduler = None
     if isinstance(result, tuple):
-        if len(result) == 4:
+        if len(result) == 5:
+            metrics, targets, drafts, perf_provider, scheduler = result
+        elif len(result) == 4:
             metrics, targets, drafts, perf_provider = result
         elif len(result) == 3:
             metrics, targets, drafts = result
@@ -4347,8 +4350,45 @@ def run(cfg: Config):
             import traceback
             traceback.print_exc()
     
+    # Drain any in-flight work that was queued before sim_time_ms
+    def _pending_work() -> bool:
+        if scheduler is not None:
+            if getattr(scheduler.prefill_scheduler.store, "items", None):
+                if len(scheduler.prefill_scheduler.store.items) > 0:
+                    return True
+            if getattr(scheduler.decode_scheduler.store, "items", None):
+                if len(scheduler.decode_scheduler.store.items) > 0:
+                    return True
+        for target in targets:
+            if getattr(target, "_enqueued_count", 0) > 0:
+                return True
+            if getattr(target, "_busy", False):
+                return True
+            if hasattr(target, "pending_decode_tokens") and target.pending_decode_tokens() > 0:
+                return True
+        return False
+
+    if _pending_work():
+        print(f"Draining in-flight work after {cfg.sim_time_ms}ms horizon...", flush=True)
+        drain_step_ms = max(1.0, float(getattr(cfg, "drain_step_ms", 50.0)))
+        drain_deadline = env.now + max(float(getattr(cfg, "drain_timeout_ms", 5000.0)), float(cfg.sim_time_ms or 0))
+        while _pending_work():
+            current = env.now
+            next_until = min(current + drain_step_ms, drain_deadline)
+            if next_until <= current:
+                break
+            env.run(until=next_until)
+            if env.now == current:
+                print("Drain loop made no progress; breaking to avoid stall", flush=True)
+                break
+            if env.now >= drain_deadline and _pending_work():
+                print("Drain time exceeded; pending work may remain", flush=True)
+                break
+        print(f"[DRAIN] env.run() completed at {env.now:.0f}ms (jobs completed: {len(metrics.completed)})", flush=True)
+    else:
+        print(f"env.run() completed at {env.now:.0f}ms", flush=True)
+
     elapsed_real_time = time.time() - start_real_time
-    print(f"env.run() completed at {env.now:.0f}ms", flush=True)
     
     # Finalize token metrics
     metrics.token_metrics.end_time_ms = env.now
