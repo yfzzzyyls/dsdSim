@@ -3,7 +3,7 @@ seed: 123
 verbose: true
 debug: true
 speculation:
-  framework: eagle
+  framework: vanilla
   execution_mode: fused
   gamma_policy:
     type: specpp
@@ -28,10 +28,12 @@ speculation:
     model: src/acceptance/llama2_7b_vs_70b.joblib
     use_classifier: true
     default_rate: 0.8
-    context_bucket: 32
-    depth_bucket: 8
-    pending_bucket: 64
-    queue_bucket: 4
+    context_bucket: 1
+    depth_bucket: 1
+    pending_bucket: 1
+    queue_bucket: 1
+    surrogate:
+      enabled: false
 execution_mode: blocking
 gamma: 4
 trace_path: traces/gsm8k_trace_1s.jsonl

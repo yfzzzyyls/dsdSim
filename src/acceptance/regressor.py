@@ -27,6 +27,7 @@ class AcceptanceRegressor:
         experts: Optional[Mapping[str, Mapping[str, Any]]] = None,
         group_features: Optional[Sequence[str]] = None,
         group_info: Optional[Mapping[str, Mapping[str, object]]] = None,
+        surrogate_config: Optional[Mapping[str, Any]] = None,
     ) -> None:
         if spec_tokens <= 0:
             spec_tokens = 1
@@ -55,6 +56,18 @@ class AcceptanceRegressor:
         self._prob_cache: "OrderedDict[Tuple[Any, ...], List[float]]" = OrderedDict()
         self._prob_cache_limit = 2048  # configurable cap
 
+        # Feature lists used by the surrogate / predictors
+        self._count_features = self._feature_columns.get("count") or ["context_length"]
+        self._accept_features = self._feature_columns.get("accept") or [
+            "context_length",
+            "position",
+        ]
+
+        # Lightweight surrogate (pre-baked acceptance surface)
+        self._surrogate: Optional[Dict[str, Any]] = None
+        if surrogate_config and surrogate_config.get("enabled"):
+            self._build_surrogate(surrogate_config)
+
         classes = getattr(classifier, "classes_", None)
         positive_index: Optional[int] = None
         positive_value = 1
@@ -72,14 +85,8 @@ class AcceptanceRegressor:
                     positive_value = classes[positive_index]
         self._positive_class_index = positive_index
         self._positive_class_value = positive_value
-
-        self._count_features = self._feature_columns.get("count") or ["context_length"]
-        self._accept_features = self._feature_columns.get("accept") or [
-            "context_length",
-            "position",
-        ]
     @classmethod
-    def from_file(cls, path: str | Path) -> "AcceptanceRegressor":
+    def from_file(cls, path: str | Path, *, surrogate_config: Optional[Mapping[str, Any]] = None) -> "AcceptanceRegressor":
         bundle = joblib.load(Path(path))
         spec_tokens = int(bundle.get("spec_tokens", 1))
         regressor = bundle.get("regressor")
@@ -104,6 +111,7 @@ class AcceptanceRegressor:
             experts=experts,
             group_features=group_features,
             group_info=group_info,
+            surrogate_config=surrogate_config,
         )
 
     def expected_accepts(
@@ -112,13 +120,49 @@ class AcceptanceRegressor:
         *,
         feature_context: Optional[Mapping[str, Any]] = None,
     ) -> float:
+        value, _ = self._predict_expected_accepts(
+            context_length,
+            feature_context=feature_context,
+        )
+        return value
+
+    def predict_expected_accepts(
+        self,
+        context_length: float,
+        *,
+        feature_context: Optional[Mapping[str, Any]] = None,
+    ) -> Tuple[float, bool]:
+        return self._predict_expected_accepts(
+            context_length,
+            feature_context=feature_context,
+        )
+
+    def _predict_expected_accepts(
+        self,
+        context_length: float,
+        *,
+        feature_context: Optional[Mapping[str, Any]] = None,
+    ) -> Tuple[float, bool]:
+        from src import sim as _sim_module
+
+        profiler = getattr(_sim_module, "_GLOBAL_PROFILER", None)
+        start_time = time.perf_counter()
+        surrogate_rate = self._surrogate_rate(context_length, feature_context)
+        if surrogate_rate is not None:
+            depth = self._extract_depth(feature_context)
+            value = max(0.0, surrogate_rate * depth)
+            if profiler is not None:
+                profiler["acceptance_surrogate_ms"] += (time.perf_counter() - start_time) * 1000.0
+                profiler["acceptance_surrogate_hits"] = profiler.get("acceptance_surrogate_hits", 0) + 1
+            return value, True
+
         row = np.array(
             [self._make_feature_row(self._count_features, context_length, None, feature_context)],
             dtype=np.float32,
         )
         regressor = self._select_regressor(feature_context)
         prediction = regressor.predict(row)
-        return float(max(0.0, prediction[0]))
+        return float(max(0.0, prediction[0])), False
 
     def position_probabilities(
         self,
@@ -155,7 +199,6 @@ class AcceptanceRegressor:
             )
         probs: List[float] = []
         classifier_time = 0.0
-        regressor_time = 0.0
         if rows:
             arr = np.array(rows, dtype=np.float32)
             classifier = self._select_classifier(feature_context)
@@ -190,7 +233,6 @@ class AcceptanceRegressor:
             profiler["acceptance_calls"] = profiler.get("acceptance_calls", 0) + 1
             profiler["acceptance_proba_ms"] += (time.perf_counter() - start_total) * 1000.0
             profiler["acceptance_classifier_ms"] += classifier_time
-            profiler["acceptance_regressor_ms"] += regressor_time
         return clipped
 
     def position_probabilities_batch(
@@ -227,6 +269,250 @@ class AcceptanceRegressor:
                 key = self._make_cache_key(context_length, depth, feature_context)
                 results[i] = self._prob_cache[key][:depth]
         return results
+
+    def _build_surrogate(self, config: Mapping[str, Any]) -> None:
+        """Precompute acceptance rates over a coarse feature grid."""
+        from src import sim as _sim_module
+
+        profiler = getattr(_sim_module, "_GLOBAL_PROFILER", None)
+        start_time = time.perf_counter()
+
+        def _step(value: float, fallback: float) -> float:
+            try:
+                numeric = float(value)
+            except (TypeError, ValueError):
+                numeric = float(fallback)
+            return fallback if numeric <= 0 else numeric
+
+        context_step = _step(config.get("context_step", config.get("context_bucket", 32.0)), 32.0)
+        context_min = float(config.get("context_min", 0.0))
+        context_max = float(config.get("context_max", 4096.0))
+        if context_max < context_min:
+            context_max = context_min
+        contexts = np.arange(context_min, context_max + context_step, context_step, dtype=np.float32)
+        if contexts.size == 0:
+            contexts = np.array([context_min], dtype=np.float32)
+
+        depth_step = max(1, int(config.get("depth_step", config.get("depth_bucket", 8)) or 8))
+        depth_min = int(max(1, config.get("depth_min", depth_step)))
+        depth_default_max = int(max(depth_min, self.spec_tokens))
+        depth_max = int(config.get("depth_max", depth_default_max))
+        if depth_max < depth_min:
+            depth_max = depth_min
+        depths = np.arange(depth_min, depth_max + depth_step, depth_step, dtype=np.int32)
+        if depths.size == 0:
+            depths = np.array([depth_min], dtype=np.int32)
+
+        pending_step = max(1, int(config.get("pending_step", config.get("pending_bucket", 64)) or 64))
+        pending_min = int(max(0, config.get("pending_min", 0)))
+        pending_max = int(max(pending_min, config.get("pending_max", 1024)))
+        pending_vals = np.arange(pending_min, pending_max + pending_step, pending_step, dtype=np.int32)
+        if pending_vals.size == 0:
+            pending_vals = np.array([pending_min], dtype=np.int32)
+
+        queue_step = max(1, int(config.get("queue_step", config.get("queue_bucket", 4)) or 4))
+        queue_min = int(max(0, config.get("queue_min", 0)))
+        queue_max = int(max(queue_min, config.get("queue_max", 64)))
+        queue_vals = np.arange(queue_min, queue_max + queue_step, queue_step, dtype=np.int32)
+        if queue_vals.size == 0:
+            queue_vals = np.array([queue_min], dtype=np.int32)
+
+        drafter_models = list(config.get("drafter_models") or [])
+        verifier_models = list(config.get("verifier_models") or [])
+        if not drafter_models:
+            drafter_models = ["surrogate_draft"]
+        if not verifier_models:
+            verifier_models = ["surrogate_target"]
+        base_context_overrides = dict(config.get("feature_context", {}) or {})
+
+        total_combos = (
+            len(contexts)
+            * len(depths)
+            * len(pending_vals)
+            * len(queue_vals)
+            * len(drafter_models)
+            * len(verifier_models)
+        )
+        max_combos = int(config.get("max_combos", 2_000_000) or 2_000_000)
+        if total_combos > max_combos:
+            if profiler is not None:
+                profiler["acceptance_surrogate_build_ms"] += (time.perf_counter() - start_time) * 1000.0
+            return
+
+        feature_rows: List[List[float]] = []
+        feature_contexts: List[Dict[str, Any]] = []
+        keys: List[Tuple[int, int, int, int, int, int]] = []
+        lookup: Dict[Tuple[int, int, int, int, int, int], float] = {}
+
+        # Precompute rows grouped by regressor instance (to support MoE)
+        reg_groups: Dict[int, List[int]] = {}
+        reg_map: Dict[int, Any] = {}
+
+        for drafter_idx, drafter_model in enumerate(drafter_models):
+            for verifier_idx, verifier_model in enumerate(verifier_models):
+                for ctx_idx, context in enumerate(contexts):
+                    for depth_idx, depth in enumerate(depths):
+                        spec_tokens = int(max(1, depth))
+                        for pend_idx, pending in enumerate(pending_vals):
+                            pending_tokens = int(max(0, pending))
+                            for queue_idx, queue in enumerate(queue_vals):
+                                queue_depth = int(max(0, queue))
+                                fc = dict(base_context_overrides)
+                                fc.update(
+                                    {
+                                        "spec_tokens": spec_tokens,
+                                        "pending_decode_tokens": pending_tokens,
+                                        "target_queue_depth": queue_depth,
+                                        "drafter_model": drafter_model,
+                                        "verifier_model": verifier_model,
+                                    }
+                                )
+                                feature_contexts.append(fc)
+                                feature_rows.append(
+                                    self._make_feature_row(self._count_features, float(context), None, fc)
+                                )
+                                global_idx = len(feature_rows) - 1
+                                keys.append(
+                                    (
+                                        drafter_idx,
+                                        verifier_idx,
+                                        ctx_idx,
+                                        depth_idx,
+                                        pend_idx,
+                                        queue_idx,
+                                    )
+                                )
+                                reg = self._select_regressor(fc)
+                                reg_key = id(reg)
+                                reg_map[reg_key] = reg
+                                reg_groups.setdefault(reg_key, []).append(global_idx)
+
+        if not feature_rows:
+            return
+
+        rows_array = np.asarray(feature_rows, dtype=np.float32)
+        rates_flat = np.zeros(len(feature_rows), dtype=np.float32)
+
+        for reg_key, indices in reg_groups.items():
+            reg = reg_map[reg_key]
+            batch_rows = rows_array[indices]
+            preds = reg.predict(batch_rows)
+            for row_idx, prediction in zip(indices, preds):
+                fc = feature_contexts[row_idx]
+                depth_val = float(max(1, fc.get("spec_tokens", self.spec_tokens)))
+                rate = float(prediction) / depth_val
+                rates_flat[row_idx] = max(0.0, min(1.0, rate))
+
+        for key, rate in zip(keys, rates_flat):
+            lookup[key] = float(rate)
+
+        self._surrogate = {
+            "contexts": contexts,
+            "depths": depths,
+            "pending": pending_vals,
+            "queues": queue_vals,
+            "context_step": float(context_step),
+            "depth_step": int(depth_step),
+            "pending_step": int(pending_step),
+            "queue_step": int(queue_step),
+            "context_min": float(contexts[0]),
+            "depth_min": int(depths[0]),
+            "pending_min": int(pending_vals[0]),
+            "queue_min": int(queue_vals[0]),
+            "drafter_models": list(drafter_models),
+            "verifier_models": list(verifier_models),
+            "lookup": lookup,
+        }
+
+        if profiler is not None:
+            profiler["acceptance_surrogate_build_ms"] += (time.perf_counter() - start_time) * 1000.0
+        if self._surrogate is not None:
+            # Track that the surrogate is active in metrics cache
+            self._surrogate["enabled"] = True
+
+    def _surrogate_rate(
+        self,
+        context_length: float,
+        feature_context: Optional[Mapping[str, Any]],
+    ) -> Optional[float]:
+        surrogate = self._surrogate
+        if not surrogate:
+            return None
+
+        fc = dict(feature_context or {})
+        drafter_models: List[str] = surrogate.get("drafter_models", [])
+        verifier_models: List[str] = surrogate.get("verifier_models", [])
+        if not drafter_models or not verifier_models:
+            return None
+
+        drafter = str(fc.get("drafter_model", drafter_models[0]))
+        verifier = str(fc.get("verifier_model", verifier_models[0]))
+        try:
+            drafter_idx = drafter_models.index(drafter)
+        except ValueError:
+            drafter_idx = 0
+        try:
+            verifier_idx = verifier_models.index(verifier)
+        except ValueError:
+            verifier_idx = 0
+
+        depth_value = self._extract_depth(fc)
+        pending_value = fc.get("pending_decode_tokens", 0)
+        queue_value = fc.get("target_queue_depth", 0)
+
+        ctx_idx = self._surrogate_axis_index(
+            float(context_length),
+            surrogate["context_min"],
+            surrogate["context_step"],
+            len(surrogate["contexts"]),
+        )
+        depth_idx = self._surrogate_axis_index(
+            depth_value,
+            float(surrogate["depth_min"]),
+            float(surrogate["depth_step"]),
+            len(surrogate["depths"]),
+        )
+        pending_idx = self._surrogate_axis_index(
+            pending_value,
+            float(surrogate["pending_min"]),
+            float(surrogate["pending_step"]),
+            len(surrogate["pending"]),
+        )
+        queue_idx = self._surrogate_axis_index(
+            queue_value,
+            float(surrogate["queue_min"]),
+            float(surrogate["queue_step"]),
+            len(surrogate["queues"]),
+        )
+
+        key = (drafter_idx, verifier_idx, ctx_idx, depth_idx, pending_idx, queue_idx)
+        rate = surrogate["lookup"].get(key)
+        if rate is None:
+            return None
+        return float(rate)
+
+    def _surrogate_axis_index(self, value: float, min_value: float, step: float, size: int) -> int:
+        if size <= 1:
+            return 0
+        if step <= 0:
+            step = 1.0
+        offset = (float(value) - float(min_value)) / float(step)
+        idx = int(round(offset))
+        if idx < 0:
+            idx = 0
+        elif idx >= size:
+            idx = size - 1
+        return idx
+
+    def _extract_depth(self, feature_context: Optional[Mapping[str, Any]]) -> float:
+        if feature_context is None:
+            return float(self.spec_tokens)
+        value = feature_context.get("spec_tokens", self.spec_tokens)
+        try:
+            depth = float(value)
+        except (TypeError, ValueError):
+            depth = float(self.spec_tokens)
+        return max(1.0, depth)
 
     def _make_feature_row(
         self,

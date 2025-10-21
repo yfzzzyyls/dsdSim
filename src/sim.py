@@ -126,20 +126,20 @@ class SpecPPGammaPolicy(GammaPolicy):
         cum_accept = 1.0
         selected = min_tokens
 
+        selected = min_tokens
         for idx in range(1, max_tokens + 1):
             prob = float(probabilities[idx - 1])
             prob = max(0.0, min(1.0, prob))
-            if idx == 1:
-                acc_prob = 1.0
-            else:
-                acc_prob = prob
-            cum_accept *= acc_prob
-            selected = idx
+            cum_accept *= prob
             if idx < min_tokens:
+                selected = idx
                 continue
             rejection = 1.0 - cum_accept
             if rejection > self._threshold:
+                # Roll back to the last depth that stayed under threshold.
+                selected = max(min_tokens, idx - 1)
                 break
+            selected = idx
 
         return max(min_tokens, min(max_tokens, selected))
 
@@ -325,6 +325,7 @@ class Config:
     acceptance_depth_bucket: int = 1
     acceptance_pending_bucket: int = 1
     acceptance_queue_bucket: int = 1
+    acceptance_surrogate_config: Dict[str, Any] = field(default_factory=dict)
     acceptance_use_classifier: bool = True
     network_config: Dict[str, Any] = field(default_factory=dict)
     network_enabled: bool = True
@@ -1621,12 +1622,18 @@ class DraftServer:
         pending_q: int,
         queue_q: int,
     ) -> Tuple[Any, ...]:
+        # Smart rounding for better cache hits without coarse quantization
+        context_rounded = round(context_q / 10) * 10 if context_q > 100 else round(context_q / 5) * 5
+        # Round pending tokens to nearest 5
+        pending_rounded = round(pending_q / 5) * 5
+        # Round queue depth to nearest 2
+        queue_rounded = round(queue_q / 2) * 2
         return (
             target_id,
             depth_q,
-            context_q,
-            pending_q,
-            queue_q,
+            context_rounded,  # Rounded to ±5-10 tokens
+            pending_rounded,  # Rounded to ±5 tokens
+            queue_rounded,    # Rounded to ±2 positions
             bool(self._acceptance_use_classifier),
         )
 
@@ -1690,17 +1697,27 @@ class DraftServer:
         if cache_entry is None:
             if _GLOBAL_PROFILER is not None:
                 _GLOBAL_PROFILER["acceptance_cache_misses"] += 1
-            start = time.perf_counter()
-            expected = self._acceptance_model.expected_accepts(
-                float(context_q),
-                feature_context=feature_context,
-            )
-            reg_duration_ms = (time.perf_counter() - start) * 1000.0
-            if _GLOBAL_PROFILER is not None:
-                _GLOBAL_PROFILER["acceptance_regressor_ms"] += reg_duration_ms
-                _GLOBAL_PROFILER["acceptance_calls"] += 1
-            rate = expected / max(1.0, float(depth_q))
-            rate = max(0.0, min(1.0, float(rate)))
+
+            # Skip expensive regressor when using classifier
+            if self._acceptance_use_classifier:
+                # Use default rate as fallback, classifier will provide actual probabilities
+                rate = self._acceptance_default_rate
+            else:
+                # Only use regressor when classifier is disabled
+                start = time.perf_counter()
+                expected, used_surrogate = self._acceptance_model.predict_expected_accepts(
+                    float(context_q),
+                    feature_context=feature_context,
+                )
+                reg_duration_ms = (time.perf_counter() - start) * 1000.0
+                if _GLOBAL_PROFILER is not None:
+                    _GLOBAL_PROFILER["acceptance_calls"] += 1
+                    if used_surrogate:
+                        _GLOBAL_PROFILER["acceptance_surrogate_queries"] += 1
+                    else:
+                        _GLOBAL_PROFILER["acceptance_regressor_ms"] += reg_duration_ms
+                rate = expected / max(1.0, float(depth_q))
+                rate = max(0.0, min(1.0, float(rate)))
 
             if self._acceptance_use_classifier:
                 start = time.perf_counter()
@@ -3935,6 +3952,10 @@ def _build_config_from_mapping(data: Mapping[str, Any]) -> Config:
         "acceptance_cached": 0,
         "acceptance_cache_hits": 0,
         "acceptance_cache_misses": 0,
+        "acceptance_surrogate_ms": 0.0,
+        "acceptance_surrogate_build_ms": 0.0,
+        "acceptance_surrogate_hits": 0,
+        "acceptance_surrogate_queries": 0,
         "build_ms": 0.0,
         "simulation_ms": 0.0,
     }
@@ -3949,6 +3970,7 @@ def _build_config_from_mapping(data: Mapping[str, Any]) -> Config:
     acceptance_cfg = dict(spec_cfg.get("acceptance", {}) or {})
     disable_acceptance_model = bool(acceptance_cfg.get("disable_model"))
     acceptance_model = None if disable_acceptance_model else (spec_cfg.get("acceptance_model") or acceptance_cfg.get("model") or acceptance_cfg.get("file"))
+    surrogate_cfg = dict(acceptance_cfg.get("surrogate") or {})
     context_bucket = int(acceptance_cfg.get("context_bucket", 1) or 1)
     depth_bucket = int(acceptance_cfg.get("depth_bucket", 1) or 1)
     pending_bucket = int(acceptance_cfg.get("pending_bucket", 1) or 1)
@@ -4000,6 +4022,7 @@ def _build_config_from_mapping(data: Mapping[str, Any]) -> Config:
         acceptance_depth_bucket=depth_bucket,
         acceptance_pending_bucket=pending_bucket,
         acceptance_queue_bucket=queue_bucket,
+        acceptance_surrogate_config=surrogate_cfg,
     )
     if not cfg.think_time.enabled:
         raise ValueError("Think time must be enabled for closed-loop operation")
@@ -4129,7 +4152,10 @@ def build(env: simpy.Environment, cfg: Config):
         try:
             acceptance_model = _ACCEPTANCE_MODEL_CACHE.get(cfg.acceptance_model_path)
             if acceptance_model is None:
-                acceptance_model = AcceptanceRegressor.from_file(cfg.acceptance_model_path)
+                acceptance_model = AcceptanceRegressor.from_file(
+                    cfg.acceptance_model_path,
+                    surrogate_config=cfg.acceptance_surrogate_config,
+                )
                 _ACCEPTANCE_MODEL_CACHE[cfg.acceptance_model_path] = acceptance_model
                 if cfg.verbose:
                     meta = getattr(acceptance_model, 'metadata', {}).get('name') or cfg.acceptance_model_path
