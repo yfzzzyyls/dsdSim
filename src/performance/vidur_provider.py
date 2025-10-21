@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional, Sequence, Tuple, Mapping
 
 from .base import PhaseMetrics, PhaseRequest, PerformanceProvider
-from .vidur_realtime import VidurRealtimeRunner
+from .vidur_realtime import VidurRealtimeRunner, get_shared_vidur_runner
 
 def _append_vidur_repo_to_path() -> None:
     base_dir = Path(__file__).resolve().parents[1]
@@ -187,7 +187,7 @@ class VidurPerformanceProvider(PerformanceProvider):
         self._cache: Dict[Tuple, PhaseMetrics] = {}
         self._targets: Dict[str, Dict[str, object]] = {}
         self._realtime_runner: Optional[VidurRealtimeRunner] = (
-            VidurRealtimeRunner(dtype=config.default_dtype, cache_root=config.realtime_cache_dir)
+            get_shared_vidur_runner(dtype=config.default_dtype, cache_root=config.realtime_cache_dir)
             if config.realtime_enabled
             else None
         )

@@ -1,7 +1,7 @@
 # sim.py v1 minimal distributed speculative-decoding simulator
 # deps: pip install simpy pyyaml
 
-import argparse, random, simpy, yaml, math, json, itertools
+import argparse, random, simpy, yaml, math, json, itertools, copy, time
 import time
 from collections import deque, defaultdict
 from types import MappingProxyType
@@ -21,6 +21,9 @@ from trace.types import TraceRecord, TraceParseError
 from acceptance.regressor import AcceptanceRegressor
 
 # ---------- Config & Types ----------
+
+_ACCEPTANCE_MODEL_CACHE: Dict[str, AcceptanceRegressor] = {}
+_GLOBAL_PROFILER = None
 
 @dataclass
 class TargetParams:
@@ -3870,10 +3873,22 @@ def _expand_auto_topology(raw: Dict[str, Any]) -> Dict[str, Any]:
         raw.setdefault("cluster_router_params", {})["default"] = router_params
     return raw
 
-def load_config(path: str) -> Config:
-    with open(path, "r") as f:
-        raw = yaml.safe_load(f) or {}  # safe_load is the secure choice for untrusted YAML
-    raw = _expand_auto_topology(raw)  # Expand auto-topology if present
+def _build_config_from_mapping(data: Mapping[str, Any]) -> Config:
+    raw_input = copy.deepcopy(dict(data))
+    global _GLOBAL_PROFILER
+    _GLOBAL_PROFILER = {
+        "vidur_realtime_ms": 0.0,
+        "vidur_cache_hits": 0,
+        "vidur_calls": 0,
+        "acceptance_proba_ms": 0.0,
+        "acceptance_regressor_ms": 0.0,
+        "acceptance_classifier_ms": 0.0,
+        "acceptance_calls": 0,
+        "acceptance_cached": 0,
+        "build_ms": 0.0,
+        "simulation_ms": 0.0,
+    }
+    raw = _expand_auto_topology(raw_input)  # Expand auto-topology if present
     wl = WorkloadCfg(**(raw.get("workload", {}) or {}))
     pm = PerformanceModelConfig(**(raw.get("performance_model", {}) or {}))
     network_cfg = dict(raw.get("network", {}) or {})
@@ -3933,6 +3948,16 @@ def load_config(path: str) -> Config:
         raise ValueError("Execution mode must be 'blocking' for closed-loop operation")
 
     return cfg
+
+
+def load_config(path: str) -> Config:
+    with open(path, "r") as f:
+        raw = yaml.safe_load(f) or {}
+    return _build_config_from_mapping(raw)
+
+
+def load_config_from_mapping(data: Mapping[str, Any]) -> Config:
+    return _build_config_from_mapping(data)
 
 def heartbeat_monitor(env: simpy.Environment, metrics: Metrics, targets: List[TargetServer], cfg, interval_ms: float = 1000):
     """Periodic monitor to show simulation progress"""
@@ -4042,10 +4067,13 @@ def build(env: simpy.Environment, cfg: Config):
         if not cfg.acceptance_model_path:
             raise RuntimeError('Acceptance model path is required for simulation')
         try:
-            acceptance_model = AcceptanceRegressor.from_file(cfg.acceptance_model_path)
-            if cfg.verbose:
-                meta = getattr(acceptance_model, 'metadata', {}).get('name') or cfg.acceptance_model_path
-                print(f"Loaded acceptance model: {meta}", flush=True)
+            acceptance_model = _ACCEPTANCE_MODEL_CACHE.get(cfg.acceptance_model_path)
+            if acceptance_model is None:
+                acceptance_model = AcceptanceRegressor.from_file(cfg.acceptance_model_path)
+                _ACCEPTANCE_MODEL_CACHE[cfg.acceptance_model_path] = acceptance_model
+                if cfg.verbose:
+                    meta = getattr(acceptance_model, 'metadata', {}).get('name') or cfg.acceptance_model_path
+                    print(f"Loaded acceptance model: {meta}", flush=True)
         except Exception as exc:
             raise RuntimeError(f"Failed to load acceptance model '{cfg.acceptance_model_path}': {exc}") from exc
 
@@ -4640,15 +4668,22 @@ def _print_report(cfg: Config, metrics, summary: Dict[str, float], targets: List
     print("===END_METRICS_JSON===")
 
 
-def simulate_config(config_path: str, *, emit_output: bool = True) -> Dict[str, float]:
-    cfg = load_config(config_path)
+def simulate_config_obj(cfg: Config, *, emit_output: bool = True) -> Dict[str, float]:
+    global _GLOBAL_PROFILER
     result = run(cfg)
     metrics, targets, drafts = _unpack_run_result(result)
     summary = metrics.summary() if hasattr(metrics, 'summary') else {}
     metrics_json = _collect_metrics_json(cfg, metrics, summary, targets)
+    if _GLOBAL_PROFILER:
+        metrics_json.setdefault("profiler", {}).update(_GLOBAL_PROFILER)
     if emit_output:
         _print_report(cfg, metrics, summary, targets, drafts, metrics_json)
     return metrics_json
+
+
+def simulate_config(config_path: str, *, emit_output: bool = True) -> Dict[str, float]:
+    cfg = load_config(config_path)
+    return simulate_config_obj(cfg, emit_output=emit_output)
 
 
 def _maybe_plot(results: List[tuple[str, Dict[str, float]]], output_path: Path) -> Path:

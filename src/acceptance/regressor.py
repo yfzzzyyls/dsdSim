@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections import OrderedDict
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
@@ -127,13 +128,23 @@ class AcceptanceRegressor:
         default: Optional[float] = None,
         feature_context: Optional[Mapping[str, Any]] = None,
     ) -> List[float]:
+        from src import sim as _sim_module
+        profiler = getattr(_sim_module, "_GLOBAL_PROFILER", None)
+        start_total = time.perf_counter()
         depth = int(max(0, depth))
         if depth == 0:
+            if profiler is not None:
+                profiler["acceptance_calls"] = profiler.get("acceptance_calls", 0) + 1
+                profiler["acceptance_proba_ms"] += (time.perf_counter() - start_total) * 1000.0
             return []
         key = self._make_cache_key(context_length, depth, feature_context)
         cached = self._prob_cache.get(key)
         if cached is not None:
             self._prob_cache.move_to_end(key)
+            if profiler is not None:
+                profiler["acceptance_calls"] = profiler.get("acceptance_calls", 0) + 1
+                profiler["acceptance_cached"] = profiler.get("acceptance_cached", 0) + 1
+                profiler["acceptance_proba_ms"] += (time.perf_counter() - start_total) * 1000.0
             return cached[:depth]
 
         limit = min(depth, self.spec_tokens)
@@ -143,11 +154,15 @@ class AcceptanceRegressor:
                 self._make_feature_row(self._accept_features, context_length, pos, feature_context)
             )
         probs: List[float] = []
+        classifier_time = 0.0
+        regressor_time = 0.0
         if rows:
             arr = np.array(rows, dtype=np.float32)
             classifier = self._select_classifier(feature_context)
             if hasattr(classifier, "predict_proba"):
+                start_classifier = time.perf_counter()
                 proba = classifier.predict_proba(arr)
+                classifier_time += (time.perf_counter() - start_classifier) * 1000.0
                 if proba.ndim == 2:
                     if proba.shape[1] == 1:
                         if self._positive_class_value == 1:
@@ -171,6 +186,11 @@ class AcceptanceRegressor:
             probs.extend([float(tail)] * (depth - len(probs)))
         clipped = [max(0.0, min(1.0, float(p))) for p in probs]
         self._store_cache_entry(key, clipped)
+        if profiler is not None:
+            profiler["acceptance_calls"] = profiler.get("acceptance_calls", 0) + 1
+            profiler["acceptance_proba_ms"] += (time.perf_counter() - start_total) * 1000.0
+            profiler["acceptance_classifier_ms"] += classifier_time
+            profiler["acceptance_regressor_ms"] += regressor_time
         return clipped
 
     def position_probabilities_batch(

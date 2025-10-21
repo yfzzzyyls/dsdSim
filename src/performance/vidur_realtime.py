@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import math
 import sys
+import time
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -107,7 +108,15 @@ class VidurRealtimeRunner:
         if batch is None:
             raise RuntimeError("VIDUR realtime runner could not build a batch for the given request")
 
+        from src import sim as _sim_module
+        profiler = getattr(_sim_module, "_GLOBAL_PROFILER", None)
+        start_time = time.perf_counter()
         execution_time = predictor.get_execution_time(batch, pipeline_stage=0)
+        duration_ms = (time.perf_counter() - start_time) * 1000.0
+        if profiler is not None:
+            profiler["vidur_realtime_ms"] += duration_ms
+            if execution_time is not None:
+                profiler["vidur_calls"] = profiler.get("vidur_calls", 0) + 1
         latency_ms = execution_time.total_time * 1000.0
         if not math.isfinite(latency_ms):
             raise ValueError("VIDUR realtime predictor returned a non-finite latency")
@@ -323,3 +332,19 @@ class VidurRealtimeRunner:
         if len(seq) < size:
             seq.extend([seq[-1]] * (size - len(seq)))
         return seq[:size]
+
+
+_RUNNER_CACHE: Dict[Tuple[str, Optional[str]], VidurRealtimeRunner] = {}
+
+
+def get_shared_vidur_runner(*, dtype: str = "fp16", cache_root: Optional[Path] = None) -> VidurRealtimeRunner:
+    """Return a cached VidurRealtimeRunner for a given dtype/cache combination."""
+    cache_key = (
+        dtype,
+        str(cache_root.resolve()) if isinstance(cache_root, Path) else (str(cache_root) if cache_root else None),
+    )
+    runner = _RUNNER_CACHE.get(cache_key)
+    if runner is None:
+        runner = VidurRealtimeRunner(dtype=dtype, cache_root=cache_root)
+        _RUNNER_CACHE[cache_key] = runner
+    return runner
