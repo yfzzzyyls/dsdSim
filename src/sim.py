@@ -320,6 +320,12 @@ class Config:
     acceptance_model_path: Optional[str] = None
     acceptance_config: Dict[str, Any] = field(default_factory=dict)
     acceptance_model_disabled: bool = False
+    acceptance_use_classifier: bool = True
+    acceptance_context_bucket: int = 1
+    acceptance_depth_bucket: int = 1
+    acceptance_pending_bucket: int = 1
+    acceptance_queue_bucket: int = 1
+    acceptance_use_classifier: bool = True
     network_config: Dict[str, Any] = field(default_factory=dict)
     network_enabled: bool = True
 
@@ -1433,6 +1439,12 @@ class DraftServer:
         if not self._acceptance_disabled and self._acceptance_model is None:
             raise RuntimeError("Acceptance model must be provided; fallbacks are not permitted")
         self._gamma_policy = gamma_policy or ConstantGammaPolicy(self.gamma)
+        self._acceptance_use_classifier = bool(getattr(cfg, "acceptance_use_classifier", True))
+        self._context_bucket = max(1, int(getattr(cfg, "acceptance_context_bucket", 1) or 1))
+        self._depth_bucket = max(1, int(getattr(cfg, "acceptance_depth_bucket", 1) or 1))
+        self._pending_bucket = max(1, int(getattr(cfg, "acceptance_pending_bucket", 1) or 1))
+        self._queue_bucket = max(1, int(getattr(cfg, "acceptance_queue_bucket", 1) or 1))
+        self._acceptance_cache: Dict[Tuple[Any, ...], Tuple[float, Tuple[float, ...]]] = {}
         self.execution_mode = getattr(cfg, "speculation_execution_mode", "distributed").lower()
         self.framework = getattr(cfg, "speculation_framework", "vanilla").lower()
         self._workload_enabled = bool(cfg.workload.rate_rps > 0) if cfg and cfg.workload else False
@@ -1596,6 +1608,28 @@ class DraftServer:
         target_id = target.p.id
         return target_id, self.connections[target_id]
     
+    def _quantize_value(self, value: float, bucket: int) -> float:
+        if bucket <= 1:
+            return value
+        return round(value / bucket) * bucket
+
+    def _acceptance_cache_key(
+        self,
+        target_id: str,
+        depth_q: int,
+        context_q: float,
+        pending_q: int,
+        queue_q: int,
+    ) -> Tuple[Any, ...]:
+        return (
+            target_id,
+            depth_q,
+            context_q,
+            pending_q,
+            queue_q,
+            bool(self._acceptance_use_classifier),
+        )
+
     def _build_acceptance_feature_context(self, target_id: str, spec_tokens: int) -> Dict[str, Any]:
         target = self._target_lookup.get(target_id)
         verifier_metadata = getattr(target.p, "metadata", {}) if target is not None else {}
@@ -1614,8 +1648,17 @@ class DraftServer:
             except AttributeError:
                 pending_tokens = 0
                 queue_depth = 0
+        spec_tokens = int(max(1, spec_tokens))
+        if self._depth_bucket > 1:
+            spec_tokens = int(max(1, self._quantize_value(spec_tokens, self._depth_bucket)))
+        pending_tokens = int(max(0, pending_tokens))
+        queue_depth = int(max(0, queue_depth))
+        if self._pending_bucket > 1:
+            pending_tokens = int(max(0, self._quantize_value(pending_tokens, self._pending_bucket)))
+        if self._queue_bucket > 1:
+            queue_depth = int(max(0, self._quantize_value(queue_depth, self._queue_bucket)))
         return {
-            "spec_tokens": int(max(1, spec_tokens)),
+            "spec_tokens": spec_tokens,
             "drafter_model": drafter_model,
             "verifier_model": verifier_model or target_id,
             "pending_decode_tokens": int(pending_tokens),
@@ -1625,17 +1668,69 @@ class DraftServer:
     def _effective_acceptance_rate(self, conn: ConnectionParams, context_length: int, depth: int) -> float:
         if depth <= 0:
             return 0.0
+        rate, _ = self._lookup_acceptance(conn, context_length, depth)
+        return rate
+
+
+    def _lookup_acceptance(self, conn: ConnectionParams, context_length: float, tokens: int) -> Tuple[float, Tuple[float, ...]]:
+        tokens = int(max(1, tokens))
         if self._acceptance_disabled or self._acceptance_model is None:
             base = conn.acceptance_rate if conn and conn.acceptance_rate is not None else self.cfg.acceptance_config.get("default_rate", 0.75)
-            return max(0.0, min(1.0, float(base)))
-        feature_context = self._build_acceptance_feature_context(conn.target_id, depth)
-        expected = self._acceptance_model.expected_accepts(
-            float(context_length),
-            feature_context=feature_context,
-        )
-        depth_f = max(1.0, float(depth))
-        rate = expected / depth_f if depth_f > 0 else 0.0
-        return max(0.0, min(1.0, float(rate)))
+            rate = max(0.0, min(1.0, float(base)))
+            return rate, tuple(rate for _ in range(tokens))
+
+        depth_q = int(max(1, self._quantize_value(tokens, self._depth_bucket)))
+        context_q = self._quantize_value(context_length, self._context_bucket)
+        feature_context = self._build_acceptance_feature_context(conn.target_id, depth_q)
+        pending_q = int(feature_context.get("pending_decode_tokens", 0))
+        queue_q = int(feature_context.get("target_queue_depth", 0))
+        key = self._acceptance_cache_key(conn.target_id, depth_q, context_q, pending_q, queue_q)
+
+        cache_entry = self._acceptance_cache.get(key)
+        if cache_entry is None:
+            if _GLOBAL_PROFILER is not None:
+                _GLOBAL_PROFILER["acceptance_cache_misses"] += 1
+            start = time.perf_counter()
+            expected = self._acceptance_model.expected_accepts(
+                float(context_q),
+                feature_context=feature_context,
+            )
+            reg_duration_ms = (time.perf_counter() - start) * 1000.0
+            if _GLOBAL_PROFILER is not None:
+                _GLOBAL_PROFILER["acceptance_regressor_ms"] += reg_duration_ms
+                _GLOBAL_PROFILER["acceptance_calls"] += 1
+            rate = expected / max(1.0, float(depth_q))
+            rate = max(0.0, min(1.0, float(rate)))
+
+            if self._acceptance_use_classifier:
+                start = time.perf_counter()
+                probabilities = self._acceptance_model.position_probabilities(
+                    context_length=float(context_q),
+                    depth=depth_q,
+                    default=rate,
+                    feature_context=feature_context,
+                )
+                cls_duration_ms = (time.perf_counter() - start) * 1000.0
+                if _GLOBAL_PROFILER is not None:
+                    _GLOBAL_PROFILER["acceptance_classifier_ms"] += cls_duration_ms
+                    _GLOBAL_PROFILER["acceptance_proba_ms"] += cls_duration_ms
+                probabilities = tuple(max(0.0, min(1.0, float(p))) for p in probabilities[:depth_q])
+            else:
+                probabilities = tuple(rate for _ in range(depth_q))
+
+            cache_entry = (rate, probabilities)
+            self._acceptance_cache[key] = cache_entry
+        else:
+            if _GLOBAL_PROFILER is not None:
+                _GLOBAL_PROFILER["acceptance_cache_hits"] += 1
+                _GLOBAL_PROFILER["acceptance_cached"] += 1
+
+        rate, base_probs = cache_entry
+        if tokens <= len(base_probs):
+            probs = base_probs[:tokens]
+        else:
+            probs = tuple(base_probs) + tuple(rate for _ in range(tokens - len(base_probs)))
+        return rate, probs
 
 
     def _simulate_verification(self, tokens: int, conn: ConnectionParams, context_length: int) -> VerifyResult:
@@ -1644,45 +1739,13 @@ class DraftServer:
         if tokens == 0:
             return VerifyResult(chunk_id=self.chunks_sent, accepted_tokens=0, rejected_tokens=0, total_tokens=0)
         accepted = 0
-        if self._acceptance_disabled or self._acceptance_model is None:
-            rate = self._effective_acceptance_rate(conn, context_length, tokens)
-            for _ in range(tokens):
-                if random.random() < rate:
-                    accepted += 1
-                else:
-                    break
-        else:
-            feature_context = self._build_acceptance_feature_context(conn.target_id, tokens)
-            default_rate = self._effective_acceptance_rate(conn, context_length, tokens)
-            try:
-                probabilities = self._acceptance_model.position_probabilities(
-                    context_length=float(context_length),
-                    depth=tokens,
-                    default=default_rate,
-                    feature_context=feature_context,
-                )
-            except Exception as exc:
-                raise RuntimeError(
-                    f"Acceptance model failed for chunk {self.chunks_sent} (ctx={context_length}, tokens={tokens})"
-                ) from exc
-            if not probabilities:
-                raise RuntimeError(
-                    f"Acceptance model returned no probabilities for chunk {self.chunks_sent} (ctx={context_length}, tokens={tokens})"
-                )
-            if self.cfg.verbose:
-                sample = probabilities[: min(len(probabilities), 8)]
-                sample_str = ", ".join(f"{p:.3f}" for p in sample)
-                ellipsis = ", ..." if len(probabilities) > len(sample) else ""
-                print(
-                    f"[{self.env.now:.1f}ms] Draft {self.id}: acceptance probs for chunk {self.chunks_sent} (ctx={context_length}, tokens={tokens}) => [{sample_str}{ellipsis}] (baseline={default_rate:.3f})",
-                    flush=True,
-                )
-            for prob in probabilities:
-                prob = max(0.0, min(1.0, float(prob)))
-                if random.random() < prob:
-                    accepted += 1
-                else:
-                    break
+        rate, probabilities = self._lookup_acceptance(conn, context_length, tokens)
+        for prob in probabilities:
+            prob = max(0.0, min(1.0, float(prob)))
+            if random.random() < prob:
+                accepted += 1
+            else:
+                break
         rejected = tokens - accepted
         return VerifyResult(
             chunk_id=self.chunks_sent,
@@ -2303,29 +2366,14 @@ class DraftServer:
             except Exception:
                 candidate_depth = self.gamma
             acceptance_probs: Tuple[float, ...] = tuple()
-            if candidate_depth and candidate_depth > 0 and not self._acceptance_disabled and self._acceptance_model is not None:
+            if candidate_depth and candidate_depth > 0:
                 candidate_depth = max(1, min(candidate_depth, 512))
-                try:
-                    feature_context = self._build_acceptance_feature_context(target_id, candidate_depth)
-                    default_rate = self._effective_acceptance_rate(conn, prompt_length, candidate_depth)
-                    probs = self._acceptance_model.position_probabilities(
-                        context_length=float(prompt_length),
-                        depth=candidate_depth,
-                        default=default_rate,
-                        feature_context=feature_context,
-                    )
-                    acceptance_probs = tuple(max(0.0, min(1.0, float(p))) for p in probs)
-                except Exception as exc:
-                    if self.cfg.debug:
-                        print(
-                            f"[{self.env.now:.1f}ms] Draft {self.id}: gamma policy acceptance lookup failed: {exc}",
-                            flush=True,
-                        )
-                    acceptance_probs = tuple()
-            elif candidate_depth and candidate_depth > 0:
-                candidate_depth = max(1, min(candidate_depth, 512))
-                rate = self._effective_acceptance_rate(conn, prompt_length, candidate_depth)
-                acceptance_probs = tuple(rate for _ in range(candidate_depth))
+                if not self._acceptance_disabled and self._acceptance_model is not None:
+                    _, probs = self._lookup_acceptance(conn, prompt_length, candidate_depth)
+                    acceptance_probs = tuple(probs)
+                else:
+                    rate = self._effective_acceptance_rate(conn, prompt_length, candidate_depth)
+                    acceptance_probs = tuple(rate for _ in range(candidate_depth))
             queue_depth = target_server.queue_len() if target_server is not None else 0
             gamma_context = GammaContext(
                 draft_id=self.id,
@@ -3885,6 +3933,8 @@ def _build_config_from_mapping(data: Mapping[str, Any]) -> Config:
         "acceptance_classifier_ms": 0.0,
         "acceptance_calls": 0,
         "acceptance_cached": 0,
+        "acceptance_cache_hits": 0,
+        "acceptance_cache_misses": 0,
         "build_ms": 0.0,
         "simulation_ms": 0.0,
     }
@@ -3899,6 +3949,10 @@ def _build_config_from_mapping(data: Mapping[str, Any]) -> Config:
     acceptance_cfg = dict(spec_cfg.get("acceptance", {}) or {})
     disable_acceptance_model = bool(acceptance_cfg.get("disable_model"))
     acceptance_model = None if disable_acceptance_model else (spec_cfg.get("acceptance_model") or acceptance_cfg.get("model") or acceptance_cfg.get("file"))
+    context_bucket = int(acceptance_cfg.get("context_bucket", 1) or 1)
+    depth_bucket = int(acceptance_cfg.get("depth_bucket", 1) or 1)
+    pending_bucket = int(acceptance_cfg.get("pending_bucket", 1) or 1)
+    queue_bucket = int(acceptance_cfg.get("queue_bucket", 1) or 1)
     cfg = Config(
         sim_time_ms=raw.get("sim_time_ms", 10_000),
         seed=raw.get("seed", 0),
@@ -3941,6 +3995,11 @@ def _build_config_from_mapping(data: Mapping[str, Any]) -> Config:
         acceptance_model_path=str(acceptance_model) if acceptance_model else None,
         acceptance_config=acceptance_cfg,
         acceptance_model_disabled=disable_acceptance_model,
+        acceptance_use_classifier=bool(acceptance_cfg.get("use_classifier", True)),
+        acceptance_context_bucket=context_bucket,
+        acceptance_depth_bucket=depth_bucket,
+        acceptance_pending_bucket=pending_bucket,
+        acceptance_queue_bucket=queue_bucket,
     )
     if not cfg.think_time.enabled:
         raise ValueError("Think time must be enabled for closed-loop operation")
@@ -3983,6 +4042,7 @@ def _build_gamma_policy(cfg: Config) -> GammaPolicy:
 
 
 def build(env: simpy.Environment, cfg: Config):
+    build_start = time.perf_counter()
     random.seed(cfg.seed)
     metrics = Metrics(verbose=cfg.verbose, burn_in_ms=cfg.burn_in_ms)
     targets: List[TargetServer] = []
@@ -4299,7 +4359,8 @@ def build(env: simpy.Environment, cfg: Config):
     # Start heartbeat monitor
     if cfg.verbose:
         env.process(heartbeat_monitor(env, metrics, targets, cfg))
-    
+    if _GLOBAL_PROFILER is not None:
+        _GLOBAL_PROFILER["build_ms"] += (time.perf_counter() - build_start) * 1000.0
     return metrics, targets, drafts, performance_provider, scheduler
 
 def run(cfg: Config):
@@ -4343,6 +4404,7 @@ def run(cfg: Config):
     metrics.token_metrics.start_time_ms = cfg.burn_in_ms  # Start after burn-in
     
     start_real_time = time.time()
+    sim_start = time.perf_counter()
     print(f"Starting env.run(until={cfg.sim_time_ms})...", flush=True)
     
     # Run with intermediate checkpoints to see progress
@@ -4430,7 +4492,8 @@ def run(cfg: Config):
     if cfg.verbose:
         print(f"\nSimulation complete in {elapsed_real_time:.2f}s real time")
         print(f"Processed {len(metrics.completed)} total jobs")
-    
+    if _GLOBAL_PROFILER is not None:
+        _GLOBAL_PROFILER["simulation_ms"] += (time.perf_counter() - sim_start) * 1000.0
     return metrics, targets, drafts
 
 def get_target_metrics(targets: List[TargetServer], sim_time_ms: float) -> Dict[str, Dict[str, float]]:

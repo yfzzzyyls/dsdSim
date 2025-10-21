@@ -1,4 +1,4 @@
-sim_time_ms: 10000
+sim_time_ms: 1000
 seed: 123
 verbose: true
 debug: true
@@ -26,10 +26,15 @@ speculation:
   acceptance:
     disable_model: false
     model: src/acceptance/llama2_7b_vs_70b.joblib
+    use_classifier: true
     default_rate: 0.8
+    context_bucket: 32
+    depth_bucket: 8
+    pending_bucket: 64
+    queue_bucket: 4
 execution_mode: blocking
 gamma: 4
-trace_path: traces/gsm8k_trace_10s.jsonl
+trace_path: traces/gsm8k_trace_1s.jsonl
 trace_replay:
   per_draft_rps: 3.5
 trace_defaults:
