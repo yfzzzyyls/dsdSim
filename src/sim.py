@@ -1622,18 +1622,12 @@ class DraftServer:
         pending_q: int,
         queue_q: int,
     ) -> Tuple[Any, ...]:
-        # Smart rounding for better cache hits without coarse quantization
-        context_rounded = round(context_q / 10) * 10 if context_q > 100 else round(context_q / 5) * 5
-        # Round pending tokens to nearest 5
-        pending_rounded = round(pending_q / 5) * 5
-        # Round queue depth to nearest 2
-        queue_rounded = round(queue_q / 2) * 2
         return (
             target_id,
             depth_q,
-            context_rounded,  # Rounded to ±5-10 tokens
-            pending_rounded,  # Rounded to ±5 tokens
-            queue_rounded,    # Rounded to ±2 positions
+            context_q,
+            pending_q,
+            queue_q,
             bool(self._acceptance_use_classifier),
         )
 
@@ -1701,7 +1695,7 @@ class DraftServer:
             # Skip expensive regressor when using classifier
             if self._acceptance_use_classifier:
                 # Use default rate as fallback, classifier will provide actual probabilities
-                rate = self._acceptance_default_rate
+                rate = self.cfg.acceptance_config.get("default_rate", 0.75)
             else:
                 # Only use regressor when classifier is disabled
                 start = time.perf_counter()

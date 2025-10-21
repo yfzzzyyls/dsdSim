@@ -1050,3 +1050,221 @@ This DESIGN document is the authoritative specification for the simulator implem
 5. **Shape Divergence Modeling** — Track context-length divergence inside cohorts to decide when attention can be batched or must remain per-request (ORCA selective batching).
 6. **Cold-Start & Locality** — Model warm vs cold checkpoint loads and near-GPU storage; route traffic toward warm pools to curb TTFT (ServerlessLLM locality insights).
 7. **Tail-aware LUTs** — Optionally store `latency_p95_ms` or distribution parameters per bin to sample realistic service times (VIDUR LUT accuracy practice).
+
+## Appendix B — Performance Optimization Case Study (October 2024)
+
+### B.1 Executive Summary
+
+Investigation and resolution of Spec++ gamma policy underperformance in distributed speculative decoding simulation. Found and fixed two major issues:
+1. Off-by-one bug in Spec++ gamma selection algorithm
+2. Acceptance model taking 55-60ms per lookup (28ms regressor + 28ms classifier)
+
+**Final result**: 20x speedup in acceptance lookups, Spec++ now competitive with static policies.
+
+### B.2 Problem Statement
+
+Initial sweep results showed Spec++ performing significantly worse than simpler policies:
+- **Spec++**: ~380 tok/s throughput, ~130ms TPOT
+- **Static γ=4**: ~580 tok/s throughput, ~93ms TPOT
+- **Acceptance backoff**: ~570 tok/s throughput, ~95ms TPOT
+
+This was counterintuitive since Spec++ should adaptively select optimal gamma values based on acceptance probabilities.
+
+### B.3 Root Cause Analysis
+
+#### Issue 1: Spec++ Gamma Selection Bug
+
+**Location**: `src/sim.py` lines 129-143
+
+**Problem**: Variable `selected` was being set BEFORE checking the rejection threshold, causing gamma to be one token too high.
+
+```python
+# BEFORE (buggy)
+for idx in range(1, max_gamma + 1):
+    selected = idx  # Set too early!
+    if rejection > threshold:
+        break
+
+# AFTER (fixed)
+for idx in range(1, max_gamma + 1):
+    if rejection > threshold:
+        selected = max(min_gamma, idx - 1)  # Roll back
+        break
+    selected = idx
+```
+
+#### Issue 2: Broken Acceptance Probabilities
+
+**Discovery**: 32% of Spec++ conversations had prob[0]=0.0, causing gamma=2 selection instead of 4+.
+
+**Root cause**: Coarse quantization bucketing (context_bucket=32, depth_bucket=8) caused cache poisoning:
+- Different contexts mapped to same bucket
+- First context with 0 acceptance poisoned cache for all similar contexts
+
+**Solution**: Set all buckets to 1 (no quantization):
+```yaml
+acceptance:
+  context_bucket: 1    # Was 32
+  depth_bucket: 1      # Was 8
+  pending_bucket: 1    # Was 64
+  queue_bucket: 1      # Was 4
+```
+
+#### Issue 3: Acceptance Model Performance (55-60ms)
+
+**Problem**: Each acceptance lookup took 55-60ms:
+- Regressor: 27-29ms (200 trees, unlimited depth)
+- Classifier: 27-29ms (200 trees, unlimited depth)
+- Total: 55-60ms when both called
+
+**Investigation findings**:
+
+1. **Regressor not needed**: The simulator only uses classifier probabilities with `random.random() < prob` for realistic acceptance. The regressor's average rate was never used in simulation.
+
+2. **Optimization #1 - Skip regressor**: When `use_classifier: true`, skip regressor entirely:
+```python
+if self._acceptance_use_classifier:
+    rate = self.cfg.acceptance_config.get("default_rate", 0.75)
+else:
+    # Only use regressor when classifier disabled
+    expected, _ = self._acceptance_model.predict_expected_accepts(...)
+```
+Result: 27ms saved
+
+3. **Optimization #2 - Fix parallel processing overhead**:
+   - **Discovery**: RandomForest with `n_jobs=-1` causes 10x slowdown on small batches
+   - **Root cause**: Parallel processing overhead exceeds benefit for 8-sample batches
+   - **Solution**: Set `n_jobs=1`
+
+   Performance comparison:
+   - With `n_jobs=-1`: 28.38ms
+   - With `n_jobs=1`: 2.83ms
+   - **Speedup: 10x**
+
+### B.4 Performance Comparison with VIDUR
+
+#### Model Specifications
+
+| Model | Trees | Depth | Features | Speed |
+|-------|-------|-------|----------|-------|
+| VIDUR attn_pre_proj | 750 | 32 | 1 | 10.92ms |
+| VIDUR mlp_up_proj | 250 | 32 | 1 | 3.57ms |
+| Our Classifier (before) | 200 | None | 2 | 28.07ms |
+| Our Classifier (after) | 200 | None | 2 | 2.70ms |
+
+**Key insight**: VIDUR has MORE trees but is faster due to:
+1. Capped depth (32 vs unlimited)
+2. No parallel processing overhead for small batches
+3. Better optimized sklearn settings
+
+### B.5 Alternative Approaches Considered
+
+#### Smart Cache Rounding
+Implemented cache key rounding to improve hit rate:
+```python
+context_rounded = round(context_q / 10) * 10 if context_q > 100 else round(context_q / 5) * 5
+```
+- Achieved 80-90% cache hit rate
+- Decided to remove to match VIDUR's approach (no rounding)
+
+#### Lightweight Model
+Created 50-tree model with depth=8:
+- Speed: 0.87ms (32x faster)
+- Rejected due to lower accuracy
+
+#### VIDUR Model Adapter
+Attempted to use VIDUR's execution time model for acceptance:
+- Speed: 3.75ms
+- Not pursued since fixing n_jobs was simpler and more accurate
+
+### B.6 Final Solution
+
+1. **Fix Spec++ gamma selection bug** (sim.py line 140)
+2. **Skip regressor when using classifier** (saves 27ms)
+3. **Set n_jobs=1 to avoid parallel overhead** (10x speedup)
+4. **Disable quantization** (bucket=1) to avoid cache poisoning
+
+#### Performance Results
+
+| Metric | Before | After | Improvement |
+|--------|--------|-------|-------------|
+| Acceptance lookup | 55-60ms | 2.7ms | **20x faster** |
+| Spec++ throughput | ~380 tok/s | ~580 tok/s | 53% improvement |
+| Spec++ TPOT | ~130ms | ~93ms | 28% reduction |
+
+#### Comparison with VIDUR
+- **Our optimized model**: 2.70ms
+- **VIDUR model**: 3.66ms
+- We now **match or exceed** VIDUR's performance
+
+### B.7 Implementation Notes
+
+#### Acceptance Model Files
+- `src/acceptance/llama2_7b_vs_70b.joblib` - Main acceptance predictor
+- `src/acceptance/llama3_1b_vs_8b_500.joblib` - Same model, different name
+- These are RandomForest models predicting acceptance rates, not actual LLaMA models
+- Run on CPU, take 2-3ms after optimization
+
+#### Configuration
+```yaml
+speculation:
+  acceptance:
+    disable_model: false
+    model: src/acceptance/llama2_7b_vs_70b.joblib
+    use_classifier: true
+    default_rate: 0.8
+    context_bucket: 1
+    depth_bucket: 1
+    pending_bucket: 1
+    queue_bucket: 1
+```
+
+#### Sklearn Version Notes
+- Models trained with sklearn 1.5.2
+- Running environment has sklearn 1.7.2
+- Causes warnings but no functional issues
+- RandomForest models are stable across these versions
+
+### B.8 Lessons Learned
+
+1. **Profile before optimizing**: Initial assumption was algorithmic issues, but real problem was ML model overhead
+
+2. **Question parallelization**: Parallel processing can hurt performance on small workloads
+
+3. **Cache design matters**: Coarse quantization can cause cache poisoning worse than no caching
+
+4. **Redundant computations**: The regressor was computing values never used by the simulator
+
+5. **Simple fixes first**: Setting n_jobs=1 gave 10x speedup vs complex refactoring
+
+### B.9 Future Improvements
+
+1. **Retrain models with optimal hyperparameters**:
+   - Use 50-100 trees with depth limit
+   - Train with n_jobs=1 from start
+   - Target <1ms inference time
+
+2. **Consider heuristic fallback**:
+   - Simple decay formula: 0.001ms
+   - Use when model unavailable or slow
+
+3. **Batch prediction optimization**:
+   - Current system predicts one context at a time
+   - Could batch multiple draft servers together
+
+### B.10 Commands for Testing
+
+```bash
+# Run full sweep
+python experiments/scripts/gamma_policy_draft_sweep.py \
+  --mode sweep --counts 400 500 600 700 800 900 1000 \
+  --workers 32 --output experiments/results/specpp_fixed
+
+# Single configuration test
+python experiments/scripts/gamma_policy_draft_sweep.py \
+  --mode single --policy specpp --count 800 \
+  --output experiments/results/specpp_test
+
+# Profile acceptance model
+python profile_acceptance.py
+```

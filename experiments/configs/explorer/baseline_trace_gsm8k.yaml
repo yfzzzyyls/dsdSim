@@ -9,7 +9,7 @@ speculation:
     type: specpp
     min_gamma: 2
     max_gamma: 8
-    stop_threshold: 0.7
+    stop_threshold: 0.9  # More aggressive (was 0.7)
     fallback_gamma: 4
   vanilla: null
   eagle:
