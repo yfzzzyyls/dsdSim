@@ -91,8 +91,8 @@ class AcceptanceRegressor:
         spec_tokens = int(bundle.get("spec_tokens", 1))
         regressor = bundle.get("regressor")
         classifier = bundle.get("classifier")
-        if regressor is None or classifier is None:
-            raise ValueError("Acceptance bundle missing regressor or classifier")
+        if classifier is None:
+            raise ValueError("Acceptance bundle missing classifier")
         feature_columns = bundle.get("feature_columns") or {}
         metadata = bundle.get("metadata") or {}
         categorical_maps = bundle.get("categorical_maps") or {}

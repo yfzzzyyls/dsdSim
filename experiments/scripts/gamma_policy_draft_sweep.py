@@ -158,7 +158,16 @@ def _build_config(base: Dict, *, policy_name: str, draft_count: int, base_dir: P
         acceptance_cfg.pop("model", None)
         acceptance_cfg.pop("file", None)
     else:
-        spec.setdefault("acceptance_model", str(REPO_ROOT / "src" / "acceptance" / "llama2_7b_vs_70b.joblib"))
+        model_path = (
+            spec.get("acceptance_model")
+            or acceptance_cfg.get("model")
+            or acceptance_cfg.get("file")
+        )
+        if not model_path:
+            raise SweepError(
+                "Acceptance model not specified; please set "
+                "`speculation.acceptance.model` (or disable the model explicitly)."
+            )
 
     gamma_policy = preset.get("gamma_policy")
     if gamma_policy:
@@ -447,8 +456,7 @@ def _plot_curves(results: Dict[str, Dict[int, Dict[str, float]]], output_dir: Pa
         return
 
     metrics = [
-        ("throughput_busy_jobs_s", "Throughput (jobs/s)", "throughput_curve.png", False, False, None),
-        ("target_tokens_per_s", "Throughput (tok/s)", "target_processing_tokens_curve.png", False, False, 5.0),
+        ("throughput_jobs_s", "Throughput (jobs/s)", "throughput_curve.png", False, False, None),
         ("ttft_avg_ms", "TTFT (ms)", "ttft_curve.png", False, False, None),
         ("tpot_avg_ms", "TPOT (ms)", "tpot_curve.png", False, False, None),
         ("target_utilization_pct", "Target Capacity Utilization (%)", "target_capacity_curve.png", True, False, None),
@@ -503,7 +511,7 @@ def _plot_curves(results: Dict[str, Dict[int, Dict[str, float]]], output_dir: Pa
         print(f"Saved {out_path}")
 
     combo_metrics = [
-        ("target_tokens_per_s", "Throughput (tok/s)", False),
+        ("throughput_jobs_s", "Throughput (jobs/s)", False),
         ("ttft_avg_ms", "TTFT (ms)", False),
         ("tpot_avg_ms", "TPOT (ms)", False),
     ]

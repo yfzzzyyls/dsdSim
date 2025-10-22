@@ -4,12 +4,12 @@ verbose: true
 debug: true
 speculation:
   framework: vanilla
-  execution_mode: fused
+  execution_mode: distributed
   gamma_policy:
     type: specpp
-    min_gamma: 2
+    min_gamma: 4
     max_gamma: 8
-    stop_threshold: 0.9  # More aggressive (was 0.7)
+    stop_threshold: 0.15
     fallback_gamma: 4
   vanilla: null
   eagle:
@@ -25,7 +25,7 @@ speculation:
       min_beam_width: 1
   acceptance:
     disable_model: false
-    model: src/acceptance/llama2_7b_vs_70b.joblib
+    model: src/acceptance/fixed_acceptance.joblib
     use_classifier: true
     default_rate: 0.8
     context_bucket: 1
@@ -38,7 +38,7 @@ execution_mode: blocking
 gamma: 4
 trace_path: traces/gsm8k_trace_1s.jsonl
 trace_replay:
-  per_draft_rps: 3.5
+  per_draft_rps: 0.2  # Reduced from 3.5 to get proper saturation curve around 700-900 drafts
 trace_defaults:
   slo_class: hetero_baseline
 prompt_length_min: 24
@@ -55,7 +55,6 @@ router_params: {}
 global_router: disabled
 workload:
   arrival: poisson
-  rate_rps: 140.0
 think_time:
   enabled: true
   distribution: lognormal
