@@ -7,11 +7,10 @@ speculation:
   execution_mode: distributed
   gamma_policy:
     type: specpp
-    min_gamma: 4
+    min_gamma: 2
     max_gamma: 8
-    stop_threshold: 0.15
+    stop_threshold: 0.7  # Back to reasonable threshold that selects gamma=4 naturally
     fallback_gamma: 4
-  vanilla: null
   eagle:
     beam_width: 4
     max_depth: 4
@@ -38,7 +37,7 @@ execution_mode: blocking
 gamma: 4
 trace_path: traces/gsm8k_trace_1s.jsonl
 trace_replay:
-  per_draft_rps: 0.2  # Reduced from 3.5 to get proper saturation curve around 700-900 drafts
+  per_draft_rps: 0.5  # Increased to ensure all policies saturate quickly
 trace_defaults:
   slo_class: hetero_baseline
 prompt_length_min: 24
