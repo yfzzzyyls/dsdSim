@@ -41,7 +41,7 @@ answer_length_min: 96
 answer_length_max: 960
 use_answer_distribution: true
 mixed_batching: true
-router: semi_clairvoyant
+router: jsq
 router_params: {}
 global_router: disabled
 workload: {}
@@ -83,7 +83,7 @@ scheduler:
 auto_topology:
   clusters:
   - name: llama
-    router: semi_clairvoyant
+    router: jsq
     router_params: {}
     targets:
       count: 20
