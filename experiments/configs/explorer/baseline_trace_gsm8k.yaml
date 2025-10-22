@@ -10,7 +10,6 @@ speculation:
     min_gamma: 2
     max_gamma: 8
     stop_threshold: 0.7  # Back to reasonable threshold that selects gamma=4 naturally
-    fallback_gamma: 4
   eagle:
     beam_width: 4
     max_depth: 4
@@ -27,19 +26,12 @@ speculation:
     model: src/acceptance/fixed_acceptance.joblib
     use_classifier: true
     default_rate: 0.8
-    context_bucket: 1
-    depth_bucket: 1
-    pending_bucket: 1
-    queue_bucket: 1
-    surrogate:
-      enabled: false
 execution_mode: blocking
 gamma: 4
 trace_path: traces/gsm8k_trace_1s.jsonl
 trace_replay:
   per_draft_rps: 0.5  # Increased to ensure all policies saturate quickly
-trace_defaults:
-  slo_class: hetero_baseline
+trace_defaults: {}
 prompt_length_min: 24
 prompt_length_max: 512
 prompt_scale_by_capability: true
@@ -52,8 +44,7 @@ mixed_batching: true
 router: semi_clairvoyant
 router_params: {}
 global_router: disabled
-workload:
-  arrival: poisson
+workload: {}
 think_time:
   enabled: true
   distribution: lognormal
@@ -81,37 +72,14 @@ scheduler:
     delayed_batch_ms: 0.3
     max_queue_depth: 24
     backpressure_wait_ms: 0.08
-    dynamic_policy:
-      enabled: true
-      low_queue_depth: 1
-      high_queue_depth: 6
-      low_wait_ms: 0.2
-      high_wait_ms: 1.4
-      low_batch_requests: 2
-      high_batch_requests: 6
-      low_delay_ms: 0.18
-      high_delay_ms: 0.55
   decode:
     pool: global_pool
     queue_policy: priority
     max_batch_requests: 6
     max_wait_ms: 0.8
-    delayed_batch_ms: 0.28
-    max_queue_depth: 28
-    backpressure_wait_ms: 0.09
-    dynamic_policy:
-      enabled: true
-      low_queue_depth: 2
-      high_queue_depth: 8
-      low_wait_ms: 0.18
-      high_wait_ms: 0.95
-      low_batch_requests: 2
-      high_batch_requests: 6
-      low_delay_ms: 0.1
-      high_delay_ms: 0.5
-  kv:
-    default_capacity_tokens: 240000
-    max_utilization_pct: 82.0
+    delayed_batch_ms: 0.3
+    max_queue_depth: 24
+    backpressure_wait_ms: 0.08
 auto_topology:
   clusters:
   - name: llama
