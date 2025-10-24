@@ -9,7 +9,7 @@ speculation:
     type: specpp
     min_gamma: 2
     max_gamma: 8
-    stop_threshold: 0.7  # Back to reasonable threshold that selects gamma=4 naturally
+    stop_threshold: 0.7
   eagle:
     beam_width: 4
     max_depth: 4

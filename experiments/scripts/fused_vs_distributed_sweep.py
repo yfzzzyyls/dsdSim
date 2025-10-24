@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
-"""Sweep draft counts for several gamma control policies."""
+"""Compare fused vs distributed speculative execution across draft counts."""
 
 from __future__ import annotations
 
 import argparse
 import contextlib
 import io
-import logging
-import time
 import json
+import logging
 import os
 import subprocess
 import sys
+import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from copy import deepcopy
 from pathlib import Path
@@ -20,85 +20,50 @@ from typing import Any, Dict, Iterable, Optional, Tuple
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SIM_PATH = REPO_ROOT / "src" / "sim.py"
 DEFAULT_CONFIG = REPO_ROOT / "experiments" / "configs" / "explorer" / "baseline_trace_gsm8k.yaml"
-OUTPUT_DIR = REPO_ROOT / "experiments" / "results" / "gamma_policy_draft_sweep"
-DEFAULT_COUNTS = [5, 15, 25, 35, 45, 55, 65, 75]
+DEFAULT_OUTPUT = REPO_ROOT / "experiments" / "results" / "fused_vs_distributed"
+DEFAULT_COUNTS = [200, 300, 400, 600, 800, 1000, 1500, 2048, 3072, 4096]
 DEFAULT_SEEDS = [123]
 VIDUR_REPO_PATH = REPO_ROOT / "thirdparty" / "Sai_speculative_vidur"
+
+EXECUTION_MODES: Dict[str, Dict[str, Any]] = {
+    "distributed": {"label": "Distributed", "style": {"color": "#1f77b4", "marker": "o"}},
+    "fused": {"label": "Fused", "style": {"color": "#ff7f0e", "marker": "s"}},
+}
 
 # Ensure in-process mode can import repository modules and vendored VIDUR
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
-src_path = REPO_ROOT / "src"
-if str(src_path) not in sys.path:
-    sys.path.insert(0, str(src_path))
+SRC_PATH = REPO_ROOT / "src"
+if str(SRC_PATH) not in sys.path:
+    sys.path.insert(0, str(SRC_PATH))
 if str(VIDUR_REPO_PATH) not in sys.path:
     sys.path.insert(0, str(VIDUR_REPO_PATH))
 
-import yaml
-from src import sim
-
-POLICY_PRESETS: Dict[str, Dict[str, Optional[dict]]] = {
-    "gamma4_static": {
-        "gamma": 4,
-        "gamma_policy": None,
-    },
-    "acceptance_backoff": {
-        "gamma": 4,
-        "gamma_policy": {
-            "type": "acceptance_backoff",
-            "min_gamma": 2,
-            "max_gamma": 8,
-            "low_acceptance": 0.25,
-            "high_acceptance": 0.6,
-        },
-    },
-    "specpp": {
-        "gamma": 4,
-        "gamma_policy": {
-            "type": "specpp",
-            "min_gamma": 2,
-            "max_gamma": 8,
-            "stop_threshold": 0.7,
-            "fallback_gamma": 4,
-        },
-    },
-}
-
-DISPLAY_NAMES = {
-    "gamma4_static": "Static γ=4",
-    "acceptance_backoff": "Simple",
-    "specpp": "Spec++",
-}
-
-LINE_STYLES = {
-    "gamma4_static": {"color": "#1f77b4", "marker": "o"},
-    "acceptance_backoff": {"color": "#ff7f0e", "marker": "s"},
-    "specpp": {"color": "#2ca02c", "marker": "^"},
-}
+import yaml  # type: ignore
+from src import sim  # type: ignore
 
 
 class SweepError(RuntimeError):
     pass
 
 
-def _load_config(path: Path) -> Dict:
+def _load_config(path: Path) -> Dict[str, Any]:
     if not path.exists():
         raise SweepError(f"Baseline config not found: {path}")
     return yaml.safe_load(path.read_text()) or {}
 
 
-def _ensure_latency_metadata(cfg: Dict) -> None:
+def _ensure_latency_metadata(cfg: Dict[str, Any]) -> None:
     for cluster in cfg.get("auto_topology", {}).get("clusters", []):
         target_spec = cluster.get("targets", {})
-        tiers = target_spec.get("tiers", [])
-        for tier in tiers:
+        for tier in target_spec.get("tiers", []):
             metadata = dict(tier.get("metadata", {}))
             metadata.setdefault("prefill_latency_per_token", 30.0)
             metadata.setdefault("decode_latency_per_token", 9.0)
             tier["metadata"] = metadata
 
 
-def _rebalance_count_by_label(draft_spec: Dict, new_total: int) -> None:
+def _rebalance_count_by_label(draft_spec: Dict[str, Any], new_total: int) -> None:
     counts = draft_spec.get("count_by_label") or {}
     if not counts:
         return
@@ -123,7 +88,7 @@ def _rebalance_count_by_label(draft_spec: Dict, new_total: int) -> None:
     draft_spec["count_by_label"] = {k: int(v) for k, v in scaled.items()}
 
 
-def _resolve_trace_path(cfg: Dict, base_dir: Path) -> None:
+def _resolve_trace_path(cfg: Dict[str, Any], base_dir: Path) -> None:
     trace_path = cfg.get("trace_path")
     if not trace_path:
         return
@@ -137,20 +102,24 @@ def _resolve_trace_path(cfg: Dict, base_dir: Path) -> None:
     cfg["trace_path"] = str(trace_obj)
 
 
-def _build_config(base: Dict, *, policy_name: str, draft_count: int, base_dir: Path) -> Dict:
-    preset = POLICY_PRESETS.get(policy_name)
-    if preset is None:
-        raise SweepError(f"Unknown policy preset '{policy_name}'")
-
+def _build_config(
+    base: Dict[str, Any],
+    *,
+    execution_mode: str,
+    draft_count: int,
+    base_dir: Path,
+    gamma: Optional[int],
+) -> Dict[str, Any]:
     cfg = deepcopy(base)
     cfg["sim_time_ms"] = 2000
     cfg["verbose"] = False
     cfg["debug"] = False
-    cfg["gamma"] = int(preset.get("gamma", 4) or 4)
+    if gamma is not None:
+        cfg["gamma"] = int(gamma)
 
     spec = cfg.setdefault("speculation", {})
-    spec["framework"] = "vanilla"
-    spec["execution_mode"] = "distributed"
+    spec["framework"] = spec.get("framework", "vanilla")
+    spec["execution_mode"] = execution_mode
 
     acceptance_cfg = spec.setdefault("acceptance", {})
     if acceptance_cfg.get("disable_model"):
@@ -169,17 +138,10 @@ def _build_config(base: Dict, *, policy_name: str, draft_count: int, base_dir: P
                 "`speculation.acceptance.model` (or disable the model explicitly)."
             )
 
-    gamma_policy = preset.get("gamma_policy")
-    if gamma_policy:
-        spec["gamma_policy"] = dict(gamma_policy)
-    else:
-        spec.pop("gamma_policy", None)
-
     _resolve_trace_path(cfg, base_dir)
     _ensure_latency_metadata(cfg)
 
-    clusters = cfg.get("auto_topology", {}).get("clusters", [])
-    for cluster in clusters:
+    for cluster in cfg.get("auto_topology", {}).get("clusters", []):
         drafts = cluster.get("drafts", {})
         drafts["count"] = int(draft_count)
         _rebalance_count_by_label(drafts, int(draft_count))
@@ -187,7 +149,7 @@ def _build_config(base: Dict, *, policy_name: str, draft_count: int, base_dir: P
     return cfg
 
 
-def _write_config(cfg: Dict, path: Path) -> None:
+def _write_config(cfg: Dict[str, Any], path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(yaml.safe_dump(cfg, sort_keys=False))
 
@@ -197,10 +159,7 @@ def _run_sim_subprocess(config_path: Path) -> Dict[str, float]:
     env = dict(os.environ)
     extra = [str(VIDUR_REPO_PATH)]
     existing = env.get("PYTHONPATH")
-    if existing:
-        env["PYTHONPATH"] = os.pathsep.join(extra + [existing])
-    else:
-        env["PYTHONPATH"] = os.pathsep.join(extra)
+    env["PYTHONPATH"] = os.pathsep.join(extra + [existing]) if existing else os.pathsep.join(extra)
     result = subprocess.run(cmd, cwd=REPO_ROOT, capture_output=True, text=True, env=env)
     if result.returncode != 0:
         raise SweepError(
@@ -233,92 +192,80 @@ def _run_sim_inprocess(cfg_dict: Dict[str, Any]) -> Dict[str, float]:
     return metrics
 
 
-def _run_policy_count(
-    policy_name: str,
-    draft_count: int,
-    base_cfg: Dict,
-    seeds: Iterable[int],
-    output_dir: Path,
-    base_dir: Path,
-    run_mode: str,
-) -> Tuple[str, int, Dict[str, float]]:
-    aggregates: Dict[str, float] = {}
-    samples = 0
-    for seed in seeds:
-        cfg = _build_config(base_cfg, policy_name=policy_name, draft_count=draft_count, base_dir=base_dir)
-        cfg["seed"] = int(seed)
-        cfg_path = output_dir / "configs" / f"{policy_name}_drafts{draft_count}_seed{seed}.yaml"
-        _write_config(cfg, cfg_path)
-        if run_mode == "sweep":
-            metrics = _run_sim_inprocess(cfg)
-        else:
-            metrics = _run_sim_subprocess(cfg_path)
-        samples += 1
-        for key, value in metrics.items():
-            aggregates[key] = aggregates.get(key, 0.0) + value
-
-    averaged = {k: v / samples for k, v in aggregates.items()} if samples else {}
-    thr = averaged.get("throughput_jobs_s", 0.0)
-    conv_thr = averaged.get("conversation_throughput_rps", 0.0)
-    ttft = averaged.get("ttft_avg_ms", 0.0)
-    tpot = averaged.get("tpot_avg_ms", 0.0)
-    print(
-        f"policy={policy_name:18s} drafts={draft_count:4d} thr={thr:7.2f} conv_thr={conv_thr:7.2f} "
-        f"ttft={ttft:7.2f} tpot={tpot:7.2f}"
-    )
-    _log_latency_breakdown(policy_name, draft_count, averaged, output_dir)
-    return policy_name, draft_count, averaged
-
-
-def _log_latency_breakdown(policy_name: str, draft_count: int, metrics: Dict[str, float], output_dir: Path) -> None:
-    """Persist latency breakdown gleaned from simulator metrics without console spam."""
-
+def _log_latency_breakdown(mode: str, draft_count: int, metrics: Dict[str, float], output_dir: Path) -> None:
     def _collect(prefix: str) -> Dict[str, float]:
-        entries = {
-            key[len(prefix):]: value
-            for key, value in metrics.items()
-            if key.startswith(prefix)
-        }
+        entries = {key[len(prefix):]: value for key, value in metrics.items() if key.startswith(prefix)}
         return dict(sorted(entries.items())) if entries else {}
 
     ttft_parts = _collect("ttft_breakdown_")
     decode_parts = _collect("decode_breakdown_")
-
     if not ttft_parts and not decode_parts:
         return
 
     payload = {
-        "policy": policy_name,
+        "mode": mode,
         "draft_count": draft_count,
         "ttft_breakdown_ms": ttft_parts,
         "decode_breakdown_ms": decode_parts,
     }
     dump_dir = output_dir / "latency_breakdowns"
     dump_dir.mkdir(parents=True, exist_ok=True)
-    out_path = dump_dir / f"{policy_name}_drafts{draft_count}.json"
+    out_path = dump_dir / f"{mode}_drafts{draft_count}.json"
     out_path.write_text(json.dumps(payload, indent=2))
 
 
 def _prepare_seed_configs(
-    policy_name: str,
+    mode: str,
     draft_count: int,
-    base_cfg: Dict,
+    base_cfg: Dict[str, Any],
     seeds: Iterable[int],
     output_dir: Path,
     base_dir: Path,
+    gamma: Optional[int],
 ) -> list[Dict[str, Any]]:
     prepared: list[Dict[str, Any]] = []
     for seed in seeds:
-        cfg = _build_config(base_cfg, policy_name=policy_name, draft_count=draft_count, base_dir=base_dir)
+        cfg = _build_config(base_cfg, execution_mode=mode, draft_count=draft_count, base_dir=base_dir, gamma=gamma)
         cfg["seed"] = int(seed)
-        cfg_path = output_dir / "configs" / f"{policy_name}_drafts{draft_count}_seed{seed}.yaml"
+        cfg_path = output_dir / "configs" / f"{mode}_drafts{draft_count}_seed{seed}.yaml"
         _write_config(cfg, cfg_path)
         prepared.append({"cfg": cfg, "path": cfg_path, "seed": int(seed)})
     return prepared
 
 
-def _run_policy_count_sweep(
-    policy_name: str,
+def _run_mode_count(
+    mode: str,
+    draft_count: int,
+    base_cfg: Dict[str, Any],
+    seeds: Iterable[int],
+    output_dir: Path,
+    base_dir: Path,
+    runner: str,
+    gamma: Optional[int],
+) -> Tuple[str, int, Dict[str, float]]:
+    aggregates: Dict[str, float] = {}
+    samples = 0
+    for seed in seeds:
+        cfg = _build_config(base_cfg, execution_mode=mode, draft_count=draft_count, base_dir=base_dir, gamma=gamma)
+        cfg["seed"] = int(seed)
+        cfg_path = output_dir / "configs" / f"{mode}_drafts{draft_count}_seed{seed}.yaml"
+        _write_config(cfg, cfg_path)
+        metrics = _run_sim_inprocess(cfg) if runner == "sweep" else _run_sim_subprocess(cfg_path)
+        samples += 1
+        for key, value in metrics.items():
+            aggregates[key] = aggregates.get(key, 0.0) + float(value)
+
+    averaged = {k: v / samples for k, v in aggregates.items()} if samples else {}
+    thr = averaged.get("throughput_jobs_s", 0.0)
+    ttft = averaged.get("ttft_avg_ms", 0.0)
+    tpot = averaged.get("tpot_avg_ms", 0.0)
+    print(f"mode={mode:12s} drafts={draft_count:4d} thr={thr:7.2f} ttft={ttft:7.2f} tpot={tpot:7.2f}")
+    _log_latency_breakdown(mode, draft_count, averaged, output_dir)
+    return mode, draft_count, averaged
+
+
+def _run_mode_count_sweep(
+    mode: str,
     draft_count: int,
     seed_configs: list[Dict[str, Any]],
     output_dir: Path,
@@ -339,212 +286,155 @@ def _run_policy_count_sweep(
     if profiler and samples:
         averaged["profiler"] = {k: v / samples for k, v in profiler.items()}
     thr = averaged.get("throughput_jobs_s", 0.0)
-    conv_thr = averaged.get("conversation_throughput_rps", 0.0)
     ttft = averaged.get("ttft_avg_ms", 0.0)
     tpot = averaged.get("tpot_avg_ms", 0.0)
-    print(
-        f"policy={policy_name:18s} drafts={draft_count:4d} thr={thr:7.2f} conv_thr={conv_thr:7.2f} "
-        f"ttft={ttft:7.2f} tpot={tpot:7.2f}"
-    )
-    _log_latency_breakdown(policy_name, draft_count, averaged, output_dir)
-    return policy_name, draft_count, averaged
+    print(f"mode={mode:12s} drafts={draft_count:4d} thr={thr:7.2f} ttft={ttft:7.2f} tpot={tpot:7.2f}")
+    _log_latency_breakdown(mode, draft_count, averaged, output_dir)
+    return mode, draft_count, averaged
 
 
-def _run_policy_count_sweep_worker(
-    policy_name: str,
+def _run_mode_count_sweep_worker(
+    mode: str,
     draft_count: int,
     seed_configs: list[Dict[str, Any]],
     output_dir_str: str,
 ) -> Tuple[str, int, Dict[str, float]]:
     logging.disable(logging.CRITICAL)
-    return _run_policy_count_sweep(policy_name, draft_count, seed_configs, Path(output_dir_str))
+    return _run_mode_count_sweep(mode, draft_count, seed_configs, Path(output_dir_str))
 
 
-def sweep(
-    base_cfg: Dict,
+def compare_modes(
+    base_cfg: Dict[str, Any],
     counts: Iterable[int],
     seeds: Iterable[int],
     output_dir: Path,
     base_dir: Path,
     workers: int,
-    run_mode: str,
+    runner: str,
+    modes: Iterable[str],
+    gamma: Optional[int],
 ) -> Dict[str, Dict[int, Dict[str, float]]]:
-    results: Dict[str, Dict[int, Dict[str, float]]] = {policy: {} for policy in POLICY_PRESETS}
+    selected_modes = [m for m in modes if m in EXECUTION_MODES]
+    if not selected_modes:
+        raise SweepError("No valid execution modes selected.")
+
     counts = [int(c) for c in counts]
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    tasks = [(policy, draft_count) for policy in POLICY_PRESETS for draft_count in counts]
+    results: Dict[str, Dict[int, Dict[str, float]]] = {mode: {} for mode in selected_modes}
+    tasks = [(mode, draft_count) for mode in selected_modes for draft_count in counts]
 
-    if run_mode == "sweep":
-        prepared_configs: Dict[Tuple[str, int], list[Dict[str, Any]]] = {}
-        for policy_name, draft_count in tasks:
-            prepared_configs[(policy_name, draft_count)] = _prepare_seed_configs(
-                policy_name,
-                draft_count,
-                base_cfg,
-                seeds,
-                output_dir,
-                base_dir,
+    if runner == "sweep":
+        prepared: Dict[Tuple[str, int], list[Dict[str, Any]]] = {}
+        for mode, draft_count in tasks:
+            prepared[(mode, draft_count)] = _prepare_seed_configs(
+                mode, draft_count, base_cfg, seeds, output_dir, base_dir, gamma
             )
 
         if workers <= 1:
-            for policy_name, draft_count in tasks:
-                _, _, metrics = _run_policy_count_sweep(
-                    policy_name,
-                    draft_count,
-                    prepared_configs[(policy_name, draft_count)],
-                    output_dir,
-                )
-                results[policy_name][draft_count] = metrics
+            for mode, draft_count in tasks:
+                _, _, metrics = _run_mode_count_sweep(mode, draft_count, prepared[(mode, draft_count)], output_dir)
+                results[mode][draft_count] = metrics
         else:
             with ProcessPoolExecutor(max_workers=workers) as executor:
                 futures = {
                     executor.submit(
-                        _run_policy_count_sweep_worker,
-                        policy_name,
+                        _run_mode_count_sweep_worker,
+                        mode,
                         draft_count,
-                        prepared_configs[(policy_name, draft_count)],
+                        prepared[(mode, draft_count)],
                         str(output_dir),
-                    ): (policy_name, draft_count)
-                    for policy_name, draft_count in tasks
+                    ): (mode, draft_count)
+                    for mode, draft_count in tasks
                 }
                 for future in as_completed(futures):
-                    policy_name, draft_count = futures[future]
+                    mode, draft_count = futures[future]
                     _, _, metrics = future.result()
-                    results[policy_name][draft_count] = metrics
+                    results[mode][draft_count] = metrics
     else:
         if workers <= 1:
-            for policy_name, draft_count in tasks:
-                _, _, metrics = _run_policy_count(
-                    policy_name,
+            for mode, draft_count in tasks:
+                _, _, metrics = _run_mode_count(
+                    mode,
                     draft_count,
                     base_cfg,
                     seeds,
                     output_dir,
                     base_dir,
-                    run_mode,
+                    runner,
+                    gamma,
                 )
-                results[policy_name][draft_count] = metrics
+                results[mode][draft_count] = metrics
         else:
             with ProcessPoolExecutor(max_workers=workers) as executor:
                 futures = {
                     executor.submit(
-                        _run_policy_count,
-                        policy_name,
+                        _run_mode_count,
+                        mode,
                         draft_count,
                         base_cfg,
                         list(seeds),
                         output_dir,
                         base_dir,
-                        run_mode,
-                    ): (policy_name, draft_count)
-                    for policy_name, draft_count in tasks
+                        runner,
+                        gamma,
+                    ): (mode, draft_count)
+                    for mode, draft_count in tasks
                 }
                 for future in as_completed(futures):
-                    policy_name, draft_count = futures[future]
+                    mode, draft_count = futures[future]
                     _, _, metrics = future.result()
-                    results[policy_name][draft_count] = metrics
+                    results[mode][draft_count] = metrics
 
     return results
 
 
-def _plot_curves(results: Dict[str, Dict[int, Dict[str, float]]], output_dir: Path) -> None:
+def _plot_comparison(results: Dict[str, Dict[int, Dict[str, float]]], output_dir: Path, modes: Iterable[str]) -> None:
     try:
         import matplotlib.pyplot as plt
     except ImportError:
         print("matplotlib not available; skipping plots")
         return
 
-    metrics = [
-        ("throughput_jobs_s", "System Throughput (jobs/s)", "throughput_curve.png", False, False, None),
-        ("target_throughput_jobs_s", "Target Throughput (jobs/s)", "target_throughput_curve.png", False, False, None),
-        ("ttft_avg_ms", "TTFT (ms)", "ttft_curve.png", False, False, None),
-        ("tpot_avg_ms", "TPOT (ms)", "tpot_curve.png", False, False, None),
-        ("target_utilization_pct", "Target Capacity Utilization (%)", "target_capacity_curve.png", True, False, None),
+    selected_modes = [m for m in modes if m in EXECUTION_MODES]
+    if not selected_modes:
+        return
+
+    metric_specs = [
+        ("throughput_jobs_s", "Throughput (jobs/s)"),
+        ("ttft_avg_ms", "TTFT (ms)"),
+        ("tpot_avg_ms", "TPOT (ms)"),
     ]
 
-    metric_data: Dict[str, Dict[str, Tuple[list[int], list[float]]]] = {}
-
-    for key, ylabel, filename, as_percent, use_running_max, drop_cap in metrics:
-        plt.figure(figsize=(6.5, 4))
-        for policy_name in POLICY_PRESETS.keys():
-            style = LINE_STYLES.get(policy_name, {})
-            samples = results.get(policy_name, {})
+    fig, axes = plt.subplots(1, len(metric_specs), figsize=(15, 4.5), sharex=False)
+    for ax, (metric_key, ylabel) in zip(axes, metric_specs):
+        for mode in selected_modes:
+            samples = results.get(mode, {})
             if not samples:
                 continue
-            drafts = sorted(samples.keys())
-            values = [samples[d].get(key, 0.0) for d in drafts]
-            if use_running_max:
-                running = []
-                max_so_far = 0.0
-                for v in values:
-                    max_so_far = max(max_so_far, v)
-                    running.append(max_so_far)
-                values = running
-            if drop_cap is not None and values:
-                adjusted = [values[0]]
-                for val in values[1:]:
-                    prev = adjusted[-1]
-                    min_allowed = prev - drop_cap
-                    adjusted.append(val if val >= min_allowed else max(min_allowed, 0.0))
-                values = adjusted
-            if as_percent:
-                values = [v * 100.0 for v in values]
-            metric_data.setdefault(key, {})[policy_name] = (drafts, values)
-            plt.plot(
-                drafts,
+            counts = sorted(samples.keys())
+            values = [samples[count].get(metric_key, 0.0) for count in counts]
+            style = EXECUTION_MODES[mode]["style"]
+            label = EXECUTION_MODES[mode]["label"]
+            ax.plot(
+                counts,
                 values,
-                label=DISPLAY_NAMES.get(policy_name, policy_name),
+                label=label,
                 color=style.get("color"),
                 marker=style.get("marker"),
                 linewidth=2.2,
                 markersize=5,
             )
-        plt.xlabel("Draft count")
-        plt.ylabel(ylabel)
-        plt.title(f"{ylabel} vs Draft count")
-        plt.grid(True, linestyle="--", alpha=0.4)
-        plt.legend()
-        plt.tight_layout()
-        out_path = output_dir / filename
-        plt.savefig(out_path, dpi=150)
-        plt.close()
-        print(f"Saved {out_path}")
-
-    combo_metrics = [
-        ("throughput_jobs_s", "System Throughput (jobs/s)", False),
-        ("target_utilization_pct", "Target Utilization (%)", True),
-        ("ttft_avg_ms", "TTFT (ms)", False),
-        ("tpot_avg_ms", "TPOT (ms)", False),
-    ]
-
-    fig, axes = plt.subplots(1, len(combo_metrics), figsize=(20, 4.5), sharex=True)
-    for ax, (key, ylabel, to_percent) in zip(axes, combo_metrics):
-        for policy_name in POLICY_PRESETS.keys():
-            if key not in metric_data or policy_name not in metric_data[key]:
-                continue
-            drafts, values = metric_data[key][policy_name]
-            plot_vals = [v * 100.0 for v in values] if to_percent else values
-            style = LINE_STYLES.get(policy_name, {})
-            ax.plot(
-                drafts,
-                plot_vals,
-                label=DISPLAY_NAMES.get(policy_name, policy_name),
-                color=style.get("color"),
-                marker=style.get("marker"),
-                linewidth=2.0,
-                markersize=4,
-            )
         ax.set_xlabel("Draft count")
         ax.set_ylabel(ylabel)
         ax.grid(True, linestyle="--", alpha=0.35)
-    axes[0].legend(frameon=False, loc="upper left")
-    fig.suptitle("Gamma Policy Draft Sweep - Throughput Drop is Measurement Artifact", fontsize=14)
-    fig.tight_layout(rect=[0, 0, 1, 0.95])
-    grid_path = output_dir / "gamma_draft_metrics_4panel_grid.png"
-    fig.savefig(grid_path, dpi=180)
+    axes[0].legend(frameon=False, loc="best")
+    fig.suptitle("Fused vs Distributed Speculation", fontsize=15)
+    fig.tight_layout(rect=[0, 0, 1, 0.94])
+    out_path = output_dir / "fused_vs_distributed_metrics.png"
+    fig.savefig(out_path, dpi=180)
     plt.close(fig)
-    print(f"Saved {grid_path}")
+    print(f"Saved {out_path}")
 
 
 def _plot_latency_breakdowns(output_dir: Path) -> None:
@@ -564,14 +454,14 @@ def _plot_latency_breakdowns(output_dir: Path) -> None:
             payload = json.loads(path.read_text())
         except json.JSONDecodeError:
             continue
-        policy = payload.get("policy")
+        mode = payload.get("mode")
         draft = payload.get("draft_count")
-        if policy is None or draft is None:
+        if mode is None or draft is None:
             continue
         ttft = payload.get("ttft_breakdown_ms", {})
         decode = payload.get("decode_breakdown_ms", {})
-        breakdowns.setdefault(policy, {}).setdefault(int(draft), {})["ttft"] = ttft
-        breakdowns.setdefault(policy, {}).setdefault(int(draft), {})["decode"] = decode
+        breakdowns.setdefault(mode, {}).setdefault(int(draft), {})["ttft"] = ttft
+        breakdowns.setdefault(mode, {}).setdefault(int(draft), {})["decode"] = decode
 
     if not breakdowns:
         return
@@ -597,7 +487,7 @@ def _plot_latency_breakdowns(output_dir: Path) -> None:
 
     palette = plt.get_cmap("tab20").colors
 
-    for policy, drafts_data in breakdowns.items():
+    for mode, drafts_data in breakdowns.items():
         draft_counts = sorted(drafts_data.keys())
         if not draft_counts:
             continue
@@ -638,33 +528,39 @@ def _plot_latency_breakdowns(output_dir: Path) -> None:
             ax.set_title(title)
             ax.grid(True, axis="y", linestyle="--", alpha=0.35)
 
-        handles = []
-        labels = []
-        for label, color in legend_map.items():
-            handles.append(plt.Rectangle((0, 0), 1, 1, color=color))
-            labels.append(label)
+        handles = [plt.Rectangle((0, 0), 1, 1, color=color) for label, color in legend_map.items()]
+        labels = list(legend_map.keys())
         fig.legend(handles, labels, loc="upper right", frameon=False)
-        fig.suptitle(f"Latency Breakdown — {policy}", fontsize=14)
+        mode_label = EXECUTION_MODES.get(mode, {}).get("label", mode)
+        fig.suptitle(f"Latency Breakdown — {mode_label}", fontsize=14)
         fig.tight_layout(rect=[0, 0, 0.9, 0.94])
 
-        out_path = output_dir / f"latency_breakdown_{policy}.png"
+        out_path = output_dir / f"latency_breakdown_{mode}.png"
         fig.savefig(out_path, dpi=180)
         plt.close(fig)
         print(f"Saved {out_path}")
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Compare gamma policies across draft counts.")
-    parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
-    parser.add_argument("--counts", type=int, nargs="*", default=DEFAULT_COUNTS)
-    parser.add_argument("--seeds", type=int, nargs="*", default=DEFAULT_SEEDS)
-    parser.add_argument("--output", type=Path, default=OUTPUT_DIR)
-    parser.add_argument("--workers", type=int, default=1, help="Number of parallel workers")
+    parser = argparse.ArgumentParser(description="Compare fused vs distributed speculation across draft counts.")
+    parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG, help="Base simulator config.")
+    parser.add_argument("--counts", type=int, nargs="*", default=DEFAULT_COUNTS, help="Draft counts to sweep.")
+    parser.add_argument("--seeds", type=int, nargs="*", default=DEFAULT_SEEDS, help="Random seeds to average.")
+    parser.add_argument("--gamma", type=int, default=None, help="Override gamma (tokens per chunk).")
+    parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT, help="Directory for results.")
+    parser.add_argument("--workers", type=int, default=1, help="Parallel workers for simulations.")
     parser.add_argument(
-        "--mode",
+        "--runner",
         choices=["subprocess", "sweep"],
         default="subprocess",
-        help="Execution mode: 'subprocess' launches sim.py per run; 'sweep' reuses a single simulator process",
+        help="Execution strategy: launch sim.py per run or reuse in-process simulator.",
+    )
+    parser.add_argument(
+        "--modes",
+        choices=sorted(EXECUTION_MODES.keys()),
+        nargs="*",
+        default=list(EXECUTION_MODES.keys()),
+        help="Execution modes to compare.",
     )
     args = parser.parse_args()
 
@@ -675,30 +571,32 @@ def main() -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     workers = max(1, int(args.workers or 1))
-    run_mode = args.mode
-    if run_mode == "sweep":
+    runner = args.runner
+    if runner == "sweep":
         logging.getLogger().setLevel(logging.WARNING)
         for name in ("vidur", "vidur.execution_time_predictor", "vidur.config"):
             logging.getLogger(name).setLevel(logging.WARNING)
 
     start_time = time.perf_counter()
-
-    results = sweep(
+    results = compare_modes(
         base_cfg,
         args.counts,
         args.seeds,
         output_dir,
         base_config_path.parent,
         workers,
-        run_mode,
+        runner,
+        args.modes,
+        args.gamma,
     )
     elapsed_s = time.perf_counter() - start_time
     print(f"Sweep completed in {elapsed_s:.2f}s")
+
     metrics_path = output_dir / "metrics.json"
     metrics_path.write_text(json.dumps(results, indent=2))
     print(f"Metrics written to {metrics_path}")
 
-    _plot_curves(results, output_dir)
+    _plot_comparison(results, output_dir, args.modes)
     _plot_latency_breakdowns(output_dir)
 
 

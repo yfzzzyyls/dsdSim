@@ -356,6 +356,7 @@ class Job:
     retry_count: int = 0
     accepted_tokens: int = 0
     gamma_override: int = 0
+    is_fused: bool = False
 
 
 class ChunkBarrier:
@@ -1023,7 +1024,12 @@ class TargetServer:
         self._pending_decode_tokens = 0  # Tokens awaiting verification (queued or inflight)
         self.total_processed_tokens = 0  # Total decode tokens processed by this target
         self.total_processed_jobs = 0    # Total decode jobs processed
-       
+
+        # Track when prefill jobs complete at target (for target throughput measurement)
+        self.prefill_completions = []  # List of (timestamp, count) tuples
+        self.prefill_service_ms = 0.0   # Total service time spent on prefill jobs (ms)
+        self.prefill_jobs_processed = 0  # Number of prefill jobs processed
+
         self.proc = env.process(self._serve_loop())
 
     # queue helpers
@@ -1069,6 +1075,14 @@ class TargetServer:
         return 0.0
 
     def _estimate_job_latency(self, job: Job) -> float:
+        target_latency = self._estimate_target_latency(job)
+        if getattr(job, "is_fused", False):
+            phase = "prefill" if job.job_type == "prefill" else "decode"
+            draft_latency = self._fused_phase_latency(job, phase)
+            return draft_latency + target_latency
+        return target_latency
+
+    def _estimate_target_latency(self, job: Job) -> float:
         provider = getattr(self, "performance", None)
         if provider is None:
             return 0.0
@@ -1095,6 +1109,8 @@ class TargetServer:
     def _estimate_batch_latency_from_provider(self, batch: List[Job]) -> Optional[float]:
         provider = getattr(self, "performance", None)
         if provider is None or not batch:
+            return None
+        if any(getattr(job, "is_fused", False) for job in batch):
             return None
         phase_groups = {
             "prefill": [job for job in batch if job.job_type == "prefill"],
@@ -1360,12 +1376,12 @@ class TargetServer:
                 self._avg_batch_latency_ms = sum(self._recent_batch_latencies) / len(self._recent_batch_latencies)
                 
                 # "serve" the batch
+                prefill_count = sum(1 for j in batch if j.job_type == "prefill")
                 if self.cfg.verbose or (self.debug and self.total_batches < 5):  # Print if verbose or first 5 batches
-                    prefill_count = sum(1 for j in batch if j.job_type == "prefill")
                     decode_count = len(batch) - prefill_count
                     print(f"[{self.env.now:.1f}ms] Target {self.p.id}: Serving batch of {len(batch)} jobs "
                           f"({prefill_count} prefill, {decode_count} decode), latency={batch_latency:.1f}ms", flush=True)
-                
+
                 for j in batch:
                     j.started_ms = self.env.now
                 self._busy = True
@@ -1379,7 +1395,11 @@ class TargetServer:
                 self.total_batches += 1
                 self.total_batch_items += len(batch)
                 self.queue_samples.append((self.env.now, self._enqueued_count))
-                
+
+                # Track prefill completions for target throughput measurement
+                if prefill_count > 0:
+                    self.prefill_completions.append((self.env.now, prefill_count))
+
                 tdone = self.env.now
                 for j in batch:
                     j.finished_ms = tdone
@@ -1397,6 +1417,12 @@ class TargetServer:
                         tokens = max(0, int(j.token_count or 0))
                         self.total_processed_tokens += tokens
                         self.total_processed_jobs += 1
+                    else:
+                        service_ms = self._estimate_job_latency(j)
+                        if service_ms <= 0.0:
+                            service_ms = max(0.0, (j.finished_ms or 0) - (j.started_ms or 0))
+                        self.prefill_service_ms += service_ms
+                        self.prefill_jobs_processed += 1
 
                     # Signal completion to waiting draft
                     if j.completion_event and not j.completion_event.triggered:
@@ -1906,44 +1932,53 @@ class DraftServer:
             target_id=target_id,
             priority_class=priority_class,
             phase="prefill",
+            is_fused=fused_mode,
         )
         self.chunks_sent += 1
 
-        prefill_payload = self._estimate_payload_bytes(prompt_length, self._prefill_overhead_bytes)
-        fwd_start = self.env.now
-        yield self._network_transfer(
-            self.id,
-            target_id,
-            conn.forward_latency_ms,
-            payload_bytes=prefill_payload,
-            link_key=conn.network_forward_key,
-        )
-        ttft_breakdown["prefill_forward_ms"] += self.env.now - fwd_start
+        if fused_mode:
+            forward_elapsed = 0.0
+        else:
+            prefill_payload = self._estimate_payload_bytes(prompt_length, self._prefill_overhead_bytes)
+            fwd_start = self.env.now
+            yield self._network_transfer(
+                self.id,
+                target_id,
+                conn.forward_latency_ms,
+                payload_bytes=prefill_payload,
+                link_key=conn.network_forward_key,
+            )
+            forward_elapsed = self.env.now - fwd_start
+        ttft_breakdown["prefill_forward_ms"] += forward_elapsed
         prefill_job.created_ms = self.env.now
 
-        if fused_mode:
-            wait_event = target_server.fused_execute(prefill_job)
-        elif self.scheduler is None:
-            target = self._target_lookup.get(target_id)
-            if target is None:
+        if self.scheduler is None:
+            if target_server is None:
                 print(f"Warning: Target {target_id} not found for draft {self.id}", flush=True)
                 return
-            target.enqueue(prefill_job)
-            wait_event = prefill_completion
+            if fused_mode:
+                wait_event = target_server.fused_execute(prefill_job)
+            else:
+                target_server.enqueue(prefill_job)
+                wait_event = prefill_completion
         else:
             wait_event = self.scheduler.submit_job(prefill_job)
 
         yield wait_event
 
-        rsp_start = self.env.now
-        yield self._network_transfer(
-            target_id,
-            self.id,
-            conn.response_latency_ms,
-            payload_bytes=self._estimate_payload_bytes(prompt_length, self._response_overhead_bytes),
-            link_key=conn.network_response_key,
-        )
-        ttft_breakdown["prefill_response_ms"] += self.env.now - rsp_start
+        if fused_mode:
+            response_elapsed = 0.0
+        else:
+            rsp_start = self.env.now
+            yield self._network_transfer(
+                target_id,
+                self.id,
+                conn.response_latency_ms,
+                payload_bytes=self._estimate_payload_bytes(prompt_length, self._response_overhead_bytes),
+                link_key=conn.network_response_key,
+            )
+            response_elapsed = self.env.now - rsp_start
+        ttft_breakdown["prefill_response_ms"] += response_elapsed
         prefill_job.rtt_end_ms = self.env.now
 
         prefill_started = prefill_job.started_ms if prefill_job.started_ms is not None else prefill_job.created_ms
@@ -2052,19 +2087,21 @@ class DraftServer:
                     target_id=target_id,
                     priority_class=priority_class,
                     phase="decode",
+                    is_fused=fused_mode,
                 )
                 self.chunks_sent += 1
 
-                if fused_mode:
-                    wait_event = target_server.fused_execute(job)
-                elif self.scheduler is None:
+                if self.scheduler is None:
                     target = self._target_lookup.get(target_id)
                     if target is None:
                         print(f"Warning: Target {target_id} not found for draft {self.id}", flush=True)
                         conversation_completed = True
                         break
-                    target.enqueue(job)
-                    wait_event = job.completion_event
+                    if fused_mode:
+                        wait_event = target.fused_execute(job)
+                    else:
+                        target.enqueue(job)
+                        wait_event = job.completion_event
                 else:
                     wait_event = self.scheduler.submit_job(job)
 
@@ -2295,6 +2332,9 @@ class DraftServer:
                     flush=True,
                 )
 
+            target_server = self._target_lookup.get(target_id)
+            fused_mode = self.framework == "vanilla" and self.execution_mode == "fused"
+
             prefill_rtt_start = self.env.now
             prefill_completion = self.env.event()
             prefill_job = Job(
@@ -2310,36 +2350,36 @@ class DraftServer:
                 target_id=target_id,
                 priority_class=priority_class,
                 phase="prefill",
+                is_fused=fused_mode,
             )
             self.chunks_sent += 1
 
             # Send prefill request to target
-            prefill_payload = self._estimate_payload_bytes(prompt_length, self._prefill_overhead_bytes)
-            fwd_start = self.env.now
-            yield self._network_transfer(
-                self.id,
-                target_id,
-                conn.forward_latency_ms,
-                payload_bytes=prefill_payload,
-                link_key=conn.network_forward_key,
-            )
-            ttft_breakdown["prefill_forward_ms"] += self.env.now - fwd_start
+            if fused_mode:
+                forward_elapsed = 0.0
+            else:
+                prefill_payload = self._estimate_payload_bytes(prompt_length, self._prefill_overhead_bytes)
+                fwd_start = self.env.now
+                yield self._network_transfer(
+                    self.id,
+                    target_id,
+                    conn.forward_latency_ms,
+                    payload_bytes=prefill_payload,
+                    link_key=conn.network_forward_key,
+                )
+                forward_elapsed = self.env.now - fwd_start
+            ttft_breakdown["prefill_forward_ms"] += forward_elapsed
             prefill_job.created_ms = self.env.now
 
-            target_server = self._target_lookup.get(target_id)
-            fused_mode = self.framework == "vanilla" and self.execution_mode == "fused"
-
-            if fused_mode:
+            if self.scheduler is None:
                 if target_server is None:
                     print(f"Warning: Target {target_id} not found for draft {self.id}", flush=True)
                     continue
-                wait_event = target_server.fused_execute(prefill_job)
-            elif self.scheduler is None:
-                if target_server is None:
-                    print(f"Warning: Target {target_id} not found for draft {self.id}", flush=True)
-                    continue
-                target_server.enqueue(prefill_job)
-                wait_event = prefill_completion
+                if fused_mode:
+                    wait_event = target_server.fused_execute(prefill_job)
+                else:
+                    target_server.enqueue(prefill_job)
+                    wait_event = prefill_completion
             else:
                 wait_event = self.scheduler.submit_job(prefill_job)
 
@@ -2347,16 +2387,20 @@ class DraftServer:
             yield wait_event
 
             # Wait for response to travel back
-            response_payload = self._estimate_payload_bytes(prompt_length, self._response_overhead_bytes)
-            rsp_start = self.env.now
-            yield self._network_transfer(
-                target_id,
-                self.id,
-                conn.response_latency_ms,
-                payload_bytes=response_payload,
-                link_key=conn.network_response_key,
-            )
-            ttft_breakdown["prefill_response_ms"] += self.env.now - rsp_start
+            if fused_mode:
+                response_elapsed = 0.0
+            else:
+                response_payload = self._estimate_payload_bytes(prompt_length, self._response_overhead_bytes)
+                rsp_start = self.env.now
+                yield self._network_transfer(
+                    target_id,
+                    self.id,
+                    conn.response_latency_ms,
+                    payload_bytes=response_payload,
+                    link_key=conn.network_response_key,
+                )
+                response_elapsed = self.env.now - rsp_start
+            ttft_breakdown["prefill_response_ms"] += response_elapsed
 
             # Mark RTT end for prefill
             prefill_job.rtt_end_ms = self.env.now
@@ -2463,6 +2507,7 @@ class DraftServer:
                         priority_class=priority_class,
                         phase="decode",
                         gamma_override=gamma_value,
+                        is_fused=fused_mode,
                     )
 
                     # Send chunk to target (forward latency)
@@ -2486,19 +2531,16 @@ class DraftServer:
                     # Job arrives at target after network delay (or immediately in fused mode)
                     job.created_ms = self.env.now
 
-                    if fused_mode:
+                    if self.scheduler is None:
                         if target_server is None:
                             print(f"Warning: Target {target_id} not found for draft {self.id}", flush=True)
                             conversation_completed = True
                             break
-                        wait_event = target_server.fused_execute(job)
-                    elif self.scheduler is None:
-                        if target_server is None:
-                            print(f"Warning: Target {target_id} not found for draft {self.id}", flush=True)
-                            conversation_completed = True
-                            break
-                        target_server.enqueue(job)
-                        wait_event = decode_completion
+                        if fused_mode:
+                            wait_event = target_server.fused_execute(job)
+                        else:
+                            target_server.enqueue(job)
+                            wait_event = decode_completion
                     else:
                         wait_event = self.scheduler.submit_job(job)
 
@@ -4638,6 +4680,21 @@ def _collect_metrics_json(cfg: Config, metrics, summary: Dict[str, float], targe
     for key, value in summary.items():
         if key.startswith("ttft_breakdown_") or key.startswith("decode_breakdown_"):
             metrics_json[key] = value
+
+    # Calculate target throughput as actual service rate of prefill jobs
+    # Use total service time spent processing prefills to remove queueing artifacts
+    target_throughput_jobs_s = 0.0
+    if targets:
+        total_prefill_jobs = 0
+        total_prefill_service_ms = 0.0
+        for t in targets:
+            total_prefill_jobs += getattr(t, "prefill_jobs_processed", 0)
+            total_prefill_service_ms += getattr(t, "prefill_service_ms", 0.0)
+
+        if total_prefill_service_ms > 0:
+            target_throughput_jobs_s = 1000.0 * total_prefill_jobs / total_prefill_service_ms
+
+    metrics_json["target_throughput_jobs_s"] = target_throughput_jobs_s
 
     if targets:
         all_batch_sizes = []
