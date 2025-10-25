@@ -45,6 +45,19 @@ class GammaConversationStats:
     acceptance_ratio: float
     tokens_generated: int
     tokens_accepted: int
+    avg_rtt_ms: float = 0.0
+    max_rtt_ms: float = 0.0
+    avg_tpot_ms: float = 0.0
+    max_tpot_ms: float = 0.0
+    gamma_used: int = 0
+    target_id: Optional[str] = None
+    queue_utilization: float = 0.0
+    target_workload_util: float = 0.0
+    pending_tokens: int = 0
+    drafter_capability: float = 0.0
+    drafter_tier: str = ""
+    context_length: int = 0
+    acceptance_estimate: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -55,6 +68,13 @@ class GammaContext:
     queue_depth: int
 
     acceptance_probabilities: Tuple[float, ...] = tuple()
+    queue_utilization: float = 0.0
+    pending_tokens: int = 0
+    target_batch_size: int = 0
+    target_workload_util: float = 0.0
+    drafter_capability: float = 1.0
+    drafter_tier: str = ""
+    acceptance_estimate: float = 0.0
 
 
 class GammaPolicy:
@@ -178,6 +198,321 @@ class AcceptanceBackoffGammaPolicy(GammaPolicy):
     def update_gamma(self, draft_id: str, stats: GammaConversationStats) -> None:
         self._last_ratio[draft_id] = max(0.0, min(1.0, stats.acceptance_ratio))
 
+
+class LatencyHeadGammaPolicy(GammaPolicy):
+    """Predicts gamma via a lightweight residual MLP fed with latency/queue telemetry."""
+
+    def __init__(self, default_gamma: int, config: Mapping[str, Any]) -> None:
+        self._default = max(1, int(default_gamma))
+        self._min = max(1, int(config.get("min_gamma", 1)))
+        self._max = max(self._min, int(config.get("max_gamma", self._default)))
+        allowed = list(config.get("allowed_gammas", [1, 2, 3, 4, 6, 8]))
+        if 1 not in allowed:
+            allowed.append(1)
+        self._allowed = sorted(set(int(max(1, g)) for g in allowed))
+        self._history_window = max(1, int(config.get("history_window", 3)))
+        self._smoothing_alpha = max(0.0, min(1.0, float(config.get("smoothing_alpha", 0.4))))
+        self._fused_dwell_steps = max(0, int(config.get("fused_dwell_steps", 1)))
+        self._rtt_ref_ms = max(1e-3, float(config.get("rtt_ref_ms", 30.0)))
+        self._tpot_ref_ms = max(1e-3, float(config.get("tpot_ref_ms", 15.0)))
+        self._pending_ref = max(1.0, float(config.get("pending_ref_tokens", 2048.0)))
+        self._capability_ref = max(1e-6, float(config.get("capability_ref", 1.0)))
+        self._context_ref = max(1.0, float(config.get("context_ref_tokens", 2048.0)))
+        self._feature_fields = [
+            "queue_util",
+            "queue_trend",
+            "pending_norm",
+            "rtt_avg_norm",
+            "rtt_delta",
+            "tpot_avg_norm",
+            "tpot_delta",
+            "drafter_capability_norm",
+            "acceptance_recent",
+            "last_gamma_norm",
+            "context_norm",
+        ]
+        mlp_cfg = dict(config.get("mlp", {}) or {})
+        hidden_dim = max(len(self._feature_fields), int(mlp_cfg.get("hidden_dim", len(self._feature_fields))))
+        self._use_residual = bool(mlp_cfg.get("residual", True))
+        self._activation_name = str(mlp_cfg.get("activation", "silu")).lower()
+        self._feature_dim = len(self._feature_fields)
+        self._hidden_dim = hidden_dim
+        self._proj_w = self._build_identity(hidden_dim, self._feature_dim)
+        self._proj_b = [0.0] * hidden_dim
+        block1_scale = float(mlp_cfg.get("block1_scale", 0.5))
+        block2_scale = float(mlp_cfg.get("block2_scale", 0.5))
+        self._block1_w = self._build_scaled_identity(hidden_dim, block1_scale)
+        self._block1_b = [0.0] * hidden_dim
+        self._block2_w = self._build_scaled_identity(hidden_dim, block2_scale)
+        self._block2_b = [0.0] * hidden_dim
+        self._out_w = [0.0] * hidden_dim
+        output_weights = mlp_cfg.get("output_weights")
+        output_bias = float(mlp_cfg.get("output_bias", 0.0))
+        if output_weights:
+            self._set_output_weights(output_weights)
+        else:
+            self._set_output_weights(self._default_output_weights())
+        self._out_b = output_bias
+
+        self._connection_history: Dict[Tuple[str, str], deque] = {}
+        self._target_queue_history: Dict[str, deque] = {}
+        self._target_workload_history: Dict[str, deque] = {}
+        self._last_acceptance: Dict[Tuple[str, str], float] = {}
+        self._last_served_gamma: Dict[Tuple[str, str], float] = {}
+        self._smoothed_gamma: Dict[Tuple[str, str], float] = {}
+        self._fused_counters: Dict[Tuple[str, str], int] = {}
+
+    def required_depth(self, default_gamma: int) -> int:
+        return max(self._max, default_gamma)
+
+    def select_gamma(
+        self,
+        draft_id: str,
+        default_gamma: int,
+        context: Optional[GammaContext] = None,
+    ) -> int:
+        if context is None:
+            return self._default
+
+        key = (draft_id, context.target_id)
+        features = self._compose_features(key, context)
+        delta = self._forward_mlp(features)
+        gamma_hat = self._default + delta
+        gamma_hat = max(self._min, min(self._max, gamma_hat))
+        gamma_hat = self._smooth_gamma(key, gamma_hat)
+        quantized = self._quantize(gamma_hat)
+        quantized = self._apply_fused_dwell(key, quantized)
+        self._last_served_gamma[key] = float(quantized)
+        return quantized
+
+    def update_gamma(self, draft_id: str, stats: GammaConversationStats) -> None:
+        target_id = stats.target_id or ""
+        if not target_id:
+            return
+        key = (draft_id, target_id)
+        history = self._connection_history.get(key)
+        if history is None:
+            history = deque(maxlen=self._history_window)
+            self._connection_history[key] = history
+        avg_rtt = stats.avg_rtt_ms or stats.max_rtt_ms or 0.0
+        avg_tpot = stats.avg_tpot_ms or stats.max_tpot_ms or 0.0
+        history.append(
+            {
+                "avg_rtt": float(avg_rtt),
+                "avg_tpot": float(avg_tpot),
+                "acceptance": float(max(0.0, min(1.0, stats.acceptance_ratio))),
+                "gamma": float(stats.gamma_used or self._last_served_gamma.get(key, self._default)),
+            }
+        )
+        if stats.queue_utilization > 0:
+            q_hist = self._target_queue_history.get(target_id)
+            if q_hist is None:
+                q_hist = deque(maxlen=self._history_window)
+                self._target_queue_history[target_id] = q_hist
+            q_hist.append(float(stats.queue_utilization))
+        if stats.target_workload_util > 0:
+            w_hist = self._target_workload_history.get(target_id)
+            if w_hist is None:
+                w_hist = deque(maxlen=self._history_window)
+                self._target_workload_history[target_id] = w_hist
+            w_hist.append(float(stats.target_workload_util))
+
+        acceptance_val = stats.acceptance_ratio
+        if acceptance_val <= 0 and stats.acceptance_estimate > 0:
+            acceptance_val = stats.acceptance_estimate
+        self._last_acceptance[key] = max(0.0, min(1.0, acceptance_val))
+        if stats.gamma_used:
+            self._last_served_gamma[key] = float(stats.gamma_used)
+
+    # --- Feature & model helpers -------------------------------------------------
+
+    def _compose_features(self, key: Tuple[str, str], context: GammaContext) -> List[float]:
+        queue_util = max(0.0, float(context.queue_utilization))
+        target_queue_hist = self._target_queue_history.get(context.target_id)
+        queue_avg = self._mean(target_queue_hist) if target_queue_hist else queue_util
+        queue_trend = queue_util - queue_avg
+        workload_util = float(context.target_workload_util) if context.target_workload_util > 0 else 0.0
+        if workload_util <= 0:
+            workload_util = context.pending_tokens / self._pending_ref if context.pending_tokens else 0.0
+        workload_util = max(0.0, min(2.0, workload_util))
+
+        conn_hist = self._connection_history.get(key)
+        rtt_avg = self._mean_field(conn_hist, "avg_rtt")
+        rtt_delta = self._delta_field(conn_hist, "avg_rtt")
+        tpot_avg = self._mean_field(conn_hist, "avg_tpot")
+        tpot_delta = self._delta_field(conn_hist, "avg_tpot")
+
+        rtt_avg_norm = self._normalize(rtt_avg, self._rtt_ref_ms)
+        rtt_delta_norm = self._normalize(rtt_delta, self._rtt_ref_ms)
+        tpot_avg_norm = self._normalize(tpot_avg, self._tpot_ref_ms)
+        tpot_delta_norm = self._normalize(tpot_delta, self._tpot_ref_ms)
+
+        capability_norm = self._normalize(context.drafter_capability or 0.0, self._capability_ref)
+        acceptance_recent = self._last_acceptance.get(key, context.acceptance_estimate or 0.0)
+        acceptance_recent = max(0.0, min(1.0, acceptance_recent))
+        last_gamma = self._last_served_gamma.get(key, float(self._default))
+        last_gamma_norm = self._normalize(last_gamma, float(max(1, self._max)))
+        context_norm = self._normalize(context.context_length, self._context_ref)
+
+        features = [
+            queue_util,
+            queue_trend,
+            workload_util,
+            rtt_avg_norm,
+            rtt_delta_norm,
+            tpot_avg_norm,
+            tpot_delta_norm,
+            capability_norm,
+            acceptance_recent,
+            last_gamma_norm,
+            context_norm,
+        ]
+        if len(features) != self._feature_dim:
+            raise ValueError(f"Feature length mismatch: expected {self._feature_dim}, got {len(features)}")
+        return features
+
+    def _forward_mlp(self, vector: List[float]) -> float:
+        proj = self._matvec(self._proj_w, vector, self._proj_b)
+        if self._use_residual:
+            block = self._matvec(self._block1_w, proj, self._block1_b)
+            block = [self._activation(v) for v in block]
+            block = self._matvec(self._block2_w, block, self._block2_b)
+            hidden = [proj[i] + block[i] for i in range(len(proj))]
+        else:
+            hidden = [self._activation(v) for v in proj]
+        return self._dot(self._out_w, hidden) + self._out_b
+
+    def _smooth_gamma(self, key: Tuple[str, str], value: float) -> float:
+        if self._smoothing_alpha <= 0.0:
+            self._smoothed_gamma[key] = value
+            return value
+        prev = self._smoothed_gamma.get(key)
+        if prev is None:
+            self._smoothed_gamma[key] = value
+            return value
+        smoothed = self._smoothing_alpha * value + (1.0 - self._smoothing_alpha) * prev
+        self._smoothed_gamma[key] = smoothed
+        return smoothed
+
+    def _quantize(self, value: float) -> int:
+        nearest = min(self._allowed, key=lambda g: abs(g - value))
+        return max(self._min, min(self._max, nearest))
+
+    def _apply_fused_dwell(self, key: Tuple[str, str], gamma: int) -> int:
+        if self._fused_dwell_steps <= 0:
+            return gamma
+        if gamma == 1:
+            self._fused_counters[key] = self._fused_dwell_steps
+            return gamma
+        counter = self._fused_counters.get(key, 0)
+        if counter > 0:
+            self._fused_counters[key] = counter - 1
+            return 1
+        self._fused_counters[key] = 0
+        return gamma
+
+    # --- Math helpers ------------------------------------------------------------
+
+    def _activation(self, x: float) -> float:
+        if self._activation_name == "relu":
+            return max(0.0, x)
+        # default SiLU
+        try:
+            return x / (1.0 + math.exp(-x))
+        except OverflowError:
+            return 0.0 if x < 0 else x
+
+    @staticmethod
+    def _matvec(matrix: List[List[float]], vector: List[float], bias: Optional[List[float]] = None) -> List[float]:
+        result: List[float] = []
+        cols = len(vector)
+        for i, row in enumerate(matrix):
+            acc = 0.0
+            for j in range(cols):
+                acc += row[j] * vector[j]
+            if bias is not None:
+                acc += bias[i]
+            result.append(acc)
+        return result
+
+    @staticmethod
+    def _dot(vec_a: List[float], vec_b: List[float]) -> float:
+        return sum(a * b for a, b in zip(vec_a, vec_b))
+
+    @staticmethod
+    def _build_identity(rows: int, cols: int) -> List[List[float]]:
+        mat: List[List[float]] = []
+        for i in range(rows):
+            row = [0.0] * cols
+            if i < cols:
+                row[i] = 1.0
+            mat.append(row)
+        return mat
+
+    @staticmethod
+    def _build_scaled_identity(size: int, scale: float) -> List[List[float]]:
+        mat: List[List[float]] = []
+        for i in range(size):
+            row = [0.0] * size
+            row[i] = scale
+            mat.append(row)
+        return mat
+
+    def _set_output_weights(self, weights: Sequence[float]) -> None:
+        padded = list(weights)[: self._hidden_dim]
+        if len(padded) < self._hidden_dim:
+            padded.extend([0.0] * (self._hidden_dim - len(padded)))
+        self._out_w = padded
+
+    def _default_output_weights(self) -> List[float]:
+        base_map = {
+            "queue_util": -0.9,
+            "queue_trend": -0.5,
+            "pending_norm": -0.6,
+            "rtt_avg_norm": -1.1,
+            "rtt_delta": -0.6,
+            "tpot_avg_norm": -0.9,
+            "tpot_delta": -0.5,
+            "drafter_capability_norm": 0.35,
+            "acceptance_recent": 0.4,
+            "last_gamma_norm": 0.2,
+            "context_norm": -0.1,
+        }
+        weights = [0.0] * self._hidden_dim
+        for idx, name in enumerate(self._feature_fields):
+            if idx >= len(weights):
+                break
+            weights[idx] = base_map.get(name, 0.0)
+        return weights
+
+    @staticmethod
+    def _mean(values: Optional[deque]) -> float:
+        if not values:
+            return 0.0
+        return sum(values) / len(values)
+
+    @staticmethod
+    def _mean_field(history: Optional[deque], field: str) -> float:
+        if not history:
+            return 0.0
+        vals = [entry.get(field, 0.0) for entry in history if entry.get(field, 0.0) > 0]
+        if not vals:
+            return 0.0
+        return sum(vals) / len(vals)
+
+    @staticmethod
+    def _delta_field(history: Optional[deque], field: str) -> float:
+        if not history or len(history) < 2:
+            return 0.0
+        last = history[-1].get(field, 0.0)
+        prev = history[-2].get(field, last)
+        return last - prev
+
+    @staticmethod
+    def _normalize(value: float, ref: float) -> float:
+        if ref <= 0:
+            return value
+        return value / ref
 
 @dataclass
 class DraftParams:
@@ -2416,6 +2751,7 @@ class DraftServer:
 
             # Phase 2: Generate answer with multiple speculation rounds
             candidate_depth = self.gamma
+            gamma_value = self.gamma
             try:
                 candidate_depth = int(self._gamma_policy.required_depth(self.gamma))
             except Exception:
@@ -2430,13 +2766,41 @@ class DraftServer:
                     rate = self._effective_acceptance_rate(conn, prompt_length, candidate_depth)
                     acceptance_probs = tuple(rate for _ in range(candidate_depth))
             queue_depth = target_server.queue_len() if target_server is not None else 0
+            pending_tokens = target_server.pending_decode_tokens() if target_server is not None else 0
+            target_batch_size = getattr(target_server.p, "batch_size", 0) if target_server is not None else 0
+            queue_utilization = (
+                queue_depth / target_batch_size if target_batch_size else float(queue_depth)
+            )
+            queue_utilization = max(0.0, queue_utilization)
+            target_workload_util = 0.0
+            if target_batch_size > 0:
+                target_workload_util = pending_tokens / max(1, target_batch_size * self.gamma)
+            elif pending_tokens:
+                target_workload_util = pending_tokens / max(1, self.gamma)
+            target_workload_util = max(0.0, min(2.0, target_workload_util))
+            acceptance_estimate = (
+                sum(acceptance_probs) / len(acceptance_probs) if acceptance_probs else 0.0
+            )
+            drafter_capability = float(self.p.capability or 0.0)
+            drafter_tier = str(self.metadata.get("tier") or self.cluster or "")
             gamma_context = GammaContext(
                 draft_id=self.id,
                 target_id=target_id,
                 context_length=prompt_length,
                 queue_depth=queue_depth,
                 acceptance_probabilities=acceptance_probs,
+                queue_utilization=queue_utilization,
+                pending_tokens=pending_tokens,
+                target_batch_size=target_batch_size,
+                target_workload_util=target_workload_util,
+                drafter_capability=drafter_capability,
+                drafter_tier=drafter_tier,
+                acceptance_estimate=acceptance_estimate,
             )
+            queue_util_snapshot = queue_utilization
+            pending_tokens_snapshot = pending_tokens
+            target_workload_snapshot = target_workload_util
+            acceptance_estimate_snapshot = acceptance_estimate
             try:
                 selected_gamma = self._gamma_policy.select_gamma(self.id, self.gamma, gamma_context)
             except Exception as exc:
@@ -2455,6 +2819,7 @@ class DraftServer:
             tokens_accepted_in_conversation = 0
             first_token_time_ms = None  # Track TTFT
             conversation_tpot_samples: List[float] = []
+            conversation_rtt_samples: List[float] = []
             conversation_completed = False
 
             # Initialize progress for Semi-Clairvoyant router
@@ -2591,6 +2956,7 @@ class DraftServer:
                     # Calculate round-trip time for this chunk
                     rtt = self.env.now - round_start
                     self.total_round_trip_time += rtt
+                    conversation_rtt_samples.append(rtt)
 
                     if self.env.now >= self.cfg.burn_in_ms:
                         self.metrics.token_metrics.total_generated_tokens += tokens_this_round
@@ -2655,12 +3021,36 @@ class DraftServer:
                             decode_breakdown=decode_breakdown,
                         )
 
+                    avg_rtt = (
+                        sum(conversation_rtt_samples) / len(conversation_rtt_samples)
+                        if conversation_rtt_samples else 0.0
+                    )
+                    max_rtt = max(conversation_rtt_samples) if conversation_rtt_samples else 0.0
+                    avg_tpot = (
+                        sum(conversation_tpot_samples) / len(conversation_tpot_samples)
+                        if conversation_tpot_samples else 0.0
+                    )
+                    max_tpot = max(conversation_tpot_samples) if conversation_tpot_samples else 0.0
+
                     self._gamma_policy.update_gamma(
                         self.id,
                         GammaConversationStats(
                             acceptance_ratio=conversation_acceptance,
                             tokens_generated=tokens_generated_in_conversation,
                             tokens_accepted=tokens_accepted_in_conversation,
+                            avg_rtt_ms=avg_rtt,
+                            max_rtt_ms=max_rtt,
+                            avg_tpot_ms=avg_tpot,
+                            max_tpot_ms=max_tpot,
+                            gamma_used=gamma_value,
+                            target_id=target_id,
+                            queue_utilization=queue_util_snapshot,
+                            target_workload_util=target_workload_snapshot,
+                            pending_tokens=pending_tokens_snapshot,
+                            drafter_capability=drafter_capability,
+                            drafter_tier=drafter_tier,
+                            context_length=prompt_length,
+                            acceptance_estimate=acceptance_estimate_snapshot,
                         ),
                     )
 
@@ -4097,6 +4487,8 @@ def _build_gamma_policy(cfg: Config) -> GammaPolicy:
         return SpecPPGammaPolicy(cfg.gamma, policy_cfg)
     if policy_type == "acceptance_backoff":
         return AcceptanceBackoffGammaPolicy(cfg.gamma, policy_cfg)
+    if policy_type == "latency_head":
+        return LatencyHeadGammaPolicy(cfg.gamma, policy_cfg)
     return ConstantGammaPolicy(cfg.gamma)
 
 
