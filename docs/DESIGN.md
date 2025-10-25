@@ -978,6 +978,42 @@ def plan(pools, candidates, metrics):
 - Cold starts: models may incur load latency; scheduler amortizes by pre-warming pools or accounting for warmup in TTFT predictions.
 - Elastic scaling: when planner changes pool sizes, mode selector considers checkpoint locality (ServerlessLLM-style) and prefetch status before routing traffic.
 
+#### 6.4.1 Latency-Aware Gamma Predictor Head
+
+- **Objective.** Maintain a predictor that emits both the execution mode and gamma with negligible overhead, using local telemetry to minimize effective latency (TPOT + RTT penalty). Gamma is clamped to ≥1: if the head outputs 1 the selector picks fused mode, otherwise it keeps distributed SD with that gamma. The policy should pivot to fused when RTT spikes or TPOT trends upward, and return to distributed when targets are healthy.
+- **Approach.**
+  - **Placement.** Run the predictor on the target side so it can see instantaneous queue depth/utilization plus verified TPOT/RTT signals without extra hops. Each target (or pool) keeps a small history ring buffer (2–3 samples) of `(tpot_ms, rtt_ms, gamma_used, mode, workload signal)`.
+  - **Features.** Feed the head `current_workload_util`, short-window averages/deltas for TPOT and RTT, and optionally acceptance/queue slack. Pack into a fixed-length feature vector per request.
+  - **Model family.** Default to a linear regressor (`gamma = clamp(w·x + b, 1, gamma_max)`) or a single hidden-layer MLP (<16 hidden units) to keep inference cost sub-µs. Ensembles (RF/XGBoost) may be used offline for analysis but should be distilled into the lightweight head for online serving.
+  - **Decision rule.** Interpret `gamma_hat <= 1` (or ≤1.5 after smoothing) as “use fused”; otherwise choose distributed with `round(gamma_hat)`. Emit `(mode, gamma)` to the scheduler/gamma policy so downstream batching stays unchanged.
+  - **Training signal.** Generate ground-truth labels via simulator sweeps: for each telemetry snapshot try feasible gammas/modes (or use a TPOT+RTT cost model) and log the SLO-satisfying choice with minimum latency. Train/fit the lightweight head on these tuples; online it simply reads the history buffer and applies the fitted weights.
+  - **Integration.** Expose a `speculation.gamma_policy.type: latency_head` that wires the history buffers, feature extraction, and predictor invocation. Config knobs define history length, coefficient vector / MLP weights, smoothing window, and fallback defaults when history is empty.
+
+##### Telemetry & Feature Vector
+
+- **Per-request snapshot.** Capture at decision time: decode queue utilization (and short EMA), current router workload class, most recent gamma/mode, per-target SLO budget, acceptance estimate, and moving averages/deltas for TPOT and RTT over the last 3 completions. These feed a fixed-size feature vector such as `[queue_util, queue_trend, tpot_avg, tpot_delta, rtt_avg, rtt_delta, acceptance_est, slo_tpot, last_gamma]`.
+- **History buffers.** Each target maintains a ring buffer of size 3 storing `(tpot_ms, rtt_ms, gamma_used, slo_hit)` so the predictor can reason about trends without recomputing from traces. Buffers reset after cold-start; the policy falls back to a default gamma until buffers are full.
+
+##### Model Architecture & Loss
+
+- **Baseline head.** A single hidden-layer MLP (input → 8–16 SiLU units → linear output) suffices; inference cost is <100 FLOPs. If additional expressiveness is required, wrap the hidden layer in a residual block (`y = x + Linear(SiLU(Linear(x)))`) as done in SpecDec++.
+- **Output.** Linear scalar mapped to `gamma_hat`, then clamped to `[1, gamma_max]`. `gamma=1` implicitly means fused mode, so no separate mode classifier is needed.
+- **Loss.** Train with Smooth L1 (Huber) or L2 depending on noise tolerance. Smooth L1 is default to stay robust to noisy oracle labels yet penalize large deviations.
+- **Serving.** After inference, optionally apply exponential smoothing (`gamma_served = α·gamma_hat + (1-α)·gamma_prev`) before rounding to the nearest allowed gamma to avoid oscillations.
+
+##### Oracle Labels & Dataset Generation
+
+- **Fixed topology per scenario.** For GSM8K-like traces we keep the existing heterogeneity: 80 drafts across ten A40 tiers and 20 verify targets across four A100/H100 tiers. Additional scenarios cover edge/cloud mixes (e.g., 3 draft tiers → 3 target pools) and mobile-cloud (4 draft tiers → 2 target pools).
+- **Condition sweeps.** For each scenario, sweep RTT multipliers (e.g., {0.5×, 1×, 1.5×, 2×}) and offered load multipliers ({0.6×, 1.0×, 1.3×}) across short/long prompt traces, yielding ~18–24 runs per scenario.
+- **Per-arrival oracle.** After a warm-up (first 500 arrivals), for each subsequent request clone or fast-forward the sim to evaluate candidate actions: fused (`gamma=1`) and distributed `gamma ∈ {2,3,4,6,8}`. The oracle selects the minimum-latency action that meets TTFT/TPOT SLOs, logging `(features, gamma*, latency, slo_flags, scenario metadata)` as a training row. We keep every fused label and downsample common distributed labels to balance the dataset.
+- **Dataset targets.** Aim for ~50k labeled samples per scenario (~150k total) stored under `data/gamma_oracle/<scenario>/<run>.parquet` with schema `{features, gamma_label, latency_label, scenario_id, rtt_multiplier, load_multiplier}`. Splits are scenario-stratified (e.g., train S1+S2, validate on S2, test on S3).
+
+##### Online Update & Fallbacks
+
+- **State updates.** After each conversation completes, append measured `(tpot, rtt, gamma_served, slo_hit)` to the ring buffer. If history is empty (startup or reset), default to a safe distributed gamma (e.g., 4) until at least two samples exist.
+- **Safety rails.** Expose config limits for min/max gamma, smoothing factor, and “fused hysteresis” (minimum dwell time once fused) to prevent thrashing under jittery RTT.
+- **Telemetry hooks.** Policy logs `(features, gamma_hat, action_taken)` for debugging and offline retraining; histograms can be dumped alongside other scheduler diagnostics.
+
 ## 7. Execution Modes
 
 1. **Distributed SD**

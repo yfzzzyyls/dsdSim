@@ -18,10 +18,16 @@ logger = logging.getLogger(__name__)
 
 
 def _append_vidur_repo_to_path() -> Path:
-    base_dir = Path(__file__).resolve().parents[1]
-    vidur_root = base_dir / "thirdparty" / "vidur"
-    if str(vidur_root) not in sys.path:
-        sys.path.insert(0, str(vidur_root))
+    project_root = Path(__file__).resolve().parents[2]
+    vidur_root = project_root / "thirdparty" / "Sai_speculative_vidur"
+    if not vidur_root.exists():
+        raise FileNotFoundError(
+            f"VIDUR repository not found at {vidur_root}. Please clone the profiling repo into 'thirdparty/Sai_speculative_vidur'."
+        )
+
+    path_str = str(vidur_root)
+    if path_str not in sys.path:
+        sys.path.insert(0, path_str)
     return vidur_root
 
 
@@ -237,6 +243,18 @@ class VidurRealtimeRunner:
             return str(primary)
         if alternate.exists():
             return str(alternate)
+        if relative.endswith("all_reduce.csv"):
+            # Some profiling bundles only provide send/recv traces; reuse them explicitly.
+            fallback = primary.parent / "send_recv.csv"
+            fallback_alt = alternate.parent / "send_recv.csv"
+            if fallback.exists():
+                logger.warning("Using send_recv.csv in place of missing all_reduce.csv at %s", fallback)
+                return str(fallback)
+            if fallback_alt.exists():
+                logger.warning(
+                    "Using send_recv.csv in place of missing all_reduce.csv at %s", fallback_alt
+                )
+                return str(fallback_alt)
         if 'cpu_overhead' in relative:
             # Optional in many profiles; allow downstream skip logic to handle it
             return str(alternate if relative.startswith('data/') else primary)

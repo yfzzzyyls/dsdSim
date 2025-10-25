@@ -89,7 +89,7 @@ auto_topology:
       count: 20
       tiers:
       - name: llama_a100
-        count: 10
+        count: 5
         model: llama-2-70b
         gpu: A100
         weight: 1.6
@@ -103,8 +103,23 @@ auto_topology:
           pipeline_parallel: 1
           scheduler: sarathi
           chunk_size: 512
+      - name: codellama_a100
+        count: 5
+        model: codellama-34b
+        gpu: A100
+        weight: 1.5
+        batch_window_ms: 0.33
+        batch_size: 12
+        vidur:
+          model_name: codellama/CodeLlama-34b-Instruct-hf
+          device: A100
+          network_device: A100_PAIRWISE_NVLINK
+          tensor_parallel: 1
+          pipeline_parallel: 1
+          scheduler: sarathi
+          chunk_size: 512
       - name: qwen_h100
-        count: 10
+        count: 5
         model: qwen-72b
         gpu: H100
         weight: 1.9
@@ -118,28 +133,67 @@ auto_topology:
           pipeline_parallel: 1
           scheduler: sarathi
           chunk_size: 512
+      - name: llama3_a100
+        count: 5
+        model: meta-llama-3-70b
+        gpu: A100
+        weight: 1.7
+        batch_window_ms: 0.31
+        batch_size: 11
+        vidur:
+          model_name: meta-llama/Meta-Llama-3-70B
+          device: A100
+          network_device: A100_PAIRWISE_NVLINK
+          tensor_parallel: 1
+          pipeline_parallel: 1
+          scheduler: sarathi
+          chunk_size: 512
     drafts:
-      count: 40
+      count: 80
       capability_map:
         llama_a40_fast: 0.55
         llama_a40_slow: 0.45
         qwen_a40_fast: 0.55
         qwen_a40_slow: 0.45
+        codellama_a40_fast: 0.58
+        codellama_a40_slow: 0.48
+        llama3_8b_a40_fast: 0.60
+        llama3_8b_a40_slow: 0.50
+        llama3_1b_a40_fast: 0.42
+        llama3_1b_a40_slow: 0.32
       draft_bucket_labels:
       - llama_a40_fast
       - llama_a40_slow
       - qwen_a40_fast
       - qwen_a40_slow
+      - codellama_a40_fast
+      - codellama_a40_slow
+      - llama3_8b_a40_fast
+      - llama3_8b_a40_slow
+      - llama3_1b_a40_fast
+      - llama3_1b_a40_slow
       count_by_label:
-        llama_a40_fast: 10
-        llama_a40_slow: 10
-        qwen_a40_fast: 10
-        qwen_a40_slow: 10
+        llama_a40_fast: 8
+        llama_a40_slow: 8
+        qwen_a40_fast: 8
+        qwen_a40_slow: 8
+        codellama_a40_fast: 8
+        codellama_a40_slow: 8
+        llama3_8b_a40_fast: 8
+        llama3_8b_a40_slow: 8
+        llama3_1b_a40_fast: 8
+        llama3_1b_a40_slow: 8
       reliability:
         llama_a40_fast: 0.985
         llama_a40_slow: 0.965
         qwen_a40_fast: 0.982
         qwen_a40_slow: 0.96
+        codellama_a40_fast: 0.983
+        codellama_a40_slow: 0.958
+        llama3_8b_a40_fast: 0.981
+        llama3_8b_a40_slow: 0.955
+        llama3_1b_a40_fast: 0.978
+        llama3_1b_a40_slow: 0.948
       metadata_by_label:
         llama_a40_fast:
           hardware: A40
@@ -185,16 +239,91 @@ auto_topology:
             pipeline_parallel: 1
             scheduler: sarathi
             chunk_size: 512
+        codellama_a40_fast:
+          hardware: A40
+          model_name: codellama-7b
+          vidur_profile:
+            model_name: codellama/CodeLlama-7b-Instruct-hf
+            device: A40
+            network_device: A40_PAIRWISE_NVLINK
+            tensor_parallel: 1
+            pipeline_parallel: 1
+            scheduler: sarathi
+            chunk_size: 512
+        codellama_a40_slow:
+          hardware: A40
+          model_name: codellama-7b
+          vidur_profile:
+            model_name: codellama/CodeLlama-7b-Instruct-hf
+            device: A40
+            network_device: A40_PAIRWISE_NVLINK
+            tensor_parallel: 1
+            pipeline_parallel: 1
+            scheduler: sarathi
+            chunk_size: 512
+        llama3_8b_a40_fast:
+          hardware: A40
+          model_name: meta-llama-3.1-8b
+          vidur_profile:
+            model_name: meta-llama/Llama-3.1-8B-Instruct
+            device: A40
+            network_device: A40_PAIRWISE_NVLINK
+            tensor_parallel: 1
+            pipeline_parallel: 1
+            scheduler: sarathi
+            chunk_size: 512
+        llama3_8b_a40_slow:
+          hardware: A40
+          model_name: meta-llama-3.1-8b
+          vidur_profile:
+            model_name: meta-llama/Llama-3.1-8B-Instruct
+            device: A40
+            network_device: A40_PAIRWISE_NVLINK
+            tensor_parallel: 1
+            pipeline_parallel: 1
+            scheduler: sarathi
+            chunk_size: 512
+        llama3_1b_a40_fast:
+          hardware: A40
+          model_name: meta-llama-3.2-1b
+          vidur_profile:
+            model_name: meta-llama/Llama-3.2-1B-Instruct
+            device: A40
+            network_device: A40_PAIRWISE_NVLINK
+            tensor_parallel: 1
+            pipeline_parallel: 1
+            scheduler: sarathi
+            chunk_size: 512
+        llama3_1b_a40_slow:
+          hardware: A40
+          model_name: meta-llama-3.2-1b
+          vidur_profile:
+            model_name: meta-llama/Llama-3.2-1B-Instruct
+            device: A40
+            network_device: A40_PAIRWISE_NVLINK
+            tensor_parallel: 1
+            pipeline_parallel: 1
+            scheduler: sarathi
+            chunk_size: 512
     connectivity:
       fanout_per_draft: 4
       net_ms_ranges:
         llama_a100:
         - 6.5
         - 11.0
+        codellama_a100:
+        - 6.8
+        - 11.5
         qwen_h100:
         - 5.2
         - 9.2
+        llama3_a100:
+        - 6.0
+        - 10.2
       link_jitter_pct: 0.12
       drop_rate:
         llama_a40_slow: 0.006
         qwen_a40_slow: 0.006
+        codellama_a40_slow: 0.007
+        llama3_8b_a40_slow: 0.008
+        llama3_1b_a40_slow: 0.009
