@@ -31,13 +31,54 @@ os.environ.setdefault("TRANSFORMERS_NO_FLAX", "1")
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, set_seed
 
-from vllm.v1.sample.sampler import Sampler as VllmSampler
-from vllm.v1.worker.gpu_input_batch import (
-    LogitsProcessors as VllmLogitsProcessors,
-    SamplingMetadata as VllmSamplingMetadata,
-)
+try:
+    from transformers.generation.utils import top_k_top_p_filtering
+except ImportError:  # transformers >= 4.57 removed this helper
 
-VLLM_SAMPLING_EPS = 1e-5
+    def top_k_top_p_filtering(
+        logits: torch.Tensor,
+        top_k: int = 0,
+        top_p: float = 1.0,
+        filter_value: float = -float("inf"),
+        min_tokens_to_keep: int = 1,
+    ) -> torch.Tensor:
+        """Standalone copy of HF's legacy sampler helper."""
+
+        if logits.ndim == 0:
+            raise ValueError("`logits` must have at least one dimension")
+
+        top_k = max(top_k, min_tokens_to_keep)
+        if top_k > 0:
+            top_k = min(top_k, logits.size(-1))
+            kth_values = torch.topk(logits, top_k)[0][..., -1, None]
+            indices_to_remove = logits < kth_values
+            logits = logits.masked_fill(indices_to_remove, filter_value)
+
+        if 0.0 < top_p < 1.0:
+            sorted_logits, sorted_indices = torch.sort(logits, descending=True)
+            probabilities = torch.softmax(sorted_logits, dim=-1)
+            cumulative_probs = torch.cumsum(probabilities, dim=-1)
+
+            sorted_indices_to_remove = cumulative_probs > top_p
+            # Ensure we keep at least `min_tokens_to_keep` tokens
+            sorted_indices_to_remove[..., :min_tokens_to_keep] = 0
+
+            # Shift the mask right to include the token that crosses the threshold
+            shifted = sorted_indices_to_remove[..., :-1].clone()
+            shifted = torch.nn.functional.pad(shifted, (1, 0), value=False)
+            sorted_indices_to_remove = sorted_indices_to_remove | shifted
+
+            indices_to_remove = torch.zeros_like(logits, dtype=torch.bool)
+            indices_to_remove.scatter_(
+                dim=-1,
+                index=sorted_indices,
+                src=sorted_indices_to_remove,
+            )
+            logits = logits.masked_fill(indices_to_remove, filter_value)
+
+        return logits
+
+SAMPLING_EPS = 1e-5
 
 try:
     from tqdm.auto import tqdm
@@ -130,10 +171,36 @@ def parse_args() -> argparse.Namespace:
         help="Number of speculative tokens the drafter proposes each iteration.",
     )
     parser.add_argument(
+        "--gamma-min",
+        type=int,
+        help="Optional minimum speculative tokens (enables per-iteration sampling).",
+    )
+    parser.add_argument(
+        "--gamma-max",
+        type=int,
+        help="Optional maximum speculative tokens (used with --gamma-min).",
+    )
+    parser.add_argument(
+        "--gamma-mean",
+        type=float,
+        help="Mean for Gaussian gamma sampler (defaults to midpoint of min/max).",
+    )
+    parser.add_argument(
+        "--gamma-std",
+        type=float,
+        help="Std dev for Gaussian gamma sampler (defaults to range/3).",
+    )
+    parser.add_argument(
         "--max-prompts",
         type=int,
         default=None,
         help="Limit number of prompts processed from --prompts-file (default: all).",
+    )
+    parser.add_argument(
+        "--prompt-offset",
+        type=int,
+        default=0,
+        help="Number of prompts to skip before processing (for resume).",
     )
     parser.add_argument(
         "--prompts-file",
@@ -241,7 +308,7 @@ def load_tokenizer(model_name: str) -> AutoTokenizer:
     return tokenizer
 
 
-def load_prompts(path: Optional[str], limit: Optional[int]) -> List[str]:
+def load_prompts(path: Optional[str]) -> List[str]:
     if path is None:
         prompts = DEFAULT_PROMPTS.copy()
     else:
@@ -256,42 +323,43 @@ def load_prompts(path: Optional[str], limit: Optional[int]) -> List[str]:
                     prompts.append(obj.get("prompt", line))
                 except json.JSONDecodeError:
                     prompts.append(line)
-    if limit is not None:
-        prompts = prompts[:limit]
     return prompts
 
 
-def _build_sampling_metadata(
+def _sample_token_from_logits(
+    logits: torch.Tensor,
+    *,
     temperature: float,
     top_p: float,
     top_k: int,
-    repetition_penalty: float,
-) -> Tuple[VllmLogitsProcessors, VllmSamplingMetadata]:
-    processors = VllmLogitsProcessors(
-        temperature=max(temperature, VLLM_SAMPLING_EPS),
-        min_p=0.0,
-        top_p=top_p,
-        top_k=top_k,
-        frequency_penalty=0.0,
-        presence_penalty=0.0,
-        repetition_penalty=max(repetition_penalty, VLLM_SAMPLING_EPS),
-    )
-    metadata = VllmSamplingMetadata(
-        prompt_adapter_request_ids=None,
-        position_ids=None,
-        span_ids=None,
-    )
-    return processors, metadata
-
-
-def _sample_next_token(
-    logits: torch.Tensor,
-    sampler: VllmSampler,
-    processors: VllmLogitsProcessors,
-    metadata: VllmSamplingMetadata,
 ) -> int:
-    token = sampler(logits, processors, metadata)
-    return token.item()
+    scaled = logits.clone().float() / max(temperature, SAMPLING_EPS)
+    filtered = top_k_top_p_filtering(
+        scaled,
+        top_k=top_k if top_k > 0 else 0,
+        top_p=top_p if 0.0 < top_p < 1.0 else 1.0,
+    )
+    probs = torch.softmax(filtered, dim=-1)
+    if torch.isnan(probs).any() or probs.sum() <= 0:
+        probs = torch.softmax(scaled, dim=-1)
+    token = torch.multinomial(probs, num_samples=1)
+    return int(token.item())
+
+
+class GammaSampler:
+    def __init__(self, min_value: int, max_value: int, mean: float, std: float) -> None:
+        self.min_value = max(1, int(min_value))
+        self.max_value = max(self.min_value, int(max_value))
+        self.mean = float(mean)
+        self.std = max(0.5, float(std))
+
+    def sample(self) -> int:
+        for _ in range(8):
+            value = round(random.gauss(self.mean, self.std))
+            if self.min_value <= value <= self.max_value:
+                return int(value)
+        value = int(round(random.gauss(self.mean, self.std)))
+        return max(self.min_value, min(self.max_value, value))
 
 
 def speculative_loop(
@@ -309,17 +377,10 @@ def speculative_loop(
     seed: int,
     stop_on_pad: bool,
     max_prompt_tokens: int,
+    gamma_sampler: Optional[Callable[[], int]] = None,
     logger: Optional[Callable[[str], None]] = None,
 ) -> Tuple[PromptLog, Dict[str, int]]:
     set_seed(seed)
-    processors, metadata = _build_sampling_metadata(
-        temperature,
-        top_p,
-        top_k,
-        repetition_penalty,
-    )
-    sampler = VllmSampler()
-
     encoded = tokenizer(
         prompt,
         return_tensors="pt",
@@ -341,6 +402,9 @@ def speculative_loop(
     num_accepted_tokens = 0
 
     while total_generated < max_tokens and not reached_eos:
+        current_spec_tokens = spec_tokens
+        if gamma_sampler is not None:
+            current_spec_tokens = max(1, gamma_sampler())
         num_drafts += 1
         context_len = context_ids.shape[-1]
 
@@ -350,8 +414,13 @@ def speculative_loop(
         ).logits[:, -1, :]
 
         draft_tokens: List[int] = []
-        for _ in range(spec_tokens):
-            token_id = _sample_next_token(draft_logits, sampler, processors, metadata)
+        for _ in range(current_spec_tokens):
+            token_id = _sample_token_from_logits(
+                draft_logits[0],
+                temperature=temperature,
+                top_p=top_p,
+                top_k=top_k,
+            )
             draft_tokens.append(token_id)
             # Append token and continue sampling autoregressively
             next_input = torch.tensor([[token_id]], device=context_ids.device)
@@ -500,9 +569,28 @@ def aggregate_metrics(
 
 def main() -> None:
     args = parse_args()
-    prompts = load_prompts(args.prompts_file, args.max_prompts)
-    if not prompts:
+    prompts = load_prompts(args.prompts_file)
+    total_available = len(prompts)
+    if total_available == 0:
         raise ValueError("No prompts provided or loaded.")
+
+    prompt_offset = max(0, int(args.prompt_offset or 0))
+    if prompt_offset >= total_available:
+        print(
+            f"Prompt offset {prompt_offset} >= available prompts {total_available}; nothing to do."
+        )
+        return
+    if prompt_offset > 0:
+        print(
+            f"Skipping first {prompt_offset} prompts (resume). "
+            f"{total_available - prompt_offset} remaining."
+        )
+    prompts = prompts[prompt_offset:]
+    if args.max_prompts is not None:
+        prompts = prompts[: args.max_prompts]
+    if not prompts:
+        print("No prompts remaining after applying max-prompts limit.")
+        return
 
     print("Loading tokenizer...")
     tokenizer = load_tokenizer(args.drafter_model)
@@ -525,6 +613,23 @@ def main() -> None:
     )
     print("Verifier ready.")
 
+    gamma_sampler = None
+    effective_spec_tokens = args.spec_tokens
+    if args.gamma_min is not None:
+        gamma_min = max(1, int(args.gamma_min))
+        gamma_max = int(args.gamma_max or gamma_min)
+        gamma_max = max(gamma_min, gamma_max)
+        gamma_mean = args.gamma_mean or ((gamma_min + gamma_max) / 2.0)
+        default_std = max(0.5, (gamma_max - gamma_min) / 3.0)
+        gamma_std = args.gamma_std or default_std
+        sampler = GammaSampler(gamma_min, gamma_max, gamma_mean, gamma_std)
+        gamma_sampler = sampler.sample
+        effective_spec_tokens = sampler.max_value
+        print(
+            f"Gamma sampler enabled: min={gamma_min}, max={gamma_max}, "
+            f"mean={gamma_mean:.2f}, std={gamma_std:.2f}"
+        )
+
     prompt_logs: List[PromptLog] = []
     summaries: List[Dict[str, int]] = []
 
@@ -540,29 +645,31 @@ def main() -> None:
 
     for idx in progress_iter:
         prompt = prompts[idx]
+        global_idx = prompt_offset + idx
         prompt_log, summary = speculative_loop(
             prompt,
             drafter_model,
             verifier_model,
             tokenizer,
-            spec_tokens=args.spec_tokens,
+            spec_tokens=effective_spec_tokens,
             max_tokens=args.max_tokens,
             temperature=args.temperature,
             top_p=args.top_p,
             top_k=args.top_k,
             repetition_penalty=args.repetition_penalty,
-            seed=args.seed + idx,
+            seed=args.seed + global_idx,
             stop_on_pad=args.stop_on_pad,
             max_prompt_tokens=args.max_prompt_tokens,
+            gamma_sampler=gamma_sampler,
             logger=write_fn if args.debug_progress else None,
         )
-        prompt_log.prompt_index = idx
+        prompt_log.prompt_index = global_idx
         prompt_logs.append(prompt_log)
         summaries.append(summary)
 
         if args.print_output:
             write_fn("-" * 60)
-            write_fn(f"[Prompt {idx}] {prompt}")
+            write_fn(f"[Prompt {global_idx}] {prompt}")
             write_fn(f"[Generated] {prompt_log.generated_text}")
             write_fn(
                 f"[Iterations] {len(prompt_log.iterations)} "
@@ -572,7 +679,7 @@ def main() -> None:
 
         if args.details_jsonl:
             record = {
-                "prompt_index": idx,
+                "prompt_index": global_idx,
                 "prompt": prompt,
                 "generated_text": prompt_log.generated_text,
                 "metadata": {
@@ -582,7 +689,11 @@ def main() -> None:
                     "top_p": args.top_p,
                     "top_k": args.top_k,
                     "repetition_penalty": args.repetition_penalty,
-                    "spec_tokens": args.spec_tokens,
+                    "spec_tokens": effective_spec_tokens,
+                    "gamma_min": args.gamma_min,
+                    "gamma_max": args.gamma_max,
+                    "gamma_mean": args.gamma_mean,
+                    "gamma_std": args.gamma_std,
                 },
                 "iterations": [
                     {
@@ -603,7 +714,7 @@ def main() -> None:
 
         if args.debug_progress:
             write_fn(
-                f"    prompt {idx + 1}/{total_prompts} summary: accepted"
+                f"    prompt {global_idx + 1} (batch {idx + 1}/{total_prompts}) summary: accepted"
                 f" {summary['num_accepted_tokens']} of {summary['num_draft_tokens']} draft tokens"
             )
 
@@ -612,11 +723,13 @@ def main() -> None:
 
         if use_progress_bar:
             progress_iter.update(0)  # ensure immediate refresh
+        elif (idx + 1) % max(1, total_prompts // 50 or 1) == 0:
+            write_fn(f"[{idx + 1}/{total_prompts}] prompts profiled")
 
     if _HAS_TQDM and hasattr(progress_iter, "close"):
         progress_iter.close()
 
-    summary = aggregate_metrics(prompt_logs, summaries, args.spec_tokens)
+    summary = aggregate_metrics(prompt_logs, summaries, effective_spec_tokens)
 
     print("Speculative decoding summary")
     print(f"  Prompts processed  : {summary['num_prompts']}")
@@ -634,7 +747,7 @@ def main() -> None:
         metrics_record = {
             "drafter_model": args.drafter_model,
             "verifier_model": args.verifier_model,
-            "spec_tokens": args.spec_tokens,
+            "spec_tokens": effective_spec_tokens,
             "max_tokens": args.max_tokens,
             "temperature": args.temperature,
             "top_p": args.top_p,
@@ -649,6 +762,8 @@ def main() -> None:
             "acceptance_per_position": summary["acceptance_per_position"],
             "position_attempts": summary["position_attempts"],
             "position_accepts": summary["position_accepts"],
+            "prompt_offset": prompt_offset,
+            "processed_prompts": summary["num_prompts"],
         }
         append_jsonl(Path(args.metrics_jsonl), metrics_record)
 

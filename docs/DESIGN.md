@@ -690,11 +690,12 @@ Example end-to-end workflow using the bundled profiling utilities:
    for split in cnndm gsm8k humaneval; do
      TRANSFORMERS_NO_TORCHAO=1 \
      ~/miniconda3/bin/conda run -n llama2spec \
-     python src/acceptance/speculative_profiler.py \
-       --drafter-model meta-llama/Llama-2-7b-hf \
-       --verifier-model meta-llama/Llama-2-70b-hf \
-        --spec-tokens 4 --max-tokens 160 \
-        --max-prompt-tokens 128 \
+    python src/acceptance/speculative_profiler.py \
+      --drafter-model meta-llama/Llama-2-7b-hf \
+      --verifier-model meta-llama/Llama-2-70b-hf \
+       --spec-tokens 10 --gamma-min 2 --gamma-max 10 --gamma-mean 6 --gamma-std 2 \
+       --max-tokens 160 \
+       --max-prompt-tokens 128 \
         --debug-progress \
         --prompts-file prompts/${split}_train.jsonl \
         --metrics-jsonl results/${split}_train_metrics.jsonl \
@@ -712,7 +713,7 @@ Example end-to-end workflow using the bundled profiling utilities:
    ~/miniconda3/bin/conda run -n llama2spec \
    python src/acceptance/train_regressor.py \
        --details-jsonl results/train_details.jsonl \
-       --spec-tokens 4 \
+       --spec-tokens 10 \
        --output-model acceptance/llama2_7b_vs_70b.joblib \
        --metadata drafter=meta-llama/Llama-2-7b-hf \
        --metadata verifier=meta-llama/Llama-2-70b-hf \
@@ -725,11 +726,12 @@ Example end-to-end workflow using the bundled profiling utilities:
    for split in cnndm gsm8k humaneval; do
      TRANSFORMERS_NO_TORCHAO=1 \
      ~/miniconda3/bin/conda run -n llama2spec \
-     python src/acceptance/speculative_profiler.py \
-       --drafter-model meta-llama/Llama-2-7b-hf \
-       --verifier-model meta-llama/Llama-2-70b-hf \
-       --spec-tokens 4 --max-tokens 160 \
-       --max-prompt-tokens 128 \
+    python src/acceptance/speculative_profiler.py \
+      --drafter-model meta-llama/Llama-2-7b-hf \
+      --verifier-model meta-llama/Llama-2-70b-hf \
+      --spec-tokens 10 --gamma-min 2 --gamma-max 10 --gamma-mean 6 --gamma-std 2 \
+      --max-tokens 160 \
+      --max-prompt-tokens 128 \
         --debug-progress \
         --prompts-file prompts/${split}_test.jsonl \
         --metrics-jsonl results/${split}_test_metrics.jsonl \
@@ -1009,7 +1011,8 @@ def plan(pools, candidates, metrics):
 ##### Oracle Labels & Dataset Generation
 
 - **Fixed topology per scenario.** For GSM8K-like traces we keep the existing heterogeneity: 80 drafts across ten A40 tiers and 20 verify targets across four A100/H100 tiers. Additional scenarios cover edge/cloud mixes (e.g., 3 draft tiers → 3 target pools) and mobile-cloud (4 draft tiers → 2 target pools).
-- **Condition sweeps.** For each scenario, sweep RTT multipliers (e.g., {0.5×, 1×, 1.5×, 2×}) and offered load multipliers ({0.6×, 1.0×, 1.3×}) across short/long prompt traces, yielding ~18–24 runs per scenario.
+- **Condition sweeps.** For each scenario, sweep RTT multipliers across a wide range (e.g., {0.5×, 1×, 2×, 5×, 10×, 20×} when the baseline RTT is ~5 ms) and offered load multipliers ({0.6×, 1.0×, 1.3×}) across short/long prompt traces, yielding ~30+ runs per scenario and covering high-delay regimes where fused execution dominates.
+- **Oracle logging.** Enable per-conversation logging by setting `speculation.gamma_oracle_logging.enabled: true` and `output_path` (JSONL). Each record stores the feature vector (queue/utilization/TPOT/RTT history, drafter tier, etc.), the mode/gamma actually taken, and observed TTFT/TPOT/latency so offline tooling can join multiple runs (constant-gamma, fused-only, etc.) to label the best action.
 - **Per-arrival oracle.** After a warm-up (first 500 arrivals), for each subsequent request clone or fast-forward the sim to evaluate candidate actions: fused (`gamma=1`) and distributed `gamma ∈ {2,3,4,6,8}`. The oracle selects the minimum-latency action that meets TTFT/TPOT SLOs, logging `(features, gamma*, latency, slo_flags, scenario metadata)` as a training row. We keep every fused label and downsample common distributed labels to balance the dataset.
 - **Dataset targets.** Aim for ~50k labeled samples per scenario (~150k total) stored under `data/gamma_oracle/<scenario>/<run>.parquet` with schema `{features, gamma_label, latency_label, scenario_id, rtt_multiplier, load_multiplier}`. Splits are scenario-stratified (e.g., train S1+S2, validate on S2, test on S3).
 
@@ -1023,6 +1026,31 @@ def plan(pools, candidates, metrics):
 
 - **Acceptance predictor (token-level).** Collect ground truth directly from hardware runs with the actual draft/target model pair (e.g., Llama‑7B → Llama‑70B). Instrument the production speculative loop so every draft token logs the context features, speculative depth, model metadata, and an accept/reject bit. Sweep a mix of policies (SpecDec++, fixed γ, dynamic heads) so the RandomForest sees diverse depths and alignment behaviours.
 - **Gamma predictor (request-level).** Use the simulator’s oracle sweep to label `(mode, gamma)` decisions. The hybrid execution path plus fast-forward evaluation lets us explore all candidate gammas under controlled RTT/load variations without expensive hardware reruns. The resulting dataset powers the latency-aware predictor head.
+
+Example configuration snippet for logging:
+
+```yaml
+speculation:
+  execution_mode: hybrid
+  gamma_oracle_logging:
+    enabled: true
+    output_path: data/gamma_oracle/gsm8k_hybrid.jsonl
+```
+
+To sweep multiple gamma candidates and build the aggregated dataset, run the helper:
+
+```bash
+python -m src.experiments.gamma_oracle_runner \
+  --config experiments/results/dynamic_gamma_mix/configs/specpp_drafts400_seed123.yaml \
+  --scenario-id gsm8k_rtt1x \
+  --gammas 1,2,3,4,5,6,7,8 \
+  --seed 123 \
+  --output-dir data/gamma_oracle
+```
+
+Each candidate run writes JSONL traces under `data/gamma_oracle/raw/<scenario>/`, and the runner
+combines them into `data/gamma_oracle/dataset/<scenario>.jsonl` containing the oracle `(mode, gamma)`
+labels plus the captured feature vectors.
 
 ## 7. Execution Modes
 

@@ -4,6 +4,7 @@
 import argparse, random, simpy, yaml, math, json, itertools, copy, time
 import time
 from collections import deque, defaultdict
+import threading
 from types import MappingProxyType
 from pathlib import Path
 
@@ -24,6 +25,29 @@ from acceptance.regressor import AcceptanceRegressor
 
 _ACCEPTANCE_MODEL_CACHE: Dict[str, AcceptanceRegressor] = {}
 _GLOBAL_PROFILER = None
+_GLOBAL_GAMMA_ORACLE_LOGGER = None
+
+
+class GammaOracleLogger:
+    """Append-only JSONL logger for oracle datasets."""
+
+    def __init__(self, path: str, metadata: Optional[Mapping[str, Any]] = None) -> None:
+        self.path = Path(path)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._lock = threading.Lock()
+        self.metadata = dict(metadata or {})
+
+    def log(self, record: Mapping[str, Any]) -> None:
+        payload = dict(record)
+        if self.metadata:
+            existing = dict(payload.get("run_metadata", {}))
+            merged = {**existing, **self.metadata}
+            payload["run_metadata"] = merged
+        line = json.dumps(payload, ensure_ascii=False)
+        with self._lock:
+            with self.path.open("a", encoding="utf-8") as handle:
+                handle.write(line)
+                handle.write("\n")
 
 @dataclass
 class TargetParams:
@@ -664,6 +688,7 @@ class Config:
     acceptance_use_classifier: bool = True
     network_config: Dict[str, Any] = field(default_factory=dict)
     network_enabled: bool = True
+    gamma_oracle_logging: Dict[str, Any] = field(default_factory=dict)
 
 @dataclass
 class Job:
@@ -1781,7 +1806,8 @@ class DraftServer:
                  trace_records: Optional[Sequence[TraceRecord]] = None,
                  performance_provider=None, network: Optional[NetworkFabric] = None,
                  acceptance_model: Optional[AcceptanceRegressor] = None,
-                 gamma_policy: Optional[GammaPolicy] = None):
+                 gamma_policy: Optional[GammaPolicy] = None,
+                 gamma_oracle_logger: Optional[GammaOracleLogger] = None):
         self.env = env
         self.p = params
         self.id = params.id
@@ -1840,7 +1866,10 @@ class DraftServer:
         self.total_tokens_accepted = 0
         self.total_tokens_rejected = 0
         self.total_round_trip_time = 0.0
+        self._recent_acceptance: Dict[str, float] = {}
+        self._acceptance_smoothing = float(getattr(cfg, "gamma_acceptance_smoothing", 0.5) or 0.5)
         
+        self._gamma_oracle_logger = gamma_oracle_logger
         self.proc = env.process(self._generate_blocking())
 
     def _ia(self) -> float:
@@ -2033,6 +2062,18 @@ class DraftServer:
         rate, _ = self._lookup_acceptance(conn, context_length, depth)
         return rate
 
+    def _update_recent_acceptance(self, target_id: str, ratio: float) -> None:
+        ratio = max(0.0, min(1.0, float(ratio)))
+        if ratio <= 0.0:
+            return
+        prev = self._recent_acceptance.get(target_id)
+        if prev is None:
+            self._recent_acceptance[target_id] = ratio
+            return
+        alpha = max(0.0, min(1.0, self._acceptance_smoothing))
+        blended = alpha * ratio + (1.0 - alpha) * prev
+        self._recent_acceptance[target_id] = blended
+
 
     def _lookup_acceptance(self, conn: ConnectionParams, context_length: float, tokens: int) -> Tuple[float, Tuple[float, ...]]:
         tokens = int(max(1, tokens))
@@ -2088,9 +2129,25 @@ class DraftServer:
                     _GLOBAL_PROFILER["acceptance_proba_ms"] += cls_duration_ms
                 probabilities = tuple(max(0.0, min(1.0, float(p))) for p in probabilities[:depth_q])
             else:
-                probabilities = tuple(rate for _ in range(depth_q))
+                decay = float(self.cfg.acceptance_config.get("decay_factor", 0.9))
+                probabilities = []
+                current = rate
+                for _ in range(depth_q):
+                    probabilities.append(max(0.0, min(1.0, float(current))))
+                    current *= decay
+                probabilities = tuple(probabilities)
 
-            cache_entry = (rate, probabilities)
+            if self._acceptance_use_classifier:
+                cache_entry = (rate, probabilities)
+            else:
+                decay = float(self.cfg.acceptance_config.get("decay_factor", 0.9))
+                position_probs = []
+                current = rate
+                for _ in range(depth_q):
+                    position_probs.append(max(0.0, min(1.0, current)))
+                    current *= decay
+                probabilities = tuple(position_probs)
+                cache_entry = (rate, probabilities)
             self._acceptance_cache[key] = cache_entry
         else:
             if _GLOBAL_PROFILER is not None:
@@ -2520,6 +2577,7 @@ class DraftServer:
         acceptance_ratio = (
             tokens_accepted / tokens_generated if tokens_generated > 0 else 0.0
         )
+        self._update_recent_acceptance(target_id, acceptance_ratio)
 
         if self.cfg.verbose or self.cfg.debug:
             print(
@@ -2700,11 +2758,31 @@ class DraftServer:
             elif pending_tokens:
                 target_workload_util = pending_tokens / max(1, self.gamma)
             target_workload_util = max(0.0, min(2.0, target_workload_util))
-            acceptance_estimate = (
+            predicted_acceptance = (
                 sum(acceptance_probs) / len(acceptance_probs) if acceptance_probs else 0.0
             )
+            observed_acceptance = self._recent_acceptance.get(target_id)
+            if observed_acceptance is None:
+                raise RuntimeError(
+                    f"Observed acceptance ratio unavailable for target={target_id}. "
+                    "Enable empirical acceptance tracking before running gamma policies."
+                )
+            acceptance_estimate = observed_acceptance
             drafter_capability = float(self.p.capability or 0.0)
             drafter_tier = str(self.metadata.get("tier") or self.cluster or "")
+            oracle_features = {
+                "queue_depth": queue_depth,
+                "queue_utilization": queue_utilization,
+                "pending_tokens": pending_tokens,
+                "target_workload_util": target_workload_util,
+                "drafter_capability": drafter_capability,
+                "drafter_tier": drafter_tier,
+                "acceptance_estimate": acceptance_estimate,
+                "acceptance_predicted": predicted_acceptance,
+                "target_batch_size": target_batch_size,
+                "context_length": prompt_length,
+                "target_queue_pending_tokens": pending_tokens,
+            }
             gamma_context = GammaContext(
                 draft_id=self.id,
                 target_id=target_id,
@@ -3013,11 +3091,11 @@ class DraftServer:
                             (first_token_time_ms - conversation_start)
                             if first_token_time_ms is not None else None
                         )
-                        self.metrics.record_conversation(
-                            conversation_id,
-                            start_ms=conversation_start,
-                            end_ms=self.env.now,
-                            draft_id=self.id,
+                    self.metrics.record_conversation(
+                        conversation_id,
+                        start_ms=conversation_start,
+                        end_ms=self.env.now,
+                        draft_id=self.id,
                             target_id=target_id,
                             tokens_generated=tokens_generated_in_conversation,
                             tokens_accepted=tokens_accepted_in_conversation,
@@ -3038,6 +3116,36 @@ class DraftServer:
                         if conversation_tpot_samples else 0.0
                     )
                     max_tpot = max(conversation_tpot_samples) if conversation_tpot_samples else 0.0
+
+                    if self._gamma_oracle_logger is not None:
+                        oracle_record = {
+                            "request_id": conversation_id,
+                            "draft_id": self.id,
+                            "target_id": target_id,
+                            "timestamp_ms": conversation_start,
+                            "mode": "fused" if conversation_fused else "distributed",
+                            "gamma": gamma_value,
+                            "context_tokens": prompt_length,
+                            "answer_tokens": answer_length,
+                            "features": oracle_features,
+                            "metrics": {
+                                "duration_ms": conversation_time,
+                                "ttft_ms": ttft_ms,
+                                "avg_rtt_ms": avg_rtt,
+                                "max_rtt_ms": max_rtt,
+                                "avg_tpot_ms": avg_tpot,
+                                "max_tpot_ms": max_tpot,
+                                "ttft_breakdown": ttft_breakdown,
+                                "decode_breakdown": decode_breakdown,
+                                "rtt_samples": conversation_rtt_samples,
+                                "tpot_samples": conversation_tpot_samples,
+                            },
+                        }
+                        try:
+                            self._gamma_oracle_logger.log(oracle_record)
+                        except Exception as exc:
+                            if self.cfg.debug:
+                                print(f"[WARN] Gamma oracle logging failed: {exc}", flush=True)
 
                     self._gamma_policy.update_gamma(
                         self.id,
@@ -4408,6 +4516,7 @@ def _build_config_from_mapping(data: Mapping[str, Any]) -> Config:
     depth_bucket = int(acceptance_cfg.get("depth_bucket", 1) or 1)
     pending_bucket = int(acceptance_cfg.get("pending_bucket", 1) or 1)
     queue_bucket = int(acceptance_cfg.get("queue_bucket", 1) or 1)
+    gamma_oracle_cfg = dict(spec_cfg.get("gamma_oracle_logging", {}) or {})
     cfg = Config(
         sim_time_ms=raw.get("sim_time_ms", 10_000),
         seed=raw.get("seed", 0),
@@ -4447,6 +4556,7 @@ def _build_config_from_mapping(data: Mapping[str, Any]) -> Config:
         speculation_framework=framework,
         speculation_execution_mode=execution_mode,
         speculation_config=spec_cfg,
+        gamma_oracle_logging=gamma_oracle_cfg,
         acceptance_model_path=str(acceptance_model) if acceptance_model else None,
         acceptance_config=acceptance_cfg,
         acceptance_model_disabled=disable_acceptance_model,
@@ -4505,6 +4615,16 @@ def build(env: simpy.Environment, cfg: Config):
     build_start = time.perf_counter()
     random.seed(cfg.seed)
     metrics = Metrics(verbose=cfg.verbose, burn_in_ms=cfg.burn_in_ms)
+    global _GLOBAL_GAMMA_ORACLE_LOGGER
+    gamma_oracle_logger = None
+    oracle_cfg = dict(getattr(cfg, "gamma_oracle_logging", {}) or {})
+    if oracle_cfg.get("enabled"):
+        output_path = oracle_cfg.get("output_path")
+        if not output_path:
+            raise ValueError("gamma_oracle_logging.enabled requires output_path")
+        metadata = dict(oracle_cfg.get("run_metadata", {}) or {})
+        gamma_oracle_logger = GammaOracleLogger(str(output_path), metadata=metadata)
+    _GLOBAL_GAMMA_ORACLE_LOGGER = gamma_oracle_logger
     targets: List[TargetServer] = []
     drafts: List[DraftServer] = []
     targets_by_cluster: Dict[str, List[TargetServer]] = defaultdict(list)
@@ -4815,6 +4935,7 @@ def build(env: simpy.Environment, cfg: Config):
                 network=network_fabric,
                 acceptance_model=acceptance_model,
                 gamma_policy=gamma_policy,
+                gamma_oracle_logger=gamma_oracle_logger,
             )
         )
 
