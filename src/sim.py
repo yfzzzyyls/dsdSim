@@ -2668,88 +2668,10 @@ class DraftServer:
                 )
 
             target_server = self._target_lookup.get(target_id)
-            fused_mode = self.framework == "vanilla" and self.execution_mode == "fused"
+            fused_allowed = self.framework == "vanilla" and self.execution_mode in {"fused", "hybrid"}
+            hybrid_enabled = fused_allowed and self.execution_mode == "hybrid"
+            conversation_fused = fused_allowed and self.execution_mode == "fused"
 
-            prefill_rtt_start = self.env.now
-            prefill_completion = self.env.event()
-            prefill_job = Job(
-                jid=self.chunks_sent,
-                created_ms=self.env.now,
-                draft_id=self.id,
-                job_type="prefill",
-                token_count=prompt_length,
-                completion_event=prefill_completion,
-                rtt_start_ms=prefill_rtt_start,
-                request_id=conversation_id,
-                context_len=prompt_length,
-                target_id=target_id,
-                priority_class=priority_class,
-                phase="prefill",
-                is_fused=fused_mode,
-            )
-            self.chunks_sent += 1
-
-            # Send prefill request to target
-            if fused_mode:
-                forward_elapsed = 0.0
-            else:
-                prefill_payload = self._estimate_payload_bytes(prompt_length, self._prefill_overhead_bytes)
-                fwd_start = self.env.now
-                yield self._network_transfer(
-                    self.id,
-                    target_id,
-                    conn.forward_latency_ms,
-                    payload_bytes=prefill_payload,
-                    link_key=conn.network_forward_key,
-                )
-                forward_elapsed = self.env.now - fwd_start
-            ttft_breakdown["prefill_forward_ms"] += forward_elapsed
-            prefill_job.created_ms = self.env.now
-
-            if self.scheduler is None:
-                if target_server is None:
-                    print(f"Warning: Target {target_id} not found for draft {self.id}", flush=True)
-                    continue
-                if fused_mode:
-                    wait_event = target_server.fused_execute(prefill_job)
-                else:
-                    target_server.enqueue(prefill_job)
-                    wait_event = prefill_completion
-            else:
-                wait_event = self.scheduler.submit_job(prefill_job)
-
-            # Wait for actual job completion instead of synthetic sleep
-            yield wait_event
-
-            # Wait for response to travel back
-            if fused_mode:
-                response_elapsed = 0.0
-            else:
-                response_payload = self._estimate_payload_bytes(prompt_length, self._response_overhead_bytes)
-                rsp_start = self.env.now
-                yield self._network_transfer(
-                    target_id,
-                    self.id,
-                    conn.response_latency_ms,
-                    payload_bytes=response_payload,
-                    link_key=conn.network_response_key,
-                )
-                response_elapsed = self.env.now - rsp_start
-            ttft_breakdown["prefill_response_ms"] += response_elapsed
-
-            # Mark RTT end for prefill
-            prefill_job.rtt_end_ms = self.env.now
-
-            prefill_started = prefill_job.started_ms if prefill_job.started_ms is not None else prefill_job.created_ms
-            prefill_queue = max(0.0, (prefill_started - prefill_job.created_ms) if prefill_started is not None else 0.0)
-            prefill_compute = max(0.0, (prefill_job.finished_ms - prefill_started) if prefill_started is not None and prefill_job.finished_ms is not None else 0.0)
-            ttft_breakdown["prefill_queue_ms"] += prefill_queue
-            ttft_breakdown["prefill_compute_ms"] += prefill_compute
-
-            if self.cfg.debug:
-                print(f"[{self.env.now:.1f}ms] Draft {self.id}: Prefill completed for {prompt_length} tokens", flush=True)
-
-            # Phase 2: Generate answer with multiple speculation rounds
             candidate_depth = self.gamma
             gamma_value = self.gamma
             try:
@@ -2808,6 +2730,10 @@ class DraftServer:
                     print(f"[{self.env.now:.1f}ms] Draft {self.id}: gamma policy select failed: {exc}", flush=True)
                 selected_gamma = self.gamma
             gamma_value = max(1, int(selected_gamma or 0))
+            if fused_allowed and not conversation_fused and hybrid_enabled and gamma_value <= 1:
+                conversation_fused = True
+            if conversation_fused:
+                gamma_value = 1
             rounds_needed = (answer_length + gamma_value - 1) // gamma_value  # ceiling division
             if self.id in ["llama_d000", "llama_d001"]:
                 print(
@@ -2815,6 +2741,87 @@ class DraftServer:
                     f"(answer={answer_length}, gamma={gamma_value})",
                     flush=True,
                 )
+
+            prefill_rtt_start = self.env.now
+            prefill_completion = self.env.event()
+            prefill_job = Job(
+                jid=self.chunks_sent,
+                created_ms=self.env.now,
+                draft_id=self.id,
+                job_type="prefill",
+                token_count=prompt_length,
+                completion_event=prefill_completion,
+                rtt_start_ms=prefill_rtt_start,
+                request_id=conversation_id,
+                context_len=prompt_length,
+                target_id=target_id,
+                priority_class=priority_class,
+                phase="prefill",
+                is_fused=conversation_fused,
+            )
+            self.chunks_sent += 1
+
+            # Send prefill request to target
+            if conversation_fused:
+                forward_elapsed = 0.0
+            else:
+                prefill_payload = self._estimate_payload_bytes(prompt_length, self._prefill_overhead_bytes)
+                fwd_start = self.env.now
+                yield self._network_transfer(
+                    self.id,
+                    target_id,
+                    conn.forward_latency_ms,
+                    payload_bytes=prefill_payload,
+                    link_key=conn.network_forward_key,
+                )
+                forward_elapsed = self.env.now - fwd_start
+            ttft_breakdown["prefill_forward_ms"] += forward_elapsed
+            prefill_job.created_ms = self.env.now
+
+            if self.scheduler is None:
+                if target_server is None:
+                    print(f"Warning: Target {target_id} not found for draft {self.id}", flush=True)
+                    continue
+                if conversation_fused:
+                    wait_event = target_server.fused_execute(prefill_job)
+                else:
+                    target_server.enqueue(prefill_job)
+                    wait_event = prefill_completion
+            else:
+                wait_event = self.scheduler.submit_job(prefill_job)
+
+            # Wait for actual job completion instead of synthetic sleep
+            yield wait_event
+
+            # Wait for response to travel back
+            if conversation_fused:
+                response_elapsed = 0.0
+            else:
+                response_payload = self._estimate_payload_bytes(prompt_length, self._response_overhead_bytes)
+                rsp_start = self.env.now
+                yield self._network_transfer(
+                    target_id,
+                    self.id,
+                    conn.response_latency_ms,
+                    payload_bytes=response_payload,
+                    link_key=conn.network_response_key,
+                )
+                response_elapsed = self.env.now - rsp_start
+            ttft_breakdown["prefill_response_ms"] += response_elapsed
+
+            # Mark RTT end for prefill
+            prefill_job.rtt_end_ms = self.env.now
+
+            prefill_started = prefill_job.started_ms if prefill_job.started_ms is not None else prefill_job.created_ms
+            prefill_queue = max(0.0, (prefill_started - prefill_job.created_ms) if prefill_started is not None else 0.0)
+            prefill_compute = max(0.0, (prefill_job.finished_ms - prefill_started) if prefill_started is not None and prefill_job.finished_ms is not None else 0.0)
+            ttft_breakdown["prefill_queue_ms"] += prefill_queue
+            ttft_breakdown["prefill_compute_ms"] += prefill_compute
+
+            if self.cfg.debug:
+                print(f"[{self.env.now:.1f}ms] Draft {self.id}: Prefill completed for {prompt_length} tokens", flush=True)
+
+            # Phase 2: Generate answer with multiple speculation rounds
             tokens_generated_in_conversation = 0
             tokens_accepted_in_conversation = 0
             first_token_time_ms = None  # Track TTFT
@@ -2838,7 +2845,7 @@ class DraftServer:
 
                     current_context = prompt_length + tokens_generated_in_conversation
                     # Generate draft tokens using performance provider latency
-                    if fused_mode:
+                    if conversation_fused:
                         generation_latency = 0.0
                     else:
                         generation_latency = self._predict_generation_latency(tokens_this_round, current_context)
@@ -2872,12 +2879,12 @@ class DraftServer:
                         priority_class=priority_class,
                         phase="decode",
                         gamma_override=gamma_value,
-                        is_fused=fused_mode,
+                        is_fused=conversation_fused,
                     )
 
                     # Send chunk to target (forward latency)
                     decode_payload = self._estimate_payload_bytes(tokens_this_round, self._decode_overhead_bytes)
-                    if fused_mode:
+                    if conversation_fused:
                         forward_elapsed = 0.0
                     else:
                         fwd_chunk_start = self.env.now
@@ -2901,7 +2908,7 @@ class DraftServer:
                             print(f"Warning: Target {target_id} not found for draft {self.id}", flush=True)
                             conversation_completed = True
                             break
-                        if fused_mode:
+                        if conversation_fused:
                             wait_event = target_server.fused_execute(job)
                         else:
                             target_server.enqueue(job)
@@ -2914,7 +2921,7 @@ class DraftServer:
 
                     # Wait for response to travel back
                     response_payload = self._estimate_payload_bytes(tokens_this_round, self._response_overhead_bytes)
-                    if fused_mode:
+                    if conversation_fused:
                         response_elapsed = 0.0
                     else:
                         rsp_chunk_start = self.env.now
@@ -4454,6 +4461,8 @@ def _build_config_from_mapping(data: Mapping[str, Any]) -> Config:
         raise ValueError("Think time must be enabled for closed-loop operation")
     if str(cfg.execution_mode).lower() != 'blocking':
         raise ValueError("Execution mode must be 'blocking' for closed-loop operation")
+    if str(cfg.speculation_execution_mode).lower() == "hybrid" and str(cfg.speculation_framework).lower() != "vanilla":
+        raise ValueError("Hybrid speculation mode currently requires speculation.framework='vanilla'")
 
     return cfg
 

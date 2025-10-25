@@ -660,24 +660,27 @@ Example end-to-end workflow using the bundled profiling utilities:
    python src/experiments/speculative/prepare_prompts.py \
        --dataset-path src/thirdparty/benchmarks/cnn_dailymail \
        --split train --text-column article \
-       --train-size 8 --test-size 2 \
+       --train-size 8 --val-size 2 --test-size 2 \
        --train-output prompts/cnndm_train.jsonl \
+       --val-output   prompts/cnndm_val.jsonl \
        --test-output  prompts/cnndm_test.jsonl
 
    # GSM8K (tiny debugging subset)
    python src/experiments/speculative/prepare_prompts.py \
        --dataset-path src/thirdparty/benchmarks/gsm8k \
        --split train --text-column question \
-       --train-size 8 --test-size 2 \
+       --train-size 8 --val-size 2 --test-size 2 \
        --train-output prompts/gsm8k_train.jsonl \
+       --val-output   prompts/gsm8k_val.jsonl \
        --test-output  prompts/gsm8k_test.jsonl
 
    # HumanEval (tiny debugging subset)
    python src/experiments/speculative/prepare_prompts.py \
        --dataset-path src/thirdparty/benchmarks/humaneval \
        --split test --text-column prompt \
-       --train-size 8 --test-size 2 \
+       --train-size 8 --val-size 2 --test-size 2 \
        --train-output prompts/humaneval_train.jsonl \
+       --val-output   prompts/humaneval_val.jsonl \
        --test-output  prompts/humaneval_test.jsonl
    ```
 
@@ -687,7 +690,7 @@ Example end-to-end workflow using the bundled profiling utilities:
    for split in cnndm gsm8k humaneval; do
      TRANSFORMERS_NO_TORCHAO=1 \
      ~/miniconda3/bin/conda run -n llama2spec \
-     python src/experiments/speculative/speculative.py \
+     python src/acceptance/speculative_profiler.py \
        --drafter-model meta-llama/Llama-2-7b-hf \
        --verifier-model meta-llama/Llama-2-70b-hf \
         --spec-tokens 4 --max-tokens 160 \
@@ -697,6 +700,8 @@ Example end-to-end workflow using the bundled profiling utilities:
         --metrics-jsonl results/${split}_train_metrics.jsonl \
         --details-jsonl results/${split}_train_details.jsonl
    done
+   # Repeat the same loop for `${split}_val.jsonl` and `${split}_test.jsonl`
+   # to populate validation/test detail logs before evaluation.
    ```
 
 3. **Train the VIDUR-style acceptance regressor**
@@ -705,7 +710,7 @@ Example end-to-end workflow using the bundled profiling utilities:
    cat results/*_train_details.jsonl > results/train_details.jsonl
 
    ~/miniconda3/bin/conda run -n llama2spec \
-   python src/experiments/speculative/regressor.py \
+   python src/acceptance/train_regressor.py \
        --details-jsonl results/train_details.jsonl \
        --spec-tokens 4 \
        --output-model acceptance/llama2_7b_vs_70b.joblib \
@@ -720,7 +725,7 @@ Example end-to-end workflow using the bundled profiling utilities:
    for split in cnndm gsm8k humaneval; do
      TRANSFORMERS_NO_TORCHAO=1 \
      ~/miniconda3/bin/conda run -n llama2spec \
-     python src/experiments/speculative/speculative.py \
+     python src/acceptance/speculative_profiler.py \
        --drafter-model meta-llama/Llama-2-7b-hf \
        --verifier-model meta-llama/Llama-2-70b-hf \
        --spec-tokens 4 --max-tokens 160 \
@@ -733,7 +738,7 @@ Example end-to-end workflow using the bundled profiling utilities:
    cat results/*_test_details.jsonl > results/test_details.jsonl
 
    ~/miniconda3/bin/conda run -n llama2spec \
-   python src/experiments/speculative/evaluate_regressor.py \
+   python src/acceptance/evaluate_regressor.py \
        --model acceptance/llama2_7b_vs_70b.joblib \
        --details-jsonl results/test_details.jsonl \
        --print-report \
@@ -1013,6 +1018,11 @@ def plan(pools, candidates, metrics):
 - **State updates.** After each conversation completes, append measured `(tpot, rtt, gamma_served, slo_hit)` to the ring buffer. If history is empty (startup or reset), default to a safe distributed gamma (e.g., 4) until at least two samples exist.
 - **Safety rails.** Expose config limits for min/max gamma, smoothing factor, and “fused hysteresis” (minimum dwell time once fused) to prevent thrashing under jittery RTT.
 - **Telemetry hooks.** Policy logs `(features, gamma_hat, action_taken)` for debugging and offline retraining; histograms can be dumped alongside other scheduler diagnostics.
+
+##### Data Collection Strategy (Real vs Simulated)
+
+- **Acceptance predictor (token-level).** Collect ground truth directly from hardware runs with the actual draft/target model pair (e.g., Llama‑7B → Llama‑70B). Instrument the production speculative loop so every draft token logs the context features, speculative depth, model metadata, and an accept/reject bit. Sweep a mix of policies (SpecDec++, fixed γ, dynamic heads) so the RandomForest sees diverse depths and alignment behaviours.
+- **Gamma predictor (request-level).** Use the simulator’s oracle sweep to label `(mode, gamma)` decisions. The hybrid execution path plus fast-forward evaluation lets us explore all candidate gammas under controlled RTT/load variations without expensive hardware reruns. The resulting dataset powers the latency-aware predictor head.
 
 ## 7. Execution Modes
 
